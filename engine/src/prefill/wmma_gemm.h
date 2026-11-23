@@ -12,6 +12,13 @@ bool strata_wmma_gemm_f16(const uint16_t* X, const uint16_t* W, float* Y,
                           int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
                           void* stream = nullptr);
 
+/// The single-wave 16x16 kernel with explicit row strides ldx (X) and ldw (W): a strided
+/// sub-view (one KV head's K rows at stride KD, one query head's Q rows at stride HD) feeds
+/// WMMA without a copy. Y[t,n] = beta*Y + sum_k W[n,k]*X[t,k]; K a multiple of 16, ldx/ldw >= K.
+bool strata_wmma_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y,
+                             int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
+                             void* stream = nullptr);
+
 /// Compute Y[t, n] = beta * Y[t, n] + sum_k W[n, k] * X[t, k] using RDNA3 WMMA instructions.
 /// X: T x K row-major (leading dim K), bf16 (uint16_t)
 /// W: N x K row-major (leading dim K), bf16 (uint16_t)

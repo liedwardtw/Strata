@@ -30,6 +30,9 @@
 #include "ik2_kernels.cuh"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/ik2/engine.hpp"
+#if defined(STRATA_USE_HIP)
+#include "wmma_gemm.h"   // src/prefill: the gfx11 WMMA FP16 GEMM (IK2_WMMA_GEMM opt-in)
+#endif
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -119,6 +122,16 @@ static inline cudaError_t cudaMemAdvise_compat(const void* devPtr, size_t count,
 namespace {
 
 namespace k = ik2::k;
+
+// IK2_VPROF2: per-visit GPU-event pair (attn start -> MoE start) shared across the two namespaces that host
+// forward() and the speculative loop.  Events accumulate per step; the loop prints the mean split.
+cudaEvent_t vpA[64], vpB[64];
+// IK2_VPROF3: extra per-visit boundaries to split attention into proj / prep+conv / flash / wo.
+// IK2_VPROF4 splits the proj phase further: vpR before rms/gates, vpS before the wqkvrg matmul.
+cudaEvent_t vpP[64], vpK[64], vpF[64], vpR[64], vpS[64];
+int vp_attn_idx = -1;   // set by forward() to the current visit index before run_layer_attn
+bool vp_init = false;
+int vp_n = 0;
 
 #define CU(x)                                                                                              \
     do {                                                                                                   \
@@ -227,6 +240,17 @@ struct Mat {
     uint8_t* raw = nullptr;     // IK2_DENSE=q8: the blocks, one token's products straight over them
     uint16_t* f16 = nullptr;    // else (the default): an FP16 copy, every product a cuBLAS GEMM - measured faster on an
     int type = 0, N = 0, K = 0; // RTX PRO 6000 (16 against 21 ms a token), for 4 GiB more VRAM
+    // IK2_INT4_DENSE: a rotated-symmetric-int4 sidecar of this whole matrix (the expert k_repack layout), loaded only
+    // when the gate is on and the bins exist. Decode matvec reads these; q8/f16 stay resident for prefill. Null = off.
+    const uint8_t* i4Wp = nullptr;
+    const uint8_t* i4Wh = nullptr;
+    const float* i4WS = nullptr;
+    // IK2_INT4_HEAD: the sidecar is reserved for run_head's T=2..8 verify GEMM; the generic decode matvec (mv1/mv1c)
+    // and matmul's IK2_INT4_DENSE_MULTI branch skip it, so T=1 decode and prefill stay byte-identical even when on.
+    bool i4_head_only = false;
+    // IK2_INT4_MSG: mat_rows' row slice carries ft0-shifted sidecar pointers. The repack is 16-row-block local, so
+    // the slice reads the same bytes a standalone conversion of its rows would. mv1/mv1c skip it (T=1 stays Q8).
+    bool i4_row_slice = false;
 };
 
 struct Layer {
@@ -255,6 +279,15 @@ struct Layer {
     // a looped core's layer: its later passes' message gates by module (0 q's, 1 k's, 2 v's, 3 the MoE's) -
     // down [rank][2 C], forget and gain [rank][C] - and the four messages' queries [4][C] in that order (F32)
     float *lp_down[4] = {}, *lp_forget[4] = {}, *lp_gain[4] = {}, *lp_query = nullptr;
+    // IK2_INT4_EXPERTS: rotated-int4 expert weights, device-resident (replace NVFP4 residency).
+    // Per layer, per role [0]=gate_up, [2]=down: one contiguous Wp/Wh/WS, and [E] pointer tables.
+    bool i4_loaded = false;
+    uint8_t *i4_Wp[3] = {}, *i4_Wh[3] = {};
+    float *i4_WS[3] = {};
+    const uint8_t** i4_tab_Wp[3] = {}, **i4_tab_Wh[3] = {};
+    const float** i4_tab_WS[3] = {};
+    size_t i4_wp_stride[3] = {}, i4_wh_stride[3] = {};
+    int i4_Kpad[3] = {};
     // the resident token path (every expert in VRAM): where each expert's blocks are, and the experts' scales, on the
     // device ([E] each; a scale's null: 1)
     const uint8_t** tab_blob = nullptr;
@@ -266,6 +299,15 @@ struct Layer {
     // the state: of the visit being run (bind_visit)
     uint16_t *kc = nullptr, *vc = nullptr;         // FP16 [kv_cap][KV * D] (IK2_KV=f16)
     uint8_t *kc8 = nullptr, *vc8 = nullptr;        // FP8 E4M3 [kv_cap][KV * D] (IK2_KV=fp8)
+    uint8_t *kci = nullptr, *vci = nullptr;        // INT8 / INT4 codes [kv_cap][KV * D] / [kv_cap][KV * D / 2] (IK2_KV=int8/int4)
+    uint16_t *ks = nullptr, *vs = nullptr;         // FP16 per-(token, KV-head) scales [kv_cap][KV] (int8/int4)
+    // IK2_KV_HOST_CAP: host-mapped overflow for the int KV of full visits. The last kv_host_cap token rows stay in
+    // VRAM (kci/vci/ks/vs above, sized kv_host_cap); older rows live in host-mapped RAM (hkci/hvci/hks/hvs, device
+    // pointers from cudaHostGetDevicePointer) and the attention kernels read them over PCIe. kv_base = first VRAM row
+    // (= max(0, newest_pos - kv_host_cap)); a row at position p < kv_base reads host[p], else VRAM[p - kv_base].
+    uint8_t *hkci = nullptr, *hvci = nullptr;
+    uint16_t *hks = nullptr, *hvs = nullptr;
+    int kv_host_cap = 0, kv_base = 0;
     int kv_cap = 0;
     float *h_k, *h_v, *h_attn, *h_mlp;             // conv histories [3][C']
     float *rec_old[4] = {}, *rec_x[4] = {};        // (speculative) the convs' histories and inputs of a verify window
@@ -279,6 +321,11 @@ struct Visit {
     int pass = 0;     // the core's pass (0: its first, or a layer outside the core)
     uint16_t *kc = nullptr, *vc = nullptr;
     uint8_t *kc8 = nullptr, *vc8 = nullptr;
+    uint8_t *kci = nullptr, *vci = nullptr;
+    uint16_t *ks = nullptr, *vs = nullptr;
+    uint8_t *hkci = nullptr, *hvci = nullptr;
+    uint16_t *hks = nullptr, *hvs = nullptr;
+    int kv_host_cap = 0, kv_base = 0;
     int kv_cap = 0;
     float *h_k = nullptr, *h_v = nullptr, *h_attn = nullptr, *h_mlp = nullptr;
     float *rec_old[4] = {}, *rec_x[4] = {};
@@ -299,6 +346,9 @@ inline Layer& bind_visit(Model& M, int v) {
     const Visit& Vi = M.V[v];
     Layer& Ly = M.L[Vi.l];
     Ly.kc = Vi.kc, Ly.vc = Vi.vc, Ly.kc8 = Vi.kc8, Ly.vc8 = Vi.vc8, Ly.kv_cap = Vi.kv_cap;
+    Ly.kci = Vi.kci, Ly.vci = Vi.vci, Ly.ks = Vi.ks, Ly.vs = Vi.vs;
+    Ly.hkci = Vi.hkci, Ly.hvci = Vi.hvci, Ly.hks = Vi.hks, Ly.hvs = Vi.hvs;
+    Ly.kv_host_cap = Vi.kv_host_cap, Ly.kv_base = Vi.kv_base;
     Ly.h_k = Vi.h_k, Ly.h_v = Vi.h_v, Ly.h_attn = Vi.h_attn, Ly.h_mlp = Vi.h_mlp;
     for (int i = 0; i < 4; ++i) Ly.rec_old[i] = Vi.rec_old[i], Ly.rec_x[i] = Vi.rec_x[i];
     return Ly;
@@ -326,6 +376,54 @@ void lazy_poll() {
 
 // IK2_PROF=1: the stream waited for at each phase's end, its time added to the phase (slower, but where it goes)
 bool g_prof = false;
+// IK2_PROF_FAST=1: event-based phase timers INSIDE the resident fast path (fast_token_launches), which IK2_PROF
+// itself disables. Run with IK2_GRAPH=0 (events are not captured). Non-blocking cudaEventRecord at phase boundaries,
+// elapsed summed after the token's sync - no per-phase stream wait, so the resident path's speed is preserved.
+bool g_prof_fast = false;
+namespace pf_fast {
+// 0 emb_norm, 1 loop_bank, 2 input_norm, 3 proj, 4 prep_kv, 5 attn, 6 wo, 7 moe_norm, 8 router_route, 9 experts, 10 combine, 11 head
+constexpr int NPH = 12;
+const char* const names[NPH] = {"emb_norm", "loop_bank", "input_norm", "proj", "prep_kv", "attn",
+                                "wo", "moe_norm", "router_route", "experts", "combine", "head"};
+// One event per mark, recorded in sequence across the token's 48 visits (a fixed-handle scheme reused the
+// same 13 events every visit and kept only the LAST timestamp, so every phase but one read as ~0 or garbage).
+constexpr int kPfMaxMarks = 1100;
+cudaEvent_t evs[kPfMaxMarks];
+int ev_phase[kPfMaxMarks];
+int nmark = 0;
+double acc[NPH];
+int ntok = 0;
+bool init = false;
+void setup() {
+    if (init) return;
+    init = true;
+    for (int i = 0; i < kPfMaxMarks; ++i) cudaEventCreate(&evs[i]);
+}
+inline void mark(int i, cudaStream_t s) {
+    if (!g_prof_fast || nmark >= kPfMaxMarks) return;
+    cudaEventRecord(evs[nmark], s);
+    ev_phase[nmark] = i;
+    ++nmark;
+}
+void finish(cudaStream_t s) {   // (after the token's stream sync: every recorded event is complete)
+    if (!g_prof_fast) return;
+    for (int k = 0; k + 1 < nmark; ++k) {
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, evs[k], evs[k + 1]) == cudaSuccess) acc[ev_phase[k]] += ms;
+    }
+    nmark = 0;
+    ++ntok;
+}
+void report() {
+    if (!g_prof_fast || !ntok) return;
+    double tot = 0.0;
+    for (int i = 0; i < NPH; ++i) tot += acc[i];
+    std::printf("\nRESIDENT DECODE PROFILE (%d tokens, %.3f ms/token total):\n", ntok, tot / ntok);
+    for (int i = 0; i < NPH; ++i)
+        std::printf("  %-13s %7.3f ms/token  %5.1f%%\n", names[i], acc[i] / ntok, 100.0 * acc[i] / tot);
+    std::fflush(stdout);
+}
+}  // namespace pf_fast
 bool g_mv = true;   // IK2_MV=0: a few tokens' experts through the FP16 GEMMs too
 // How often each expert is picked by a token (prefill and decode), [n_layer * E]: IK2_POP_OUT=FILE writes it at
 // the end (int32 n_layer, int32 E, then uint64 counts); IK2_WARM=FILE fills the expert cache with the most picked
@@ -376,12 +474,68 @@ inline bool dual() { return g_ep || g_tp; }
 std::vector<uint8_t> g_ep_own;
 inline int ep_owner(int l, int e) { return g_ep_own[(size_t) l * g_pop_E_ep + e]; }
 bool g_flash = true;   // IK2_FLASH=0: the prefill's attention (FP16 KV) through the logits in memory and cuBLAS, not fused
+bool g_flash_wmma = true;   // IK2_FLASH_WMMA=0: gfx1100 uses the scalar/cuBLAS attention even when fused is on
+bool g_gate_fuse = true;    // IK2_GATE_FUSE=0: the scalar decode's output gate as its own gate_mul launch, not the combine's epilogue
+bool g_rms_fuse = true;     // IK2_RMS_FUSE=0: layer-0 full attention's q/k/v norms as three rms launches, not one rms_multi
+bool g_onepass = false;     // IK2_ATTN_ONEPASS=1: sliding decode attention split+combine as one launch (env-gated experiment)
+bool g_loopbank_fuse = false;  // IK2_LOOPBANK_FUSE=1: loop-core pass>0 bank copies as one kernel, not n_bank+1 D2D memcpys
+bool g_int4_experts = true;  // IK2_INT4_EXPERTS=0: NVFP4 experts; default ON: rotated-int4 device-resident experts (l<20), falls back to NVFP4 when int4-bin absent
+int g_int4_layers = 20;      // IK2_INT4_LAYERS: number of low layers served by rotated-int4 sidecars (24 = also convert the Q8_0 l>=20 experts, ~2 GiB smaller for 1M context)
+bool g_i4_mid_fuse = false;  // IK2_I4_MID_FUSE=1: fused swiglu+prep_down+rot (SLOWER on gfx1100: 92.0 vs 93.8; kept for reference)
+int g_i4_rot_in = 0;         // IK2_I4_ROT_IN: phase D, 1 = gate_up rot-in-matvec, 2 = also down prep+rot-in (default off)
+bool g_int4_pf_off = false;   // IK2_INT4_PF=0: disable INT4 prefill experts (isolate decode vs prefill bug)
+bool g_verify_fast = false;   // IK2_VERIFY_FAST=1: device-only INT4 verify MoE (g_rec, T=2..8): the T=1 resident
+                              // sequence at S=T*K slots, no route D2H / stream sync (graph-capturable). Default OFF.
+bool g_verify_graph = false;  // IK2_VERIFY_GRAPH=1: capture the T=8 verify forward once and replay it. Needs
+                              // IK2_VERIFY_FAST=1 and the single-GPU resident path. Default OFF.
+bool g_moe_group_exp = false; // IK2_MOE_GROUP_EXPERT=1: verify-fast MoE grouped BY EXPERT -- each expert's
+                              // weights read once for all its slots (bit-exact vs k_mv_grouped). Needs
+                              // IK2_VERIFY_FAST=1. Default OFF.
+enum VGStage { VG_NORMAL = 0, VG_CAPTURE = 1, VG_REPLAY = 2 };
+VGStage g_vg_stage = VG_NORMAL;
+bool g_int4_dense = true;     // IK2_INT4_DENSE=0: disable rotated-int4 sidecars for the dense projections' DECODE matvecs (byte-identical Q8 path)
+                              // (wqkvrg/wqrg/wk/wv/wo); default OFF, the Q8_0 path byte-identical. Prefill stays Q8.
+bool g_int4_dense_multi = false;  // IK2_INT4_DENSE_MULTI=1: int4 W4A8 GEMM for T=2..8 verify dense projections (default OFF)
+bool g_int4_msg = false;      // IK2_INT4_MSG=1: int4 W4A8 GEMM for the looped layers' msg row slices of wqkvrg
+bool g_int4_dense_mv = true;  // IK2_INT4_DENSE_MV=0: verify projections via 256-tiled WMMA GEMM (7/8 waves idle at T=8)
+bool g_int4_prefill = false;  // IK2_INT4_PREFILL=1: int4 W4A8 WMMA GEMM for ALL prefill dense projections (T>8),
+                              // reading the VRAM int4 sidecar instead of decoding host/Q8 to f16. Removes the
+                              // per-chunk Q8->f16 decode (the PCIe-read bottleneck when dense is host-mapped at 1M).
+                              // (T=2..8; reuses the whole-matrix sidecar with ft0-shifted pointers). Default OFF.
+bool g_int4_rot_dedup = false;  // IK2_INT4_ROT_DEDUP=1: rotate+quant each activation once per run_layer_attn call
+                                // (the msg branch projects in_q twice). Epoch-gated per call, never across visits.
+                                // Default OFF: the shared-scratch rotate-every-call path stays byte-identical.
+bool g_int4_mv_alt = false;   // IK2_INT4_MV_ALT=1: fuse the sliding msg branch's 4 wqkvrg row-slice matvecs into ONE
+                              // k_mv_alt launch over the full fused sidecar (per-tile activation select by row range).
+                              // Needs IK2_INT4_MSG + the dense MV path; default OFF keeps the 4-call path byte-identical.
+bool g_mv_lds = false;        // IK2_MV_LDS=1: dense verify matvec via k_mv_lds -- the NC-token activation staged into
+                              // LDS once per CTA, dot loop reads per-group slices from LDS (fewer live activation
+                              // VGPRs at NC=8). Bit-exact vs int4_matvec; default OFF keeps that path byte-identical.
+bool g_int4_head = false;     // IK2_INT4_HEAD=1: int4 W4A8 GEMM for the verify HEAD projection out_w (T=2..8). Default
+                              // OFF: the head stays f16/cuBLAS byte-identical. The drafter's fold reads M.out_w.f16
+                              // (the f16 WEIGHT copy), which this never touches; verify logits stay f32 in W.logits.
+bool g_int4_head_decode = false;  // IK2_INT4_HEAD_DECODE=1: T=1 decode head over the out_w INT4 sidecar (VRAM) instead
+                              // of the Q8 blocks. With IK2_DENSE_HOST=1 the Q8 head is host-mapped, so every token
+                              // read ~490 MiB over PCIe (60 ms = 81.7% of the 1M-ctx decode); the int4 sidecar is
+                              // ~240 MiB in VRAM (~1 ms). Needs IK2_INT4_HEAD=1 (sidecar loaded). Greedy may differ
+                              // from the Q8 head (int4 vs Q8 quantization) - measure parity.
+bool g_draft_head_int4 = true;    // IK2_DRAFT_HEAD_INT4=0 to disable: drafter base-logits head over out_w INT4 sidecar
+                              // INT4 sidecar (NC=7 matvec) instead of the FP16 head copy. Needs the sidecar loaded
+                              // (IK2_INT4_HEAD=1 + IK2_DENSE=q8); without it propose() falls back to gemm_h. Default
+                              // OFF keeps the draft byte-identical. fold still reads M.out_w.f16 either way.
+bool g_exp_prefill_wmma = false;   // IK2_EXPERTS_PREFILL_WMMA=1: NVFP4-direct multi-token WMMA prefill experts (skip decode_f16)
 int g_n_sm = 0;
 bool g_group = true;   // IK2_GROUP=0: 2 .. 8 tokens' experts a slot at a time, their attention a head at a time
 bool g_group_exp = true, g_group_attn = true;   // (IK2_GROUP=1: the experts grouped only, 2: the attention only)
 FILE* g_trace = nullptr;   // IK2_TRACE=FILE: each layer's picks, records of int32 (layer, T, K, T x K experts)
 struct Prof {
     double attn = 0, route = 0, upload = 0, experts = 0, rest = 0;
+    double pf_host = 0, pf_gpu = 0, pf_sync = 0;   // run_prefill_moe: host bookkeeping / GPU expert work / cache waits
+    double pf_dec = 0, pf_gemm = 0, pf_gather = 0, pf_scatter = 0, pf_swiglu = 0;   // run_exp phase split
+    double a_proj = 0, a_conv = 0, a_qk = 0, a_probs = 0, a_pv = 0, a_out = 0;   // run_layer_attn sub-phase split
+    double pf_loopgate = 0;   // loop_gates_chunk (FP32 cuBLAS rank-64 products)
+    int pf_calls = 0;
+    long br_rg = 0, br_mv = 0, br_pf = 0;   // IK2_BRANCH: which MoE path fires (resident-grouped / token / run_prefill_moe)
     double t = 0;
     void start() {
         if (g_prof) cudaStreamSynchronize(g_s), t = now();
@@ -398,12 +552,104 @@ struct Prof {
 template <class T>
 T* dalloc(size_t n) {
     T* p = nullptr;
+    size_t fr_b = 0, fr_a = 0, tt = 0;
+    const bool tr = getenv("IK2_VRAM_TRACE") != nullptr;
+    if (tr) CU(cudaMemGetInfo(&fr_b, &tt));
     CU(cudaMalloc(&p, std::max<size_t>(1, n) * sizeof(T)));
+    if (tr) {
+        CU(cudaMemGetInfo(&fr_a, &tt));
+        static size_t tot = 0; static int cnt = 0;
+        const size_t b = std::max<size_t>(1, n) * sizeof(T);
+        tot += b; ++cnt;
+        const size_t drop = fr_b > fr_a ? fr_b - fr_a : 0;
+        if (drop >= (64ull << 20) || cnt % 40 == 0)
+            std::printf("DALLOC #%d req %zu MiB drop %zu MiB free %.2f GiB (cum %zu MiB)\n", cnt, b >> 20, drop >> 20, fr_a / 1073741824.0, tot >> 20);
+    }
     return p;
+}
+// IK2_VRAM_TRACE: checkpoint free VRAM at a named load phase (finds the ctx-scaled hog outside dalloc).
+static void vram_mark(const char* tag) {
+    if (!getenv("IK2_VRAM_TRACE")) return;
+    size_t f = 0, t = 0; CU(cudaMemGetInfo(&f, &t));
+    std::printf("VRAM-MARK %-22s free %.2f GiB\n", tag, f / 1073741824.0);
+    std::fflush(stdout);
+}
+// IK2_KV_HOST_CAP: host-mapped (zero-copy) allocation for the long-context int KV. The device pointer reads/writes
+// host RAM over PCIe, so a 1M-token KV (8.4 GiB) costs ~0 VRAM and the model stays resident. Slower per token than
+// VRAM-resident KV (the attention reads the whole cache over PCIe) but it is the only way 1M fits beside the experts.
+// Returns a DEVICE pointer into pinned mapped host memory; *host_out is the host pointer (for free / serve).
+template <class T>
+T* halloc_mapped(size_t n, void** host_out) {
+    void* h = nullptr;
+    CU(cudaHostAlloc(&h, std::max<size_t>(1, n) * sizeof(T), cudaHostAllocMapped));
+    void* d = nullptr;
+    CU(cudaHostGetDevicePointer(&d, h, 0));
+    if (host_out) *host_out = h;
+    if (getenv("IK2_VRAM_TRACE"))
+        std::printf("HALLOC-MAPPED req %zu MiB (host RAM, device-visible)\n", (std::max<size_t>(1, n) * sizeof(T)) >> 20);
+    return (T*) d;
 }
 
 // Y [T][N] (ldy) = X [T][K] FP16 . W [N][K]^T FP16, F32 sums
+#if defined(STRATA_USE_HIP) && defined(IK2_WMMA_DEBUG)
+// Debug: run BOTH the gfx11 WMMA GEMM and hipBLAS, compare, report the worst shape, keep hipBLAS's result (correct).
+static void gemm16_wmma_debug(const uint16_t* W, int N, int Kd, const uint16_t* X, int T, float* Y, int ldy, float beta, bool use_wmma) {
+    const size_t yn = (size_t) T * ldy;
+    static float* yw = nullptr;
+    static size_t yw_cap = 0;
+    if (yn > yw_cap) { if (yw) cudaFree(yw); CU(cudaMalloc(&yw, yn * sizeof(float))); yw_cap = yn; }
+    CU(cudaMemsetAsync(yw, 0, yn * sizeof(float), g_s));
+    const bool ran = strata_wmma_gemm_f16(X, W, yw, T, N, Kd, ldy, beta, g_s);
+    const float one = 1.0f;
+    CB(cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, N, T, Kd, &one, W, CUDA_R_16F, Kd, X, CUDA_R_16F, Kd, &beta, Y,
+                    CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    CU(cudaStreamSynchronize(g_s));
+    if (!ran) { std::printf("WMMA_DBG declined N=%d K=%d T=%d ldy=%d beta=%.0f\n", N, Kd, T, ldy, beta); return; }
+    std::vector<float> a(yn), b(yn);
+    CU(cudaMemcpy(a.data(), yw, yn * sizeof(float), cudaMemcpyDeviceToHost));
+    CU(cudaMemcpy(b.data(), Y, yn * sizeof(float), cudaMemcpyDeviceToHost));
+    double maxd = 0; size_t wi = 0;
+    for (size_t i = 0; i < yn; ++i) {
+        const double d = std::fabs((double) a[i] - (double) b[i]);
+        if (d > maxd) { maxd = d; wi = i; }
+    }
+    if (maxd > 1e-2) {
+        std::printf("WMMA_DBG N=%d K=%d T=%d ldy=%d beta=%.0f maxd=%.4g at t=%zu n=%zu wmma=%.5g blas=%.5g\n",
+                    N, Kd, T, ldy, beta, maxd, wi / ldy, wi % ldy, a[wi], b[wi]);
+        std::fflush(stdout);
+    }
+    if (use_wmma && ran) CU(cudaMemcpyAsync(Y, yw, yn * sizeof(float), cudaMemcpyDeviceToDevice, g_s));
+}
+#endif
 void gemm16(const uint16_t* W, int N, int Kd, const uint16_t* X, int T, float* Y, int ldy, float beta = 0.0f) {
+#if defined(STRATA_USE_HIP)
+#if defined(IK2_WMMA_DEBUG)
+    {
+        // IK2_WMMA_DEBUG=1 compares WMMA vs hipBLAS but keeps hipBLAS; =2 uses WMMA's result (test correctness).
+        static const int dbg_use = getenv("IK2_WMMA_DEBUG") ? std::atoi(getenv("IK2_WMMA_DEBUG")) : 1;
+        gemm16_wmma_debug(W, N, Kd, X, T, Y, ldy, beta, dbg_use == 2);
+        return;
+    }
+#endif
+    // IK2_WMMA_GEMM=1: the prompt projections on the gfx11 matrix cores instead of hipBLAS (opt-in; the default
+    // path is byte-identical). The wide shapes take the tuned 128x256 BK64 kernel (T>=64, N>=1024, K%64==0);
+    // everything else keeps hipBLAS. The 64x64 double-buffer kernel races on gfx1100, so it is never selected
+    // here. IK2_WMMA_TILE=1 forces the small single-wave path (debug).
+    static const int wmma_gemm = getenv("IK2_WMMA_GEMM") ? std::atoi(getenv("IK2_WMMA_GEMM")) : 0;
+    if (wmma_gemm) {
+        // The tuned 128x256 BK64 kernel wins on wide projections (T>=128, N>=1024); the small single-wave
+        // kernel wins on medium ones (T>=32, N>=512). Tiny shapes keep hipBLAS. The 64x64 double-buffer
+        // kernel races on gfx1100, so it is never selected. IK2_WMMA_TILE=1 forces the small path (debug).
+        static const int force_small = getenv("IK2_WMMA_TILE") ? std::atoi(getenv("IK2_WMMA_TILE")) : 0;
+        const bool wide = T >= 128 && N >= 1024 && Kd % 64 == 0;
+        const bool medium = T >= 32 && N >= 512 && Kd % 16 == 0;
+        bool ok = false;
+        if (force_small) ok = strata_wmma_gemm_f16(X, W, Y, T, N, Kd, ldy, beta, g_s);
+        else if (wide) ok = strata_pf_gemm_f16(X, W, Y, T, N, Kd, ldy, beta, g_s);
+        else if (medium) ok = strata_wmma_gemm_f16(X, W, Y, T, N, Kd, ldy, beta, g_s);
+        if (ok) return;
+    }
+#endif
     const float one = 1.0f;
     CB(cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, N, T, Kd, &one, W, CUDA_R_16F, Kd, X, CUDA_R_16F, Kd, &beta, Y,
                     CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
@@ -417,9 +663,25 @@ bool g_dense_q8 = false;
 // top-1 token (KL mean 8.5e-4) and FP8 changed 5 (KL 8.3e-3): Inkling's router is full of near-ties, so FP8's 1.5% in
 // layer 0's attention output already moves 7 of 48 tokens' experts.  The full layers' cache is 32 KB a token in FP16.
 bool g_kv_fp8 = false;
+// INT8 / INT4 KV (IK2_KV=int8 / int4): per-(token, KV-head) FP16 scale + symmetric int codes, software dequant.
+// int8 ~1.016 B/elem (precision baseline), int4 ~0.516 B/elem (halves the KV read bandwidth of fp8).  Kept as
+// separate flags so every existing g_kv_fp8 site keeps its exact FP8 semantics and the f16 default is untouched.
+enum KvMode { KV_F16 = 0, KV_FP8 = 1, KV_INT8 = 2, KV_INT4 = 3 };
+KvMode g_kv_mode = KV_F16;
+bool g_kv_int8 = false, g_kv_int4 = false;
+inline bool kv_is_int() { return g_kv_int8 || g_kv_int4; }
+inline int kv_int_bits() { return g_kv_int4 ? 4 : 8; }
+// IK2_KV_HOST: host-map the WHOLE int KV of the full-attention visits (the ctx-scaled hog). 0 = VRAM (default,
+// byte-identical); 1 = host-mapped zero-copy (1M fits beside the experts, decode reads the cache over PCIe).
+int g_kv_host = 0;
+// IK2_DENSE_HOST: host-map the Q8_0 planar dense copies (prefill-only when int4 sidecars serve decode). Frees ~1.1 GiB
+// VRAM so the 1M int4 KV (8.4 GiB) fits beside the experts ALL IN VRAM -> 1M decode reads KV at VRAM speed, not PCIe.
+// Prefill decodes these host-mapped Q8 weights to f16 over PCIe (slower prefill, faster 1M decode). 0 = VRAM (default).
+int g_dense_host = 0;
 // Q8_0 blocks (2 bytes of FP16 scale, 32 int8 values) taken apart into m.q8 / m.q8d on the device; false if the
 // matrix cannot be kept so (another type, or K not a multiple of 128)
-bool upload_planar(Mat& m, const std::vector<const uint8_t*>& parts, const std::vector<size_t>& part_values) {
+bool upload_planar(Mat& m, const std::vector<const uint8_t*>& parts, const std::vector<size_t>& part_values,
+                   bool force_vram = false) {
     if (m.type != k::kQ8_0 || m.K % 128) return false;
     size_t n = 0;
     for (size_t v : part_values) n += v;
@@ -433,14 +695,20 @@ bool upload_planar(Mat& m, const std::vector<const uint8_t*>& parts, const std::
             std::memcpy(&q[b * 32], p + 2, 32);
         }
     }
-    m.q8 = dalloc<int8_t>(n);
-    m.q8d = dalloc<uint16_t>(n / 32);
+    if (g_dense_host && !force_vram) {
+        // host-mapped zero-copy: prefill decode_q8p_f16 reads these over PCIe; decode uses int4 sidecars (VRAM).
+        m.q8 = halloc_mapped<int8_t>(n, nullptr);
+        m.q8d = halloc_mapped<uint16_t>(n / 32, nullptr);
+    } else {
+        m.q8 = dalloc<int8_t>(n);
+        m.q8d = dalloc<uint16_t>(n / 32);
+    }
     CU(cudaMemcpy(m.q8, q.data(), n, cudaMemcpyHostToDevice));
     CU(cudaMemcpy(m.q8d, d.data(), n / 32 * 2, cudaMemcpyHostToDevice));
     return true;
 }
 
-Mat load_mat(const Shards& S, const std::string& n, int N, int Kd) {
+Mat load_mat(const Shards& S, const std::string& n, int N, int Kd, bool force_vram = false, bool skip_q8 = false) {
     const auto* t = S.info(n);
     if (!t) die("no tensor " + n);
     if (t->elements() != (uint64_t) N * Kd) die(n + ": " + std::to_string(t->elements()) + " values");
@@ -449,8 +717,13 @@ Mat load_mat(const Shards& S, const std::string& n, int N, int Kd) {
     Mat m;
     m.type = (int) t->type, m.N = N, m.K = Kd;
     const size_t nb = tensor_bytes(*t);
+    if (skip_q8) {
+        // IK2_INT4_HEAD_DECODE: the head is loaded as its INT4 sidecar (below); no Q8/raw copy. The sidecar is
+        // the only weight copy - decode and prefill both read it. m.type stays kQ8_0 for any block fallback.
+        return m;
+    }
     if (g_dense_q8) {
-        if (upload_planar(m, {S.data(n)}, {(size_t) N * Kd})) return m;
+        if (upload_planar(m, {S.data(n)}, {(size_t) N * Kd}, force_vram)) return m;
         m.raw = dalloc<uint8_t>(nb);
         CU(cudaMemcpy(m.raw, S.data(n), nb, cudaMemcpyHostToDevice));
         return m;
@@ -603,12 +876,20 @@ bool try_load_fused_raw(const Shards& S, const std::vector<MatPart>& parts, int 
 
 // one token's product over a dense matrix kept as the GGUF's blocks, or planar
 void mv1(const Mat& m, const float* x, float* y) {
+    if (m.i4Wp && (!m.i4_head_only || g_int4_head_decode) && !m.i4_row_slice) {   // IK2_INT4_DENSE: rotated-int4 sidecar, rotation folded into the matvec prologue (head too when IK2_INT4_HEAD_DECODE)
+        k::int4_dense_rot(m.i4Wp, m.i4Wh, m.i4WS, m.N, m.K, x, y, k::MvConv{}, k::MvConv{}, 1.f / (1 << k::kInt4Sh8), g_s);
+        return;
+    }
     if (m.q8) k::mv_q8p(m.q8, m.q8d, m.N, m.K, x, y, g_s);
     else k::mv_blocks(m.type, m.raw, m.N, m.K, x, y, g_s);
 }
 // ... with up to two short convs on its rows: the planar Q8 product has them as its epilogue (a launch less each;
 // those rows of y are then not written), any other matrix gets the product and then the convs
 void mv1c(const Mat& m, const float* x, float* y, const k::MvConv& c0, const k::MvConv& c1 = k::MvConv{}) {
+    if (m.i4Wp && !m.i4_head_only && !m.i4_row_slice) {   // IK2_INT4_DENSE: same fused conv epilogue as the planar Q8 path, over the int4 product
+        k::int4_dense_rot(m.i4Wp, m.i4Wh, m.i4WS, m.N, m.K, x, y, c0, c1, 1.f / (1 << k::kInt4Sh8), g_s);
+        return;
+    }
     if (m.q8) {
         k::mv_q8p_conv(m.q8, m.q8d, m.N, m.K, x, y, c0, c1, g_s);
         return;
@@ -622,7 +903,32 @@ uint16_t* g_w16 = nullptr;   // a matrix's FP16 decode for the prompt path's GEM
 size_t g_w16_n = 0;          // values it holds
 // Y [T][N] = X [T][K] . W^T: one token straight over the blocks (x32), more through an FP16 decode and a GEMM (x16).
 // A matrix larger than the decode buffer (the head: its few rows of logits) goes a token at a time over its blocks.
+bool try_int4_dense_multi(const Mat& m, const float* x32, int T, float* Y, int ldy);
+bool try_int4_dense_mv(const Mat& m, const float* x32, int T, float* Y, int ldy);
 void matmul(const Mat& m, const float* x32, const uint16_t* x16, int T, float* Y, int ldy) {
+    // IK2_INT4_DENSE_MULTI for the verify projections; IK2_INT4_HEAD for the head out_w (i4_head_only);
+    // IK2_INT4_MSG for wqkvrg row slices (i4_row_slice). The head sidecar is reserved for this T=2..8 GEMM:
+    // mv1/mv1c and the DENSE_MULTI gate skip it, so T=1 decode and the prompt path (chunks of 16) keep their
+    // existing route even when IK2_INT4_HEAD=1.
+    const bool i4_multi = m.i4_head_only ? g_int4_head : (m.i4_row_slice ? g_int4_msg : g_int4_dense_multi);
+    // IK2_INT4_DENSE_MV: verify projections over the decode-style dp4a matvec instead of the prefill WMMA GEMM.
+    // The GEMM tiles the token dim to 256, so T=8 leaves 7 of 8 waves idle; the matvec reads each weight row once
+    // and reuses it across the T tokens (NC). rot+quant once, then one launch per matrix (slices keep ldy).
+    if (i4_multi && g_int4_dense_mv && m.i4Wp && m.i4Wh && m.i4WS && x32 && T > 1 && T <= 8 &&
+        m.K % 256 == 0 && m.N % 16 == 0 && (m.i4_row_slice ? ldy >= m.N : ldy == m.N) &&
+        try_int4_dense_mv(m, x32, T, Y, ldy))
+        return;
+    if (i4_multi && m.i4Wp && m.i4Wh && m.i4WS && x32 && T > 1 && T <= 8 &&
+        m.K % 256 == 0 && m.N % 32 == 0 && (m.i4_row_slice ? ldy >= m.N : ldy == m.N) &&
+        try_int4_dense_multi(m, x32, T, Y, ldy))
+        return;
+    // IK2_INT4_PREFILL: the int4 W4A8 WMMA GEMM for ANY prefill chunk (T>8). Reads the VRAM int4 sidecar
+    // directly (no Q8->f16 decode), which is the lever when dense is host-mapped at long context. The GEMM
+    // tiles N to 256, so it is efficient for large T (unlike T=8 where the dp4a matvec above wins).
+    if (g_int4_prefill && !m.i4_head_only && m.i4Wp && m.i4Wh && m.i4WS && x32 && T > 8 &&
+        m.K % 256 == 0 && m.N % 32 == 0 && (m.i4_row_slice ? ldy >= m.N : ldy == m.N) &&
+        try_int4_dense_multi(m, x32, T, Y, ldy))
+        return;
     if (m.f16) {
         gemm16(m.f16, m.N, m.K, x16, T, Y, ldy);
         return;
@@ -884,7 +1190,7 @@ struct ExpertCache {
         die("expert cache: no slot free");
     }
 
-    void init(const std::vector<Layer>& L, int dev, int n_layers_in, int E_in, size_t budget) {
+    void init(const std::vector<Layer>& L, int dev, int n_layers_in, int E_in, size_t budget, int int4_below = 0) {
         n_layers = n_layers_in;
         E = E_in;
         layer_pool.assign(n_layers, -1);
@@ -905,7 +1211,15 @@ struct ExpertCache {
         for (auto& kv : by_sb) grps.push_back({kv.first, std::move(kv.second)});
         auto min_req_bytes = [&]() {
             size_t s = 0;
-            for (const auto& g : grps) s += (size_t) std::min(E, (int) g.layers.size() * E) * g.sb;
+            for (const auto& g : grps) {
+                // INT4 pools serve prefill STREAMING only (decode reads the i4_* sidecars, already resident). A small
+                // working set suffices; requiring a full 128-expert pool here would OOM at 1M ctx where the KV hog
+                // leaves little VRAM. Non-INT4 (Q8 decode-critical) pools still need their full per-layer minimum.
+                bool pool_all_int4 = int4_below > 0;
+                for (int l : g.layers) if (l >= int4_below) pool_all_int4 = false;
+                const int min_e = pool_all_int4 ? 2 : std::min(E, (int) g.layers.size() * E);
+                s += (size_t) min_e * g.sb;
+            }
             return s;
         };
         while (grps.size() > 1 && (min_req_bytes() > budget || grps.size() > 4)) {
@@ -928,12 +1242,42 @@ struct ExpertCache {
 
         pools.resize(grps.size());
         std::vector<int> pmin(grps.size()), pmax(grps.size());
+        std::vector<bool> is_int4_pool(grps.size(), false);
         for (size_t p = 0; p < grps.size(); ++p) {
             pools[p].slot_bytes = grps[p].sb;
             pools[p].n_layers = (int) grps[p].layers.size();
             for (int l : grps[p].layers) layer_pool[l] = (int) p;
             pmax[p] = pools[p].n_layers * E;
+            // INT4 layers (l<int4_below) use i4_* buffers for decode; their cache slots serve prefill streaming
+            // only. Cap them so the VRAM budget leaves the l>=20 Q8 pools fully resident (needed for decode).
+            bool all_int4 = int4_below > 0;
+            for (int l : grps[p].layers) if (l >= int4_below) all_int4 = false;
+            is_int4_pool[p] = all_int4;
+            if (all_int4) pmax[p] = std::min(pmax[p], E + 16);
             pmin[p] = std::min(min_base, pmax[p]);
+        }
+        // Guarantee full residency for the non-INT4 (l>=int4_below, Q8_0 decode-critical) pools FIRST: reserve
+        // their pmax up front, then size the capped INT4 prefill-streaming pools from the remainder. Without this
+        // the spl binary search + greedy grow can leave a Q8 pool a few slots short when dense INT4 sidecars
+        // shrink the budget, dropping the resident path (and long-context decode) entirely.
+        if (int4_below > 0) {
+            size_t reserved = 0;
+            for (size_t p = 0; p < pools.size(); ++p)
+                if (!is_int4_pool[p]) reserved += (size_t) pmax[p] * pools[p].slot_bytes;
+            if (reserved <= budget) {
+                const size_t int4_budget = budget - reserved;
+                size_t iused = 0;
+                for (size_t p = 0; p < pools.size(); ++p)
+                    if (is_int4_pool[p]) iused += (size_t) pmin[p] * pools[p].slot_bytes;
+                size_t irem = int4_budget > iused ? int4_budget - iused : 0;
+                for (size_t p = 0; p < pools.size(); ++p) {
+                    if (!is_int4_pool[p]) { pools[p].n_slots = pmax[p]; continue; }
+                    int ns = pmin[p];
+                    while (ns < pmax[p] && pools[p].slot_bytes <= irem) { ++ns; irem -= pools[p].slot_bytes; }
+                    pools[p].n_slots = ns;
+                }
+                goto pools_sized;
+            }
         }
         auto used_for = [&](double spl) {
             size_t u = 0;
@@ -966,6 +1310,7 @@ struct ExpertCache {
                 }
             }
         }
+    pools_sized:
         for (size_t p = 0; p < pools.size(); ++p) {
             Pool& P = pools[p];
             P.prob_cap = std::max(1, P.n_slots / 5);
@@ -1144,6 +1489,44 @@ struct Work {
     std::vector<uint64_t> use_tot;   // [layer] their sum
     float* wtr = nullptr;        // [S] the routing weight of each expert-sorted row
     float* wtr_h[2] = {nullptr, nullptr};
+    // IK2_INT4_EXPERTS decode scratch
+    int8_t *i4_xq = nullptr; float2 *i4_xd = nullptr;        // [C], [C/32]: quantized input activation (verify-fast: [Tm] rows)
+    float *i4_hf = nullptr; int8_t *i4_hq = nullptr; float2 *i4_hd = nullptr;   // [S][Kpad], [S][Kpad], [S][Kpad/32]
+    const uint8_t **i4_Wp_s = nullptr, **i4_Wh_s = nullptr; const float **i4_WS_s = nullptr;  // [S] per-slot ptrs (gate_up)
+    const uint8_t **i4_Wp_dn = nullptr, **i4_Wh_dn = nullptr; const float **i4_WS_dn = nullptr;  // [S] per-slot ptrs (down)
+    // IK2_MOE_GROUP_EXPERT: device-side expert->slot grouping of this visit's routing (S<=64 slots).
+    // gcnt/gexp [64], gslots [64*8], ngrp [1]. One build serves gate_up and down; fixed matvec grid.
+    int *i4_g_cnt = nullptr, *i4_g_slots = nullptr, *i4_g_exp = nullptr, *i4_g_n = nullptr;
+    int i4_Kpad_f = 0;
+    // IK2_INT4_EXPERTS prefill scratch: one expert's rows at a time (tiled to i4_pf_cap tokens)
+    float* i4_pf_x = nullptr;         // [cap][Kmax] f32 activations (gathered input / padded hidden)
+    uint8_t* i4_pf_x4 = nullptr;      // two planes of cap * Kmax / 2 bytes each (hi nibbles, then lo)
+    uint8_t* i4_pf_xm = nullptr;      // [cap/16][Kmax/256] block maxima, 16 bytes per block
+    float* i4_pf_xr = nullptr;        // [cap] row residual scales
+    int i4_pf_cap = 0;                // rows the scratch holds (T_buf rounded up to 256)
+    int i4_pf_Kmax = 0;               // Kmax the i4_pf_x4/xm/xr scratch was allocated for
+    int8_t* i4_mv_xq = nullptr;       // IK2_INT4_DENSE_MV: decode-matvec activation codes [T][Kmax]
+    float2* i4_mv_xd = nullptr;       // IK2_INT4_DENSE_MV: per-32-group (d, d*sum) scales [T][Kmax/32]
+    // IK2_INT4_MV_ALT: the fused msg matvec needs in_q/in_k/in_v rotated CONCURRENTLY (one launch reads all
+    // three by row range). Slots 0/1/2 = in_q/in_k/in_v; slot 0 is reused for the r+gate rows. Same [T][Kmax]
+    // layout as i4_mv_xq/xd, allocated only when the env is on. Never aliased with i4_mv_xq/xd or the dedup slots.
+    int8_t* i4_ma_xq[3] = {};
+    float2* i4_ma_xd[3] = {};
+    // IK2_INT4_ROT_DEDUP: per-input rotation slots. Each slot owns its codes/scales, so in_q's rotation survives
+    // the in_k/in_v rotations between the msg branch's two in_q projections. A slot is valid only for the
+    // run_layer_attn call that filled it: the key includes the call epoch (W.xq/xk/xv are reused across visits
+    // with DIFFERENT content, so the pointer alone is never a safe key) and hits are confined to the call by
+    // i4_rot_in_attn (RAII in run_layer_attn). Eviction only costs a re-rotation, never correctness.
+    static constexpr int kI4RotSlots = 4;   // msg visit: in_q, in_k, in_v + wo's W.o
+    int8_t* i4_rd_xq[kI4RotSlots] = {};     // per-slot activation codes [T][Kmax]
+    float2* i4_rd_xd[kI4RotSlots] = {};     // per-slot (d, d*sum) scales [T][Kmax/32]
+    const float* i4_rd_src[kI4RotSlots] = {};   // slot key: input pointer
+    int i4_rd_T[kI4RotSlots] = {};          // slot key: token rows
+    int i4_rd_K[kI4RotSlots] = {};          // slot key: activation width
+    uint64_t i4_rd_ep[kI4RotSlots] = {};    // slot key: run_layer_attn epoch the codes were rotated in
+    uint64_t i4_rot_epoch = 0;              // bumped at every run_layer_attn entry AND exit (host-only)
+    bool i4_rot_in_attn = false;            // true only while a run_layer_attn call is on the stack
+    int i4_rd_next = 0;                     // round-robin slot for the next miss
     // prefill attention: the relative bias of up to kRelbRows queries x heads, [rows * H][extent] (IK2_RELB=0: off)
     static constexpr int kRelbRows = 512;
     float* relb = nullptr;
@@ -1274,6 +1657,57 @@ std::vector<DevCtx> g_dev;
 int g_cur = -1;
 Work& dev_work(int d) { return g_dev[d].W; }
 ExpertCache& dev_cache(int d) { return g_dev[d].EC; }
+// IK2_INT4_DENSE_MULTI / IK2_INT4_MSG: pack T float rows and run the W4A8 GEMM on the current device. The scratch
+// is the prefill-expert rot_pack8 buffer, unused by this multi-token dense path in the same forward call.
+bool try_int4_dense_multi(const Mat& m, const float* x32, int T, float* Y, int ldy) {
+    if (g_cur < 0 || g_cur >= (int) g_dev.size()) return false;
+    Work& W = dev_work(g_cur);
+    if (!W.i4_pf_x4 || !W.i4_pf_xm || !W.i4_pf_xr || W.i4_pf_cap < 256 || m.K > W.i4_pf_Kmax) return false;
+    k::int4_rot_pack8(x32, T, m.K, W.i4_pf_x4, W.i4_pf_xm, W.i4_pf_xr, g_s);
+    k::int4_gemm8(m.i4Wp, m.i4Wh, m.i4WS, m.N, m.K, W.i4_pf_x4, W.i4_pf_xm, W.i4_pf_xr,
+                  T, 4, 8, Y, nullptr, k::kInt4Sh8, g_s, ldy);
+    return true;
+}
+// IK2_INT4_DENSE_MV: same projection over the decode dp4a matvec (NC=T). Reads each weight row once and reuses
+// it across the T tokens, avoiding the GEMM's 256-token tiling (7/8 waves idle at T=8). One rot+quant + one launch.
+bool try_int4_dense_mv(const Mat& m, const float* x32, int T, float* Y, int ldy) {
+    if (g_cur < 0 || g_cur >= (int) g_dev.size()) return false;
+    Work& W = dev_work(g_cur);
+    if (!W.i4_mv_xq || !W.i4_mv_xd || m.K > W.i4_pf_Kmax || T > (g_verify_fast ? 8 : 1)) return false;
+    // IK2_INT4_ROT_DEDUP: the rotation is a pure function of (x32, T, K), so within ONE run_layer_attn call an
+    // input already rotated into its own slot needs no second rotation (the msg branch projects in_q twice).
+    // The epoch matches only the current call and the flag is only set inside it, so codes from a previous
+    // visit (same W.xq/xk/xv pointers, new content) or an outside matmul (the head rewrites W.xq) never hit.
+    if (g_int4_rot_dedup && W.i4_rot_in_attn && W.i4_rd_xq[0]) {
+        int hit = -1;
+        for (int i = 0; i < Work::kI4RotSlots; ++i)
+            if (W.i4_rd_ep[i] == W.i4_rot_epoch && W.i4_rd_src[i] == x32 && W.i4_rd_T[i] == T && W.i4_rd_K[i] == m.K) {
+                hit = i;
+                break;
+            }
+        if (hit < 0) {
+            hit = W.i4_rd_next;
+            W.i4_rd_next = (W.i4_rd_next + 1) % Work::kI4RotSlots;
+            k::int4_rot_q8x(x32, T, m.K, W.i4_rd_xq[hit], W.i4_rd_xd[hit], g_s);
+            W.i4_rd_src[hit] = x32; W.i4_rd_T[hit] = T; W.i4_rd_K[hit] = m.K; W.i4_rd_ep[hit] = W.i4_rot_epoch;
+        }
+        if (g_mv_lds)   // IK2_MV_LDS: LDS-staged activation variant, bit-exact vs int4_matvec
+            k::int4_matvec_lds(m.i4Wp, m.i4Wh, m.i4WS, m.N, m.K, W.i4_rd_xq[hit], W.i4_rd_xd[hit], T, Y, ldy, nullptr,
+                               1.f / (1 << k::kInt4Sh8), g_s);
+        else
+            k::int4_matvec(m.i4Wp, m.i4Wh, m.i4WS, m.N, m.K, W.i4_rd_xq[hit], W.i4_rd_xd[hit], T, Y, ldy, nullptr,
+                           1.f / (1 << k::kInt4Sh8), g_s);
+        return true;
+    }
+    k::int4_rot_q8x(x32, T, m.K, W.i4_mv_xq, W.i4_mv_xd, g_s);
+    if (g_mv_lds)   // IK2_MV_LDS: LDS-staged activation variant, bit-exact vs int4_matvec
+        k::int4_matvec_lds(m.i4Wp, m.i4Wh, m.i4WS, m.N, m.K, W.i4_mv_xq, W.i4_mv_xd, T, Y, ldy, nullptr,
+                           1.f / (1 << k::kInt4Sh8), g_s);
+    else
+        k::int4_matvec(m.i4Wp, m.i4Wh, m.i4WS, m.N, m.K, W.i4_mv_xq, W.i4_mv_xd, T, Y, ldy, nullptr,
+                       1.f / (1 << k::kInt4Sh8), g_s);
+    return true;
+}
 void use_dev(int d) {
     if (d == g_cur) return;
     if (g_stage) cudaFree(g_stage), g_stage = nullptr, g_stage_bytes = 0;   // (the previous device's)
@@ -1302,6 +1736,28 @@ __global__ void gather_f16_16_kernel(const uint16_t* __restrict__ x16, const int
     for (int i = threadIdx.x; i < n4; i += blockDim.x) dst[i] = src[i];
 }
 
+#if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
+// FP16 rows gathered to F32 (the INT4 prefill's activation input): y [n][C] = x[idx[i]][C].
+__global__ void gather_f32_16_kernel(const uint16_t* __restrict__ x16, const int* __restrict__ idx, int n, int C,
+                                     float* __restrict__ y) {
+    const int row = blockIdx.x;
+    if (row >= n) return;
+    const uint16_t* src = x16 + (size_t) idx[row] * C;
+    float* dst = y + (size_t) row * C;
+    for (int i = threadIdx.x; i < C; i += blockDim.x) dst[i] = __half2float(__ushort_as_half(src[i]));
+}
+
+// h [n][F] FP16 -> x [n][Kpad] F32, zero-padded (INT4 down-projection input). One block per row.
+__global__ void i4_pad_h_kernel(const uint16_t* __restrict__ h, int n, int F, int Kpad, float* __restrict__ x) {
+    const int row = blockIdx.x;
+    if (row >= n) return;
+    const uint16_t* src = h + (size_t) row * F;
+    float* dst = x + (size_t) row * Kpad;
+    for (int i = threadIdx.x; i < Kpad; i += blockDim.x)
+        dst[i] = i < F ? __half2float(__ushort_as_half(src[i])) : 0.0f;
+}
+#endif
+
 // out[idx[row]] += wr[row] * y[row] over rows (one expert's tokens: each token at most once, so no two rows collide)
 __global__ void scatter_add_rows_kernel(const float* __restrict__ y, const int* __restrict__ idx,
                                         const float* __restrict__ wr, int C, float* __restrict__ out, int ld) {
@@ -1321,6 +1777,17 @@ __global__ void scatter_add_rows_kernel(const float* __restrict__ y, const int* 
 Mat mat_rows(const Mat& m, int r0, int n) {   // the rows [r0, r0 + n) of a matrix
     Mat p = m;
     p.N = n;
+    p.i4Wp = p.i4Wh = nullptr;   // the int4 sidecar is whole-matrix; a row slice falls back to q8/raw/f16
+    p.i4WS = nullptr;
+    // IK2_INT4_MSG: the repack is 16-row-block local, so rows [r0, r0+n) read the whole-matrix sidecar from the
+    // block ft0 = r0/16 on: Wp ft0*nsb*2048 bytes, Wh ft0*nsb*64 bytes, WS r0 floats (nsb = K/256).
+    if (g_int4_msg && m.i4Wp && !m.i4_head_only && r0 % 16 == 0 && n % 16 == 0 && m.K % 256 == 0) {
+        const size_t nsb = m.K / 256, ft0 = r0 / 16;
+        p.i4Wp = m.i4Wp + ft0 * nsb * 2048;
+        p.i4Wh = m.i4Wh + ft0 * nsb * 64;
+        p.i4WS = m.i4WS + r0;
+        p.i4_row_slice = true;
+    }
     if (m.f16) p.f16 = m.f16 + (size_t) r0 * m.K;
     else if (m.q8) p.q8 = m.q8 + (size_t) r0 * m.K, p.q8d = m.q8d + (size_t) r0 * (m.K >> 5);
     else p.raw = m.raw + (size_t) r0 * (m.K / k::block_values(m.type)) * k::block_bytes(m.type);
@@ -1335,6 +1802,7 @@ void matmul_rows(const Mat& m, int r0, int n, const float* x32, const uint16_t* 
 // of the prefill.  Here the products go through cuBLAS and the kernels are what is left around them.
 constexpr int kLoopGemmMin = 32;   // tokens from which the products are cuBLAS's
 void loop_gates_chunk(Work& W, const k::LoopGate* gt, int n, int T, int C, int R, float eps) {
+    const double tlg = g_prof && T >= kLoopGemmMin ? now() : 0;
     if (T < kLoopGemmMin) {
         k::loop_gates(gt, n, T, C, R, eps, W.lp_g, g_s);
         return;
@@ -1352,23 +1820,41 @@ void loop_gates_chunk(Work& W, const k::LoopGate* gt, int n, int T, int C, int R
         CB(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, C, T, R, &one, gt[j].G, C, g, R, &zero, gn, C));
         k::loop_gate_blend(gt[j].x, gt[j].m, f, gn, (size_t) T * C, gt[j].y, g_s);
     }
+    if (tlg) { cudaStreamSynchronize(g_s); g_pf.pf_loopgate += now() - tlg; }
 }
 
 // One layer's attention + post-attention conv + residual into r_out ([T][C]).
 // h_in ([T][C]) is unmodified and acts as the residual input; when l % c.block == 0, it is saved to blk(nb).
 // msg: a looped core's later pass - the layer's messages [4][T][C] (q's, k's, v's, the MoE's), which gate its q, k and
 // v inputs before their norms (so a sliding layer too projects each from its own input).
+// IK2_INT4_ROT_DEDUP scope: the rotation cache in try_int4_dense_mv may only hit inside ONE run_layer_attn
+// call. Entry bumps the epoch (the norms rewrite W.xq/xk/xv every visit, so the pointer alone is not a key);
+// the RAII destructor closes the scope on EVERY exit and bumps again, so later matmuls reading a rewritten
+// W.xq (verify MoE norm, the head's out_w) always take the original rotate-every-call path. Host-only state:
+// graph capture bakes each visit's own rotation kernels into the replayed stream sequence, unchanged.
+struct RotDedupScope {
+    Work& W;
+    bool on;
+    explicit RotDedupScope(Work& w) : W(w), on(g_int4_rot_dedup && w.i4_rd_xq[0] != nullptr) {
+        if (on) { ++W.i4_rot_epoch; W.i4_rot_in_attn = true; }
+    }
+    ~RotDedupScope() { if (on) { W.i4_rot_in_attn = false; ++W.i4_rot_epoch; } }
+};
 void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const float* h_in, const int* pos_p, int nb,
                     size_t blk_off, float* r_out, Work& W, const float* msg = nullptr) {
+    RotDedupScope rot_dedup_scope(W);   // (no-op unless IK2_INT4_ROT_DEDUP=1)
     const Config& c = M.c;
     const int C = c.C;
     const size_t TC = (size_t) T * C;
     auto blk = [&](int i) { return W.blocks + ((size_t) i * W.blk_ld + blk_off) * C; };
 
-    const bool need_x32 = g_dense_q8 && T == 1;
+    const bool need_x32 = g_dense_q8 && (T == 1 || g_int4_dense_multi || g_int4_msg || g_int4_prefill);
+    const bool apr = g_prof && T > 1;   // profile prefill attention sub-phases (sync per phase)
+    const double ap0 = apr ? now() : 0;
     const uint16_t* xk16 = W.x16;
     const uint16_t* xv16 = W.x16;
     const float *in_q = h_in, *in_k = h_in, *in_v = h_in;
+    if (vp_attn_idx >= 0) cudaEventRecord(vpR[vp_attn_idx], g_s);
     if (msg) {
         k::ResStates st{};
         for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
@@ -1419,14 +1905,37 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const int HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel;
     float *q_p = W.q, *k_p = W.kk, *v_p = W.vv, *r_p = W.rr, *gate_p = W.gate, *sink_p = W.sink;
     float *kd_p = W.dyn, *vd_p = W.dyn;
+    if (vp_attn_idx >= 0) cudaEventRecord(vpS[vp_attn_idx], g_s);
     if (Ly.sliding) {
         if (Ly.wqkvrg.N > 0) {
             if (msg) {   // the fused rows by the input they take: q | k | v | r, gate (and the sink)
                 const int N = Ly.wqkvrg.N;
-                matmul_rows(Ly.wqkvrg, 0, HD, in_q, W.x16, T, W.qkv, N);
-                matmul_rows(Ly.wqkvrg, HD, KD, in_k, xk16, T, W.qkv + HD, N);
-                matmul_rows(Ly.wqkvrg, HD + KD, KD, in_v, xv16, T, W.qkv + HD + KD, N);
-                matmul_rows(Ly.wqkvrg, HD + 2 * KD, N - HD - 2 * KD, in_q, W.x16, T, W.qkv + HD + 2 * KD, N);
+                // IK2_INT4_MV_ALT: one k_mv_alt launch over the WHOLE fused sidecar instead of four
+                // small-grid slice launches (k/v slices are 64 blocks on 96 CUs - latency-bound).
+                // Guards mirror matmul's DENSE_MV gate + mat_rows' slice conditions + try_int4_dense_mv,
+                // so this fires exactly where the OFF path took four k_mv launches. Same weights, same
+                // rotated codes per input (in_q rotated once, reused for r+gate), same per-row dp4a
+                // chain and reduction -> bit-identical W.qkv. Boundaries HD/HD+KD/HD+2KD are 16-aligned.
+                const int K = Ly.wqkvrg.K;
+                const bool mv_alt = g_int4_mv_alt && g_int4_msg && g_int4_dense_mv &&
+                                    Ly.wqkvrg.i4Wp && Ly.wqkvrg.i4Wh && Ly.wqkvrg.i4WS && !Ly.wqkvrg.i4_head_only &&
+                                    K % 256 == 0 && N % 16 == 0 && HD % 16 == 0 && KD % 16 == 0 &&
+                                    in_q && in_k && in_v && T > 1 && T <= (g_verify_fast ? 8 : 1) &&
+                                    K <= W.i4_pf_Kmax && W.i4_ma_xq[0] && W.i4_ma_xd[0];
+                if (mv_alt) {
+                    k::int4_rot_q8x(in_q, T, K, W.i4_ma_xq[0], W.i4_ma_xd[0], g_s);
+                    k::int4_rot_q8x(in_k, T, K, W.i4_ma_xq[1], W.i4_ma_xd[1], g_s);
+                    k::int4_rot_q8x(in_v, T, K, W.i4_ma_xq[2], W.i4_ma_xd[2], g_s);
+                    k::int4_matvec_alt(Ly.wqkvrg.i4Wp, Ly.wqkvrg.i4Wh, Ly.wqkvrg.i4WS, N, K,
+                                       W.i4_ma_xq[0], W.i4_ma_xd[0], W.i4_ma_xq[1], W.i4_ma_xd[1],
+                                       W.i4_ma_xq[2], W.i4_ma_xd[2], HD, HD + KD, HD + 2 * KD,
+                                       T, W.qkv, N, 1.f / (1 << k::kInt4Sh8), g_s);
+                } else {
+                    matmul_rows(Ly.wqkvrg, 0, HD, in_q, W.x16, T, W.qkv, N);
+                    matmul_rows(Ly.wqkvrg, HD, KD, in_k, xk16, T, W.qkv + HD, N);
+                    matmul_rows(Ly.wqkvrg, HD + KD, KD, in_v, xv16, T, W.qkv + HD + KD, N);
+                    matmul_rows(Ly.wqkvrg, HD + 2 * KD, N - HD - 2 * KD, in_q, W.x16, T, W.qkv + HD + 2 * KD, N);
+                }
             } else {
                 matmul(Ly.wqkvrg, in_q, W.x16, T, W.qkv, Ly.wqkvrg.N);
             }
@@ -1517,14 +2026,40 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f;
     const float v_scale = 32.0f;
     const float k_inv = 1.0f / k_scale, v_inv = 1.0f / v_scale;
-    if (g_kv_fp8) {
+    if (vp_attn_idx >= 0) cudaEventRecord(vpP[vp_attn_idx], g_s);
+    double ap1 = ap0;
+    if (apr) { cudaStreamSynchronize(g_s); ap1 = now(); g_pf.a_proj += ap1 - ap0; }
+    if (kv_is_int()) {
+        const int bits = kv_int_bits();
+        if (g_vg_stage != VG_NORMAL) {
+            k::prep_qkv_r_int_g(bits, q_p, Ly.q_clip, W.kconv, Ly.kci, Ly.ks, W.vconv, Ly.vci, Ly.vs, r_p, Ly.r_clip,
+                                T, c.H, c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps,
+                                Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos_p, Ly.kv_cap, g_s);
+        } else {
+            k::prep_qkv_r_int(bits, q_p, Ly.q_clip, W.kconv, Ly.kci, Ly.ks, W.vconv, Ly.vci, Ly.vs, r_p, Ly.r_clip,
+                              T, c.H, c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps,
+                              Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0, Ly.kv_cap, g_s);
+        }
+    } else if (g_kv_fp8) {
+        if (g_vg_stage != VG_NORMAL) {
+            k::prep_qkv_r_fp8_g(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, T, c.H, c.KV, c.D,
+                                c.d_rel, c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha,
+                                c.n_floor, pos_p, Ly.kv_cap, k_scale, v_scale, g_s);
+        } else {
         k::prep_qkv_r_fp8(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                           c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
                           Ly.kv_cap, k_scale, v_scale, g_s);
+        }
     } else {
+        if (g_vg_stage != VG_NORMAL) {
+            k::prep_qkv_r_f16_g(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, T, c.H, c.KV, c.D,
+                                c.d_rel, c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha,
+                                c.n_floor, pos_p, Ly.kv_cap, g_s);
+        } else {
         k::prep_qkv_r_f16(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                           c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
                           Ly.kv_cap, g_s);
+        }
     }
 
     const int extent = Ly.sliding ? c.extent_swa : c.extent;
@@ -1534,8 +2069,13 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const float one = 1.0f, zero = 0.0f;
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
     const int attn_kv_cap = Ly.sliding ? Ly.kv_cap : 0;
+    if (apr) { cudaStreamSynchronize(g_s); const double n = now(); g_pf.a_conv += n - ap1; ap1 = n; }
+    if (vp_attn_idx >= 0) cudaEventRecord(vpK[vp_attn_idx], g_s);
     if (T == 1) {
-        if (g_kv_fp8) {
+        if (kv_is_int()) {
+            k::attn_decode_int(kv_int_bits(), q_p, r_p, sink_p, Ly.kci, Ly.vci, Ly.ks, Ly.vs, attn_kv_cap, c.H, c.KV,
+                               c.D, k0, nk, pos0, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+        } else if (g_kv_fp8) {
             k::attn_decode_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0,
                                qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         } else {
@@ -1543,7 +2083,22 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                                Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         }
     } else if (T <= 8 && g_group && g_group_attn) {
-        if (g_kv_fp8) {
+        if (g_vg_stage != VG_NORMAL) {
+            // P fixed at capture; W.lg is already sized for 8 queries x 128 splits.
+            if (kv_is_int())
+                k::attn_multi_int_g(kv_int_bits(), q_p, r_p, sink_p, Ly.kci, Ly.vci, Ly.ks, Ly.vs, attn_kv_cap, T,
+                                    c.H, c.KV, pos_p, 128, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
+                                    W.o, g_s);
+            else if (g_kv_fp8)
+                k::attn_multi_fp8_g(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, T, c.H, c.KV, pos_p, 128,
+                                    qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+            else
+                k::attn_multi_f16_g(q_p, r_p, sink_p, Ly.kc, Ly.vc, attn_kv_cap, T, c.H, c.KV, pos_p, 128, qk_scale,
+                                    Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+        } else if (kv_is_int()) {
+            k::attn_multi_int(kv_int_bits(), q_p, r_p, sink_p, Ly.kci, Ly.vci, Ly.ks, Ly.vs, attn_kv_cap, T, c.H,
+                              c.KV, k0, nk, pos0, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+        } else if (g_kv_fp8) {
             k::attn_multi_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, T, c.H, c.KV, k0, nk, pos0,
                               qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         } else {
@@ -1556,6 +2111,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         const int GQA = c.H / c.KV;
         // softmax rows (with the relative bias and the sink) -> lg16: the bias as one small GEMM (K = d_rel) first
         auto attn_probs = [&](int Tq, int nk_s, int ts, int k0_s) {
+            const double pb0 = apr ? now() : 0;
             if (W.relb && extent <= W.relb_ext) {
                 const float one_f = 1.0f, zero_f = 0.0f;
                 CB(cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, extent, Tq * c.H, c.d_rel, &one_f, Ly.rel_proj,
@@ -1567,8 +2123,16 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                 k::attn_probs_f16(W.lg, lg16, c.H, Tq, nk_s, pos0 + ts, k0_s, qk_scale, r_p + (size_t) ts * HR,
                                   c.d_rel, Ly.rel_proj, extent, window, sink_p + (size_t) ts * c.H, g_s);
             }
+            if (apr) { cudaStreamSynchronize(g_s); g_pf.a_probs += now() - pb0; }
         };
-        if (g_flash && c.D == 128 && W.relb && extent <= W.relb_ext) {
+        // int8/int4 prefill: the WMMA flash kernel dequantizes int codes to FP16 as staged (kv_intx8_h8), so int KV
+        // keeps the fast flash path; only a non-WMMA build falls back to unpack -> FP16 staging + the GEMM path below.
+        const bool int_flash_ok = kv_is_int()
+#if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
+            && g_flash_wmma
+#endif
+            ;
+        if (g_flash && c.D == 128 && W.relb && extent <= W.relb_ext && (!kv_is_int() || int_flash_ok)) {
             if (!g_n_sm) CU(cudaDeviceGetAttribute(&g_n_sm, cudaDevAttrMultiProcessorCount, Ly.dev));
             for (int ts = 0; ts < T; ts += Work::kRelbRows) {
                 const int Tq = std::min(Work::kRelbRows, T - ts);
@@ -1578,14 +2142,44 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                                 CUDA_R_32F, extent, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
                 const int k_lo = Ly.sliding ? std::max(0, pos0 + ts - c.window + 1) : 0;
                 const int ns = k::attn_flash_splits(Tq, c.H, pos0 + ts + Tq - k_lo, g_n_sm);
-                if (g_kv_fp8)
+                if (kv_is_int())
+#if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
+                    k::attn_flash_wmma_int(kv_int_bits(), W.x16 + (size_t) ts * HD, HD, Ly.kci, Ly.vci, Ly.ks, Ly.vs,
+                                           attn_kv_cap, c.H, c.KV, c.D, Tq, pos0 + ts, qk_scale, W.relb, extent, window,
+                                           sink_p + (size_t) ts * c.H, W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
+#else
+                    ;   // (int_flash_ok is false off a WMMA build; the unpack path below handles int)
+#endif
+                else if (g_kv_fp8)
+#if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
+                if (g_flash_wmma)
+                    k::attn_flash_wmma_fp8(W.x16 + (size_t) ts * HD, HD, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, Tq,
+                                           pos0 + ts, qk_scale * k_inv, v_inv, W.relb, extent, window,
+                                           sink_p + (size_t) ts * c.H, W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
+                else
                     k::attn_flash_fp8(W.x16 + (size_t) ts * HD, HD, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, Tq,
                                       pos0 + ts, qk_scale * k_inv, v_inv, W.relb, extent, window,
                                       sink_p + (size_t) ts * c.H, W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
+#else
+                    k::attn_flash_fp8(W.x16 + (size_t) ts * HD, HD, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, Tq,
+                                      pos0 + ts, qk_scale * k_inv, v_inv, W.relb, extent, window,
+                                      sink_p + (size_t) ts * c.H, W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
+#endif
+                else
+#if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
+                if (g_flash_wmma)
+                    k::attn_flash_wmma_f16(W.x16 + (size_t) ts * HD, HD, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, c.D, Tq,
+                                           pos0 + ts, qk_scale, W.relb, extent, window, sink_p + (size_t) ts * c.H,
+                                           W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
                 else
                     k::attn_flash_f16(W.x16 + (size_t) ts * HD, HD, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, c.D, Tq,
                                       pos0 + ts, qk_scale, W.relb, extent, window, sink_p + (size_t) ts * c.H,
                                       W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
+#else
+                    k::attn_flash_f16(W.x16 + (size_t) ts * HD, HD, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, c.D, Tq,
+                                      pos0 + ts, qk_scale, W.relb, extent, window, sink_p + (size_t) ts * c.H,
+                                      W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
+#endif
             }
         } else
         for (int ts = 0; ts < T;) {
@@ -1595,11 +2189,20 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             if (W.relb) Tq = std::min(Tq, Work::kRelbRows);
             const int nk_s = pos0 + ts + Tq - k0_s;
             const long long qn = (long long) Tq * nk_s;
-            if (g_kv_fp8) {
+            if (g_kv_fp8 || kv_is_int()) {
+                // int8/int4 rows unpack to the same FP16 staging (their per-row scale applied there); the
+                // QK / PV GEMMs below are unchanged.
+                auto unpack_kv = [&](int k_off, int nk_c) {
+                    if (kv_is_int())
+                        k::unpack_kv_int_to_f16(kv_int_bits(), Ly.kci, Ly.vci, Ly.ks, Ly.vs, attn_kv_cap,
+                                                k0_s + k_off, nk_c, KD, W.kv_k16, W.kv_v16, g_s);
+                    else
+                        k::unpack_kv_fp8_to_f16(Ly.kc8, Ly.vc8, attn_kv_cap, k0_s + k_off, nk_c, KD, k_inv, v_inv,
+                                                W.kv_k16, W.kv_v16, g_s);
+                };
                 for (int k_off = 0; k_off < nk_s; k_off += W.kv_tmp_cap) {
                     const int nk_c = std::min(W.kv_tmp_cap, nk_s - k_off);
-                    k::unpack_kv_fp8_to_f16(Ly.kc8, Ly.vc8, attn_kv_cap, k0_s + k_off, nk_c, KD, k_inv, v_inv, W.kv_k16,
-                                            W.kv_v16, g_s);
+                    unpack_kv(k_off, nk_c);
                     for (int g = 0; g < c.KV; ++g) {
                         const uint16_t* Kp = W.kv_k16 + (size_t) g * c.D;
                         CB(cublasGemmStridedBatchedEx(
@@ -1613,8 +2216,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                 for (int k_off = 0; k_off < nk_s; k_off += W.kv_tmp_cap) {
                     const int nk_c = std::min(W.kv_tmp_cap, nk_s - k_off);
                     if (nk_s > W.kv_tmp_cap) {
-                        k::unpack_kv_fp8_to_f16(Ly.kc8, Ly.vc8, attn_kv_cap, k0_s + k_off, nk_c, KD, k_inv, v_inv,
-                                                W.kv_k16, W.kv_v16, g_s);
+                        unpack_kv(k_off, nk_c);
                     }
                     const float beta = k_off == 0 ? zero : one;
                     for (int g = 0; g < c.KV; ++g) {
@@ -1630,8 +2232,22 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                 const int start = attn_kv_cap > 0 ? (k0_s % attn_kv_cap) : k0_s;
                 const int n1 = attn_kv_cap > 0 ? std::min(nk_s, attn_kv_cap - start) : nk_s;
                 const int n2 = nk_s - n1;
+                const double qk0 = apr ? now() : 0;
                 for (int g = 0; g < c.KV; ++g) {
                     const uint16_t* Kp1 = Ly.kc + (size_t) start * KD + (size_t) g * c.D;
+#if defined(STRATA_USE_HIP)
+                    // QK^T on the gfx11 matrix cores: per query head scores[t,key] = sum_d K[key,d] Q[t,d].
+                    // K rows stride KD, Q rows stride HD (a strided sub-view, no copy). Off by default: hipBLAS's
+                    // tuned batched GEMM beats the single-wave WMMA kernel on these small GQA-batched shapes.
+                    static const int wmma_qk = getenv("IK2_WMMA_QK") ? atoi(getenv("IK2_WMMA_QK")) : 0;
+                    if (wmma_qk && n1 >= 16 && Tq >= 16) {
+                        for (int qh = 0; qh < GQA; ++qh) {
+                            strata_wmma_gemm_f16_ld(W.x16 + (size_t) ts * HD + (size_t) (g * GQA + qh) * c.D, HD,
+                                                    Kp1, KD, W.lg + (size_t) (g * GQA + qh) * qn, Tq, n1, c.D,
+                                                    nk_s, 0.0f, g_s);
+                        }
+                    } else
+#endif
                     CB(cublasGemmStridedBatchedEx(
                         g_blas, CUBLAS_OP_T, CUBLAS_OP_N, n1, Tq, c.D, &one, Kp1, CUDA_R_16F, KD, 0,
                         W.x16 + (size_t) ts * HD + (size_t) g * GQA * c.D, CUDA_R_16F, HD, (long long) c.D, &zero,
@@ -1639,6 +2255,15 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                         CUBLAS_GEMM_DEFAULT));
                     if (n2 > 0) {
                         const uint16_t* Kp2 = Ly.kc + (size_t) g * c.D;
+#if defined(STRATA_USE_HIP)
+                        if (wmma_qk && n2 >= 16 && Tq >= 16) {
+                            for (int qh = 0; qh < GQA; ++qh) {
+                                strata_wmma_gemm_f16_ld(W.x16 + (size_t) ts * HD + (size_t) (g * GQA + qh) * c.D, HD,
+                                                        Kp2, KD, W.lg + (size_t) (g * GQA + qh) * qn + n1, Tq, n2, c.D,
+                                                        nk_s, 0.0f, g_s);
+                            }
+                        } else
+#endif
                         CB(cublasGemmStridedBatchedEx(
                             g_blas, CUBLAS_OP_T, CUBLAS_OP_N, n2, Tq, c.D, &one, Kp2, CUDA_R_16F, KD, 0,
                             W.x16 + (size_t) ts * HD + (size_t) g * GQA * c.D, CUDA_R_16F, HD, (long long) c.D, &zero,
@@ -1646,7 +2271,9 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                             CUBLAS_GEMM_DEFAULT));
                     }
                 }
+                if (apr) { cudaStreamSynchronize(g_s); g_pf.a_qk += now() - qk0; }
                 attn_probs(Tq, nk_s, ts, k0_s);
+                const double pv0 = apr ? now() : 0;
                 for (int g = 0; g < c.KV; ++g) {
                     const uint16_t* Vp1 = Ly.vc + (size_t) start * KD + (size_t) g * c.D;
                     CB(cublasGemmStridedBatchedEx(
@@ -1663,11 +2290,14 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
                     }
                 }
+                if (apr) { cudaStreamSynchronize(g_s); g_pf.a_pv += now() - pv0; }
             }
             ts += Tq;
         }
+        if (apr) { cudaStreamSynchronize(g_s); g_pf.a_out += now() - ap1; }
     }
-    k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && T == 1, g_s);
+    if (vp_attn_idx >= 0) cudaEventRecord(vpF[vp_attn_idx], g_s);
+    k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && (T == 1 || g_int4_dense_multi || g_int4_msg || g_int4_prefill), g_s);
     matmul(Ly.wo, W.o, W.x16, T, W.tmp, C);
     conv_rec(Ly, 2, W.tmp, Ly.h_attn, T, C);
     if (l % c.block == 0) {
@@ -1687,6 +2317,10 @@ void prefetch_layer(Model& M, int l, Work& W, ExpertCache& EC, int T, const Work
     W.pf_layers[pr] = -1;
     if (getenv("IK2_PREFETCH") && !std::atoi(getenv("IK2_PREFETCH"))) return;
     if (!g_overlap || g_prof || l >= M.c.n_layer || (!dual() && M.L[l].dev != g_cur)) return;
+#if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
+    // Resident INT4 layers need no NVFP4 slots: don't fill the small pool0 with weights nobody reads.
+    if (g_int4_experts && M.L[l].i4_loaded && l < g_int4_layers && !g_ep && !g_tp) return;
+#endif
     const Work& U = Wpop ? *Wpop : W;   // (whose picks so far: under EP, GPU 0's)
     const int E = M.c.E, pi = EC.layer_pool[l];
     if (pi < 0 || EC.pools[pi].n_active < (ahead + 1) * E + 64) return;
@@ -1720,11 +2354,22 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
                      const float* r_in, float* h_out, Work& W, ExpertCache& EC, double& t_exp) {
     const Config& c = M.c;
     const int C = c.C, F = c.F, S = T * c.K;
+    // Resident INT4 experts: the converter folded each expert's outer scale into WS. The prefill then uses
+    // sg=su=1 and a route-only wtr (no scale[2]); the NVFP4 cache is not consulted for these layers.
+    // EP/TP keep the old path: the converted weights are only resident on the loading device.
+    bool i4_pf = false;
+#if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
+    i4_pf = g_int4_experts && Ly.i4_loaded && l < g_int4_layers && !g_ep && !g_tp && !g_int4_pf_off;
+#endif
+    if (g_prof) ++g_pf.pf_calls;
     const double te0 = now();
+    const double ts0 = now();
     if (g_seq_done + 1 < g_seq_next) {
         CU(cudaStreamSynchronize(g_cs));
         g_seq_done = g_seq_next - 1;
     }
+    if (g_prof) g_pf.pf_sync += now() - ts0;
+    const double th0 = now();   // (prof: host bookkeeping ends here)
     std::fill(W.cnt.begin(), W.cnt.end(), 0);
     for (int i = 0; i < S; ++i) ++W.cnt[top[i]];
     if (W.use.empty()) W.use.assign((size_t) c.n_layer * c.E, 0), W.use_tot.assign(c.n_layer, 0);
@@ -1754,19 +2399,27 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         const int e = top[i], row = W.fill[e]++;
         gidx[row] = i / c.K;
         inv[i] = row;
-        sg[row] = Ly.scale[0].empty() ? 1.0f : Ly.scale[0][e];
-        su[row] = Ly.scale[1].empty() ? 1.0f : Ly.scale[1][e];
-        wt[i] = w[i] * (Ly.scale[2].empty() ? 1.0f : Ly.scale[2][e]);
+        // i4_pf: the scale is in WS, so the per-row gate/up scales are 1 and wtr carries only the route weight
+        sg[row] = i4_pf ? 1.0f : (Ly.scale[0].empty() ? 1.0f : Ly.scale[0][e]);
+        su[row] = i4_pf ? 1.0f : (Ly.scale[1].empty() ? 1.0f : Ly.scale[1][e]);
+        wt[i] = w[i] * (i4_pf || Ly.scale[2].empty() ? 1.0f : Ly.scale[2][e]);
         wtr[row] = wt[i];
     }
+    if (g_prof) g_pf.pf_host += now() - th0;
 
     // the experts on a GPU: d -1 all of them (one GPU), else the ones it owns (IK2_EP), into X.tmp
     auto exec = [&](int d, Work& X, ExpertCache& XC, const uint16_t* xin) {
         const uint64_t tick = ++XC.tick;
-        const cudaStream_t cst = g_overlap && !g_prof ? g_cs : g_s;
+        // (the overlap stream stays on under IK2_PROF: the phase laps already serialise the boundaries, so forcing
+        // the copies onto g_s here only inflated t_exp and hid the real expert cost behind the upload phase)
+        const cudaStream_t cst = g_overlap ? g_cs : g_s;
         X.hit_exps.clear();
         X.miss_exps.clear();
         const double tu = now();
+        if (i4_pf) {
+            // INT4 weights are resident: no NVFP4 slots are gathered, copied into, or waited on.
+            std::fill(X.slot_ptrs.begin(), X.slot_ptrs.end(), (uint8_t*) nullptr);
+        } else {
         for (int e = 0; e < c.E; ++e) {
             if (!W.cnt[e] || (d >= 0 && ep_owner(l, e) != d)) {
                 X.slot_ptrs[e] = nullptr;
@@ -1781,6 +2434,7 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
             }
         }
         for (int e : X.miss_exps) X.slot_ptrs[e] = XC.get(Ly, l, e, tick, cst, nullptr, false, true);
+        }
 
         const int n_miss = (int) X.miss_exps.size();
         const int n_batches = (n_miss + Work::kMissBatch - 1) / Work::kMissBatch;
@@ -1794,6 +2448,7 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         }
         XC.t_up += now() - tu;
         g_pf.lap(g_pf.upload);
+        const double tg0 = now();   // (prof: GPU expert work + cache waits)
 
         CU(cudaMemcpyAsync(X.gidx, gidx, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
         CU(cudaMemcpyAsync(X.inv, inv, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
@@ -1808,18 +2463,111 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         auto run_exp = [&](int e) {
             const int cnt_e = W.cnt[e], st_e = W.start[e];
             const uint8_t* sl = X.slot_ptrs[e];
+            const bool pr = g_prof && cnt_e >= 128;   // profile only the big GEMM experts (sync per phase)
+            const double tga = pr ? now() : 0;
+#if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
+            if (i4_pf) {
+                // Resident INT4: no NVFP4 decode, no gathered weight pointers. Rows are tiled to the
+                // scratch capacity (a lent pass can carry more tokens than the buffers were sized for).
+                // sg/su=1 and wtr=route weight only: the expert's outer scale is folded into WS.
+                // (cap is the f32 scratch's row count; gu32/h16/y32 are sized for T rows, so clamp to both)
+                const int cap = std::min(X.i4_pf_cap, std::max(1, T)), Kp = Ly.i4_Kpad[2];
+                double a_gather = 0, a_gemm = 0, a_swiglu = 0, a_scatter = 0;
+                for (int t0 = 0; t0 < cnt_e; t0 += cap) {
+                    const int n = std::min(cap, cnt_e - t0), off = st_e + t0;
+                    const double q0 = pr ? now() : 0;
+                    gather_f32_16_kernel<<<n, 256, 0, g_s>>>(xin, X.gidx + off, n, C, X.i4_pf_x);
+                    if (pr) cudaStreamSynchronize(g_s);
+                    const double q1 = pr ? now() : 0;
+                    k::int4_rot_pack8(X.i4_pf_x, n, C, X.i4_pf_x4, X.i4_pf_xm, X.i4_pf_xr, g_s);
+                    k::int4_gemm8(Ly.i4_Wp[0] + (size_t) e * Ly.i4_wp_stride[0],
+                                  Ly.i4_Wh[0] + (size_t) e * Ly.i4_wh_stride[0],
+                                  Ly.i4_WS[0] + (size_t) e * 2 * F, 2 * F, C,
+                                  X.i4_pf_x4, X.i4_pf_xm, X.i4_pf_xr, n, 4, 8, X.gu32, nullptr, k::kInt4Sh8, g_s);
+                    if (pr) cudaStreamSynchronize(g_s);
+                    const double q2 = pr ? now() : 0;
+                    k::swiglu_cap_f32(X.gu32, n, F, X.sg + off, X.su + off, c.gate_cap, c.up_cap, X.h16, g_s);
+                    i4_pad_h_kernel<<<n, 256, 0, g_s>>>(X.h16, n, F, Kp, X.i4_pf_x);
+                    if (pr) cudaStreamSynchronize(g_s);
+                    const double q3 = pr ? now() : 0;
+                    k::int4_rot_pack8(X.i4_pf_x, n, Kp, X.i4_pf_x4, X.i4_pf_xm, X.i4_pf_xr, g_s);
+                    k::int4_gemm8(Ly.i4_Wp[2] + (size_t) e * Ly.i4_wp_stride[2],
+                                  Ly.i4_Wh[2] + (size_t) e * Ly.i4_wh_stride[2],
+                                  Ly.i4_WS[2] + (size_t) e * C, C, Kp,
+                                  X.i4_pf_x4, X.i4_pf_xm, X.i4_pf_xr, n, 4, 8, X.y32, nullptr, k::kInt4Sh8, g_s);
+                    if (pr) cudaStreamSynchronize(g_s);
+                    const double q4 = pr ? now() : 0;
+                    scatter_add_rows_kernel<<<n, 256, 0, g_s>>>(X.y32, X.gidx + off, X.wtr + off, C, X.tmp, C);
+                    if (pr) {
+                        cudaStreamSynchronize(g_s);
+                        const double q5 = now();
+                        a_gather += q1 - q0; a_gemm += (q2 - q1) + (q4 - q3);
+                        a_swiglu += q3 - q2; a_scatter += q5 - q4;
+                    }
+                }
+                if (pr) {
+                    g_pf.pf_gather += a_gather; g_pf.pf_dec += 0; g_pf.pf_gemm += a_gemm;
+                    g_pf.pf_swiglu += a_swiglu; g_pf.pf_scatter += a_scatter;
+                }
+                return;
+            }
+#endif
             gather_f16_16_kernel<<<cnt_e, 256, 0, g_s>>>(xin, X.gidx + st_e, cnt_e, C, X.ex16);
+            if (pr) cudaStreamSynchronize(g_s);
+            const double tde = pr ? now() : 0;
+#if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
+            if (g_exp_prefill_wmma && Ly.ty[0] == k::kNVFP4 && Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4
+                && cnt_e >= 16) {
+                // NVFP4-direct multi-token WMMA: no decode_f16 whole-weight expand; fragments read in the GEMM.
+                k::experts_prefill_gate_up_wmma(sl, Ly.eb[0], C, F, cnt_e, X.ex16, X.gu32, g_s);
+                if (pr) cudaStreamSynchronize(g_s);
+                const double tgm = pr ? now() : 0;
+                k::swiglu_cap_f32(X.gu32, cnt_e, F, X.sg + st_e, X.su + st_e, c.gate_cap, c.up_cap, X.h16, g_s);
+                if (pr) cudaStreamSynchronize(g_s);
+                const double tsw = pr ? now() : 0;
+                k::experts_prefill_down_wmma(sl, Ly.eb[0] + Ly.eb[1], C, F, cnt_e, X.h16, X.y32, g_s);
+                if (pr) cudaStreamSynchronize(g_s);
+                const double tdn = pr ? now() : 0;
+                scatter_add_rows_kernel<<<cnt_e, 256, 0, g_s>>>(X.y32, X.gidx + st_e, X.wtr + st_e, C, X.tmp, C);
+                if (pr) {
+                    cudaStreamSynchronize(g_s);
+                    const double te = now();
+                    g_pf.pf_gather += tde - tga;
+                    g_pf.pf_dec += 0;   // no decode_f16 in this path
+                    g_pf.pf_gemm += (tgm - tde) + (tdn - tsw);
+                    g_pf.pf_swiglu += tsw - tgm;
+                    g_pf.pf_scatter += te - tdn;
+                }
+                return;
+            }
+#endif
             if (Ly.ty[0] == Ly.ty[1]) {
                 k::decode_f16(Ly.ty[0], sl, (size_t) 2 * F * C, X.w16, g_s);
             } else {
                 k::decode_f16(Ly.ty[0], sl, (size_t) F * C, X.w16, g_s);
                 k::decode_f16(Ly.ty[1], sl + Ly.eb[0], (size_t) F * C, X.w16 + (size_t) F * C, g_s);
             }
+            if (pr) cudaStreamSynchronize(g_s);
+            const double tgm = pr ? now() : 0;
             gemm16(X.w16, 2 * F, C, X.ex16, cnt_e, X.gu32, 2 * F);
+            if (pr) cudaStreamSynchronize(g_s);
+            const double tsw = pr ? now() : 0;
             k::swiglu_cap_f32(X.gu32, cnt_e, F, X.sg + st_e, X.su + st_e, c.gate_cap, c.up_cap, X.h16, g_s);
             k::decode_f16(Ly.ty[2], sl + Ly.eb[0] + Ly.eb[1], (size_t) C * F, X.w16, g_s);
+            if (pr) cudaStreamSynchronize(g_s);
+            const double tdn = pr ? now() : 0;
             gemm16(X.w16, C, F, X.h16, cnt_e, X.y32, C);
+            if (pr) cudaStreamSynchronize(g_s);
+            const double tsc = pr ? now() : 0;
             scatter_add_rows_kernel<<<cnt_e, 256, 0, g_s>>>(X.y32, X.gidx + st_e, X.wtr + st_e, C, X.tmp, C);
+            if (pr) {
+                cudaStreamSynchronize(g_s);
+                const double te = now();
+                g_pf.pf_gather += tde - tga;
+                g_pf.pf_dec += (tgm - tde) + (tdn - tsw);
+                g_pf.pf_gemm += (tsw - tgm) + (tsc - tdn);
+                g_pf.pf_scatter += te - tsc;
+            }
         };
         const bool pf = X.pf_layers[l % Work::kPfRing] == l;
         X.miss_pos.assign(c.E, -1);
@@ -1834,6 +2582,7 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
             run_exp(e);
         }
         X.pf_layers[l % Work::kPfRing] = -1;
+        if (g_prof) { cudaStreamSynchronize(g_s); g_pf.pf_gpu += now() - tg0; }
     };
     if (g_ep) {   // GPU 1's experts on GPU 1 (the input over, its sums back), GPU 0's meanwhile
         CU(cudaEventRecord(g_ep_x, g_s));
@@ -1982,6 +2731,8 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
         }
         if (out_mode != OutMode::kNone) {
             const int t0 = all_logits ? 0 : T - 1, nt = T - t0;
+            // IK2_INT4_HEAD rides matmul's T=2..8 gate (i4_head_only): the verify GEMM (nt=2..8) takes the int4
+            // sidecar; n=1 and the prompt chunks (n=16) keep their existing route, with matmul's fallback intact.
             if (out_mode == OutMode::kArgmax) {
                 argmax_out->resize(nt);
                 for (int i = 0; i < nt; i += 16) {
@@ -1990,9 +2741,9 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
                     if (n == 1) k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, W.argmax_d + i, g_s);
                     else k::argmax_rows(W.logits, c.n_rows, n, c.n_vocab, W.argmax_d + i, g_s);
                 }
-                CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) nt * 4, cudaMemcpyDeviceToHost, g_s));
+                if (g_vg_stage == VG_NORMAL) { CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) nt * 4, cudaMemcpyDeviceToHost, g_s));
                 CU(cudaStreamSynchronize(g_s));
-                for (int i = 0; i < nt; ++i) (*argmax_out)[i] = W.argmax_h[i];
+                for (int i = 0; i < nt; ++i) (*argmax_out)[i] = W.argmax_h[i]; }
             } else {
                 for (int i = 0; i < nt; i += 16) {   // (W.logits holds 16 rows)
                     const int n = std::min(16, nt - i);
@@ -2030,6 +2781,20 @@ struct FastGraph {
 };
 FastGraph g_fgraph[4];      // by OutMode
 
+// IK2_VERIFY_GRAPH: one graph for the whole T=8 g_rec verify forward (48 layer visits + head).  Captured on the
+// first pure-argmax verify window after a warm-up normal pass, replayed at every later window.  Inputs (token rows,
+// positions) arrive through pinned W.emb_h / W.pos_h, and the base position is read on the device by the prep /
+// attention kernels, so a replay needs no host value between launches.  The head's argmaxes are read once after
+// the replay; the accept comparison and rollback stay host-side, outside the graph.
+struct VerifyGraph {
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    bool built = false;
+    bool disabled = false;
+    bool warmed = false;   // one normal pass first: warms hipBLAS shapes/workspace before capture
+};
+VerifyGraph g_vgraph;
+
 // one token's launches: its embedding row in W.emb_h and its position in W.pos_h[0] (pinned host; copied first)
 void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
     const Config& c = M.c;
@@ -2038,15 +2803,22 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
     const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f, v_scale = 32.0f;
     // the attention's key splits: fixed, so that the launches are the same at every position
-    const int P_sl = std::min(128, std::max(1, (c.window + 63) / 64)), P_full = 128;
+    int P_sl = std::min(128, std::max(1, (c.window + 63) / 64)), P_full = 128;
+    if (const char* ps = getenv("IK2_DECODE_P")) { int v = std::atoi(ps); if (v >= 1 && v <= 128) P_sl = v; }
+    if (g_prof_fast) pf_fast::setup();
+    pf_fast::mark(0, g_s);
     CU(cudaMemcpyAsync(W.tmp, W.emb_h, Cb, cudaMemcpyHostToDevice, g_s));
     k::rms(W.tmp, M.embd_norm, 1, C, c.eps, W.h, g_s);
     CU(cudaMemcpyAsync(W.pos, W.pos_h, 4, cudaMemcpyHostToDevice, g_s));
+    pf_fast::mark(1, g_s);
     auto blk = [&](int i) { return W.blocks + (size_t) i * W.blk_ld * C; };
     int nb = 0, nb_pre = 0, n_bank = 0;
     for (int vis = 0; vis < c.n_visit; ++vis) {
         const int l = M.V[vis].l;
         Layer& Ly = bind_visit(M, vis);
+        // (profiling: ev1 is re-recorded at each visit's start so ev1->ev2 spans only this visit's loop_bank work,
+        //  not every prior visit's compute; the 48 per-visit deltas sum to the whole token.)
+        pf_fast::mark(1, g_s);
         // a looped core's passes (as forward()'s)
         const float* msg = nullptr;
         if (c.n_pass > 1 && l == c.core0) {
@@ -2054,12 +2826,19 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                 nb_pre = nb;
                 CU(cudaMemcpyAsync(W.lp_pre, W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
             } else {
-                n_bank = 0;
-                for (int i = nb_pre + 1; i < nb; ++i, ++n_bank)
-                    CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * C, blk(i), Cb, cudaMemcpyDeviceToDevice, g_s));
-                CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * C, W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
-                ++n_bank;
-                CU(cudaMemcpyAsync(W.h, W.lp_pre, Cb, cudaMemcpyDeviceToDevice, g_s));
+                if (g_loopbank_fuse && nb > nb_pre) {
+                    // the same copies as one launch (row = C floats; h's bank copy and its restore share a thread)
+                    k::loop_bank_copies(W.lp_pre, W.h, W.blocks, (size_t) W.blk_ld * C, nb_pre, nb, W.lp_bank, W.h,
+                                        (size_t) C, g_s);
+                    n_bank = nb - nb_pre;
+                } else {
+                    n_bank = 0;
+                    for (int i = nb_pre + 1; i < nb; ++i, ++n_bank)
+                        CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * C, blk(i), Cb, cudaMemcpyDeviceToDevice, g_s));
+                    CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * C, W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
+                    ++n_bank;
+                    CU(cudaMemcpyAsync(W.h, W.lp_pre, Cb, cudaMemcpyDeviceToDevice, g_s));
+                }
                 nb = nb_pre;
                 // the pass's messages, every core layer's at once: the bank stays as it is until the pass ends, and a
                 // layer's launch of its own was 7 us on one SM (a job a block: the same sums, 24 launches less a token)
@@ -2069,11 +2848,16 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             }
         }
         if (M.V[vis].pass > 0) msg = W.lp_msg_all + (size_t) (l - c.core0) * 4 * C;   // (q, k | v, MoE)
+        pf_fast::mark(2, g_s);
         // the attention's inputs, normed, in F32: W.xq, W.xk, W.xv (sep: q, k and v each have their own)
         float* x3[3] = {W.xq, W.xk, W.xv};
         const float* nw[3] = {Ly.sliding ? Ly.attn_norm : Ly.q_in_norm, Ly.sliding ? Ly.attn_norm : Ly.k_in_norm,
                               Ly.sliding ? Ly.attn_norm : Ly.v_in_norm};
         bool sep = !Ly.sliding;
+        // (rms_alt experiment REVERTED: norming the fused projection's input in every block's prologue recomputes
+        //  the 2304-norm 2144x and costs LDS/syncthreads - measured -3% decode vs one cheap rms launch. The kernel
+        //  mv_q8p_rms_alt stays in the tree, unwired.)
+        const bool rms_alt = false;
         {
             k::ResStates st{};
             for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
@@ -2093,19 +2877,37 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                 uint16_t* y16[3] = {W.x16, W.xk16, W.xv16};
                 for (int j = 0; j < Ly.n_res_q; ++j) outs.w[j] = nw[j], outs.y16[j] = y16[j], outs.y32[j] = x3[j];
                 k::attn_res_rms_f16(st, nb + 1, Ly.res_score, Ly.n_res_q, 1, C, 1e-6f, c.eps, outs, g_s);
+            } else if (l == 0 && sep && g_rms_fuse) {
+                // (a full layer 0: q/k/v share W.h, three norms in one launch instead of three)
+                k::rms_multi(k::RmsJobs{{W.h, W.h, W.h}, {nw[0], nw[1], nw[2]}, {x3[0], x3[1], x3[2]}}, 3, C, c.eps, g_s);
+            } else if (rms_alt) {
+                // (a sliding layer: the fused product's prologue norms W.h; no separate input-norm launch here)
             } else {
                 for (int j = 0; j < (sep ? 3 : 1); ++j) k::rms(W.h, nw[j], 1, C, c.eps, x3[j], g_s);
             }
         }
         // the projections, straight over the blocks
+        pf_fast::mark(3, g_s);
         float *q_p, *k_p, *v_p, *r_p, *gate_p, *kd_p = nullptr, *vd_p = nullptr;
         // (k's and v's short convs ride their products' launches - mv1c - and the sinks the clips' launch below)
         if (Ly.sliding) {
             const Mat& m = Ly.wqkvrg;   // q | k | v | r | gate
             q_p = W.qkv, k_p = q_p + HD, v_p = k_p + KD, r_p = v_p + KD, gate_p = r_p + HR;
             if (!sep) {
-                mv1c(m, W.xq, W.qkv, k::MvConv{HD, KD, Ly.h_k, Ly.sc_k, nullptr, 0, nullptr, W.kconv},
-                     k::MvConv{HD + KD, KD, Ly.h_v, Ly.sc_v, nullptr, 0, nullptr, W.vconv});
+                if (rms_alt) {
+                    // (a sliding layer: q/k/v/r/gate share the normed input W.h; the rms rides the product launch)
+                    k::mv_q8p_rms_alt(m.q8, m.q8d, m.N, m.K, W.h, nw[0], c.eps, W.qkv,
+                                      k::MvConv{HD, KD, Ly.h_k, Ly.sc_k, nullptr, 0, nullptr, W.kconv},
+                                      k::MvConv{HD + KD, KD, Ly.h_v, Ly.sc_v, nullptr, 0, nullptr, W.vconv}, g_s);
+                } else {
+                    mv1c(m, W.xq, W.qkv, k::MvConv{HD, KD, Ly.h_k, Ly.sc_k, nullptr, 0, nullptr, W.kconv},
+                         k::MvConv{HD + KD, KD, Ly.h_v, Ly.sc_v, nullptr, 0, nullptr, W.vconv});
+                }
+            } else if (m.i4Wp) {   // IK2_INT4_DENSE: same one launch, the int4 product with the k/v inputs by tile
+                k::int4_dense_rot(m.i4Wp, m.i4Wh, m.i4WS, m.N, m.K, W.xq, W.qkv,
+                                  k::MvConv{HD, KD, Ly.h_k, Ly.sc_k, nullptr, 0, nullptr, W.kconv},
+                                  k::MvConv{HD + KD, KD, Ly.h_v, Ly.sc_v, nullptr, 0, nullptr, W.vconv},
+                                  1.f / (1 << k::kInt4Sh8), g_s, k::MvAlt{W.xk, HD, KD}, k::MvAlt{W.xv, HD + KD, KD});
             } else if (m.q8) {   // (q, k and v each with its input: k's and v's rows take theirs, one launch)
                 k::mv_q8p_conv(m.q8, m.q8d, m.N, m.K, W.xq, W.qkv,
                                k::MvConv{HD, KD, Ly.h_k, Ly.sc_k, nullptr, 0, nullptr, W.kconv},
@@ -2129,16 +2931,32 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             mv1c(Ly.wv, W.xv, v_p, k::MvConv{0, KD, Ly.h_v, Ly.sc_v, vd_p, c.KV, nullptr, W.vconv});
         }
         // the clips, the token's K and V into the cache at its position, the attention
+        pf_fast::mark(4, g_s);
         const int extent = Ly.sliding ? c.extent_swa : c.extent;
         const int window = Ly.sliding ? c.window : (1 << 30);
         const int P = Ly.sliding ? P_sl : P_full;
         // the attention on the tensor cores, from an FP16 copy of q (IK2_ATTN_MMA=0: the scalar kernels - a layer
-        // without a window, its keys the whole context, is bound by their arithmetic)
-        const bool mma = g_attn_mma == 1 || (g_attn_mma == 2 && !Ly.sliding);
+        // without a window, its keys the whole context, is bound by their arithmetic).  int8/int4 KV use the
+        // scalar dequant kernels: the tensor-core path reads raw f16 / fp8 codes and has no scale per head.
+        const bool mma = (g_attn_mma == 1 || (g_attn_mma == 2 && !Ly.sliding)) && !kv_is_int();
         const int ring = Ly.sliding ? Ly.kv_cap : 0;
         const int ns = Ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : g_mma_split;
         uint16_t* q16 = mma ? W.x16 : nullptr;
-        if (g_kv_fp8) {
+        pf_fast::mark(5, g_s);
+        if (kv_is_int()) {
+            const int bits = kv_int_bits();
+            k::prep_qkv_r_int_at(bits, q_p, Ly.q_clip, W.kconv, Ly.kci, Ly.ks, W.vconv, Ly.vci, Ly.vs, r_p,
+                                 Ly.r_clip, c.H, c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos,
+                                 !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap, q16, g_s, Ly.sink16, W.xq, C, W.sink);
+            if (g_onepass && Ly.sliding)
+                k::attn_decode_int_onepass(bits, q_p, r_p, W.sink, Ly.kci, Ly.vci, Ly.ks, Ly.vs, Ly.kv_cap, c.H,
+                                           c.KV, W.pos, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.o, g_s,
+                                           g_gate_fuse ? gate_p : nullptr);
+            else
+                k::attn_decode_int_at(bits, q_p, r_p, W.sink, Ly.kci, Ly.vci, Ly.ks, Ly.vs,
+                                      Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P, qk_scale, Ly.rel_proj,
+                                      c.d_rel, extent, window, W.lg, W.o, g_s, g_gate_fuse ? gate_p : nullptr);
+        } else if (g_kv_fp8) {
             k::prep_qkv_r_fp8_at(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap,
                                  k_scale, v_scale, q16, g_s, Ly.sink16, W.xq, C, W.sink);
@@ -2146,10 +2964,14 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                 k::attn_decode_mma_fp8(q16, r_p, W.sink, Ly.kc8, Ly.vc8, ring, c.H, c.KV, W.pos, 0, ns,
                                        qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
                                        W.o, gate_p, W.x16, g_s);
+            else if (g_onepass && Ly.sliding)
+                k::attn_decode_fp8_onepass(q_p, r_p, W.sink, Ly.kc8, Ly.vc8, Ly.kv_cap, c.H, c.KV, W.pos,
+                                           qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window,
+                                           W.o, g_s, g_gate_fuse ? gate_p : nullptr);
             else
                 k::attn_decode_fp8_at(q_p, r_p, W.sink, Ly.kc8, Ly.vc8, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P,
                                       qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
-                                      W.o, g_s);
+                                      W.o, g_s, g_gate_fuse ? gate_p : nullptr);
         } else {
             k::prep_qkv_r_f16_at(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap, q16,
@@ -2157,18 +2979,24 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             if (mma)
                 k::attn_decode_mma_f16(q16, r_p, W.sink, Ly.kc, Ly.vc, ring, c.H, c.KV, W.pos, 0, ns, qk_scale,
                                        Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, W.x16, g_s);
+            else if (g_onepass && Ly.sliding)
+                k::attn_decode_f16_onepass(q_p, r_p, W.sink, Ly.kc, Ly.vc, Ly.kv_cap, c.H, c.KV, W.pos, qk_scale,
+                                           Ly.rel_proj, c.d_rel, extent, window, W.o, g_s, g_gate_fuse ? gate_p : nullptr);
             else
                 k::attn_decode_f16_at(q_p, r_p, W.sink, Ly.kc, Ly.vc, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P,
-                                      qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+                                      qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s,
+                                      g_gate_fuse ? gate_p : nullptr);
         }
-        if (!mma) k::gate_mul_f16(W.o, gate_p, (size_t) HD, W.x16, true, g_s);   // (the tensor cores' merge has it)
+        if (!mma && !g_gate_fuse) k::gate_mul_f16(W.o, gate_p, (size_t) HD, W.x16, true, g_s);   // (the tensor cores' merge has it)
         // the output projection with its short conv (and the stream added, but where a block starts: there the
         // stream joins the blocks and starts again)
+        pf_fast::mark(6, g_s);
         const bool first = l % c.block == 0;
         if (first) CU(cudaMemcpyAsync(blk(nb), W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
         mv1c(Ly.wo, W.o, W.tmp, k::MvConv{0, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, first ? nullptr : W.h, W.r});
         if (first) ++nb;
         // the MoE: its input, the router and the picks' tables on the device, the experts
+        pf_fast::mark(7, g_s);
         {
             k::ResStates st{};
             for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
@@ -2184,17 +3012,67 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                 k::attn_res_rms_f16(st, nb + 1, Ly.ffn_res_score, 1, 1, C, 1e-6f, c.eps, outs, g_s);
             }
         }
+        pf_fast::mark(8, g_s);
         k::mv_f16(Ly.router16, c.E, C, W.xq, W.rlog, g_s);
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + c.K);
-        // (NVFP4 experts go through the tensor cores, their input as two FP16 limbs the router's launch writes)
+        // (NVFP4 experts: the scalar GEMV is faster than the WMMA one on gfx1100 (single token wastes the
+        // tensor core's 16 columns); default scalar there, tensor cores on CUDA. IK2_EXPERT_MMA overrides.)
+#if defined(__HIPCC__)
+        static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 0;
+#else
         static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
+#endif
         const bool exp_tc = exp_mma && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, c.F);
         if (!g_ep_fast) {
-            k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob, Ly.tab_sc[0], Ly.tab_sc[1],
-                           Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s, W.xq, C,
-                           exp_tc ? (uint16_t*) W.gu32 : nullptr);
-            if (exp_tc) {
+            pf_fast::mark(9, g_s);
+            const bool i4 = g_int4_experts && Ly.i4_loaded && l < g_int4_layers;
+            k::route_token(W.rlog, Ly.probs_b, c.E, c.K, c.route_scale, Ly.tab_blob,
+                           i4 ? nullptr : Ly.tab_sc[0], i4 ? nullptr : Ly.tab_sc[1],
+                           i4 ? nullptr : Ly.tab_sc[2], rtop, rw, W.blob, W.tok, W.inv, W.sg, W.su,
+                           W.wt, g_s, W.xq, C, exp_tc ? (uint16_t*) W.gu32 : nullptr,
+                           i4 ? Ly.i4_tab_Wp[0] : nullptr, i4 ? Ly.i4_tab_Wh[0] : nullptr,
+                           i4 ? Ly.i4_tab_WS[0] : nullptr, W.i4_Wp_s, W.i4_Wh_s, W.i4_WS_s);
+            if (i4) {
+                // Rotated-int4 grouped decode: scale folded in WS, so sg=su=1 and wt = route weight only.
+                // Both gate_up and down slot pointers were gathered in route_token's epilogue (no extra launches).
+                const int S = c.K, F = c.F, Kp = W.i4_Kpad_f;
+                const float inv4 = 1.0f / (float) (1 << 12);   // sh=12 (kInt4Sh8)
+                // Phase D (IK2_I4_ROT_IN): rot_q8x folded into the matvec prologue, one 256-block per
+                // wave, full matvec parallelism kept. 1: gate_up only; 2: also down prep+rot.
+                const bool rot_up = g_i4_rot_in >= 1 && C % 256 == 0 && C / 256 <= 10;
+                const bool rot_dn = g_i4_rot_in >= 2 && !g_i4_mid_fuse && Kp % 256 == 0 && Kp / 256 <= 10;
+                // gate_up: shared input activation (one token, W.xq), 8 expert weight sets.
+                if (rot_up) {
+                    k::int4_matvec_grouped_rot(W.i4_Wp_s, W.i4_Wh_s, W.i4_WS_s, 2 * F, C, W.xq, nullptr, 0,
+                                               S, W.gu32, 2 * F, inv4, g_s);
+                } else {
+                    k::int4_rot_q8x(W.xq, 1, C, W.i4_xq, W.i4_xd, g_s);
+                    k::int4_matvec_grouped(W.i4_Wp_s, W.i4_Wh_s, W.i4_WS_s, 2 * F, C, W.i4_xq, W.i4_xd,
+                                           S, W.gu32, 2 * F, inv4, g_s);   // xq_stride=0: shared act
+                }
+                if (g_i4_mid_fuse) {
+                    // Fuse swiglu + prep_down + rot_q8x into one launch. Bit-exact: gu values and the
+                    // f16 round-trip are reproduced verbatim; zero-pad beyond F matches prep_down.
+                    k::int4_mid(W.gu32, S, F, Kp, c.gate_cap, c.up_cap, W.i4_hq, W.i4_hd, g_s);
+                } else {
+                    k::swiglu_cap_f32(W.gu32, S, F, W.sg, W.su, c.gate_cap, c.up_cap, W.h16, g_s);   // sg=su=1
+                    if (!rot_dn) {
+                        k::int4_prep_down(W.h16, W.i4_hf, S, F, Kp, g_s);
+                        k::int4_rot_q8x(W.i4_hf, S, Kp, W.i4_hq, W.i4_hd, g_s);
+                    }
+                }
+                // down: per-slot activations (h16[S][F] -> padded float [S][Kp]).
+                k::int4_gather_slots(rtop, Ly.i4_tab_Wp[2], Ly.i4_tab_Wh[2], Ly.i4_tab_WS[2], S,
+                                     W.i4_Wp_dn, W.i4_Wh_dn, W.i4_WS_dn, g_s);
+                if (rot_dn) {
+                    k::int4_matvec_grouped_rot(W.i4_Wp_dn, W.i4_Wh_dn, W.i4_WS_dn, C, Kp, nullptr, W.h16, F,
+                                               S, W.y32, C, inv4, g_s);
+                } else {
+                    k::int4_matvec_grouped(W.i4_Wp_dn, W.i4_Wh_dn, W.i4_WS_dn, C, Kp, W.i4_hq, W.i4_hd,
+                                           S, W.y32, C, inv4, g_s, Kp, Kp / 32);
+                }
+            } else if (exp_tc) {
                 k::experts_gate_up_swiglu_mma(W.blob, c.K, Ly.eb[0], (const uint16_t*) W.gu32, C, c.F, W.sg, W.su,
                                               c.gate_cap, c.up_cap, W.h16, g_s);
                 k::experts_down_mma(W.blob, c.K, Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
@@ -2203,6 +3081,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                                           c.gate_cap, c.up_cap, W.h16, g_s);
                 k::experts_down(W.blob, c.K, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
             }
+            pf_fast::mark(10, g_s);
             k::moe_combine_conv(W.y32, W.inv, W.wt, c.K, C, Ly.h_mlp, Ly.sc_mlp, W.r, W.h, g_s);
         } else {
             const int S = c.K;
@@ -2266,7 +3145,8 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                                S, C, Ly.h_mlp, Ly.sc_mlp, dev_work(0).r, dev_work(0).h, g_s);
         }
     }
-    if (out_mode == OutMode::kNone) return;
+    pf_fast::mark(11, g_s);
+    if (out_mode == OutMode::kNone) { pf_fast::mark(12, g_s); return; }
     {   // the head
         k::ResStates st{};
         for (int i = 0; i < nb; ++i) st.st[i] = blk(i);
@@ -2287,6 +3167,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             CU(cudaMemcpyAsync(W.logits_h, W.logits, (size_t) c.n_vocab * 4, cudaMemcpyDeviceToHost, g_s));
         }
     }
+    pf_fast::mark(12, g_s);
 }
 
 // one token through the resident path: its logits appended to logits_out (kLogits) or its argmax (kArgmax)
@@ -2341,6 +3222,7 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
         }
     }
     CU(cudaStreamSynchronize(g_s));
+    pf_fast::finish(g_s);
     if (out_mode == OutMode::kArgmax) {
         argmax_out->assign(1, W.argmax_h[0]);
     } else if (out_mode == OutMode::kLogits) {
@@ -2360,17 +3242,70 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
              std::vector<float>& logits_out, std::vector<int>* argmax_out, double& t_exp) {
     const Config& c = M.c;
     const int C = c.C;
+    const bool vprof2 = getenv("IK2_VPROF2") != nullptr || getenv("IK2_VPROF3") != nullptr || getenv("IK2_VPROF4") != nullptr;
+    if (vprof2 && !vp_init) { for (int q = 0; q < 64; ++q) { cudaEventCreate(&vpA[q]); cudaEventCreate(&vpB[q]); cudaEventCreate(&vpP[q]); cudaEventCreate(&vpK[q]); cudaEventCreate(&vpF[q]); cudaEventCreate(&vpR[q]); cudaEventCreate(&vpS[q]); } vp_init = true; }
+    if (vprof2) vp_n = 0;
+    if (g_prof && T > 1) std::printf("FWDDBG T=%d K=%d S=%d rg_slots=%d g_fast=%d g_mv=%d tab_empty=%d n_visit=%d\n", T, c.K, T * c.K, dev_work(g_cur).rg_slots, (int) g_fast, (int) g_mv, (int) M.L[0].tab_h.empty(), c.n_visit);
     if ((g_fast || g_ep_fast) && T == 1 && dump.empty() && !g_prof && !g_rec && !g_taps && !g_trace && g_pop.empty() &&
         g_img.at(pos0) < 0) {
         fast_token(M, tok[0], pos0, out_mode, logits_out, argmax_out);
         return;
     }
     if (out_mode == OutMode::kCand) out_mode = OutMode::kLogits, g_cand.n = -1;   // (this path: the logits)
+    // Verify graph needs every layer visit to stay device-only: VERIFY_FAST's shape guards are model constants,
+    // so require them up front or a visit falls through to the general MoE path (route D2H + stream sync),
+    // which is not capturable and would abort the process via CU().
+    const bool vg_shape_ok = C % 256 == 0 && (2 * (size_t) c.F) % 16 == 0 &&
+                             dev_work(0).i4_Kpad_f % 256 == 0 && T <= dev_work(0).Tm &&
+                             (size_t) T * c.K <= 64 && (size_t) T * c.K <= dev_work(0).i4_pf_cap;
+    bool vg_layers_ok = true;
+    for (int l = 0; l < c.n_layer && vg_layers_ok; ++l)
+        if (!M.L[l].tab_blob || (l < g_int4_layers && !M.L[l].i4_loaded)) vg_layers_ok = false;
+    const bool vg_try = g_verify_graph && g_verify_fast && g_rec && T == ik2::draft::kBlock && all_logits &&
+                        out_mode == OutMode::kArgmax && argmax_out && !g_vgraph.disabled && !g_prof && !g_prof_fast &&
+                        dump.empty() && !g_trace && g_pop.empty() && !dual() && !g_ep_fast && !g_ep && g_fast &&
+                        g_group && g_group_attn && g_int4_experts && !g_int4_pf_off && !g_img.n &&
+                        !g_exp_prefill_wmma && g_dev.size() == 1 && vg_shape_ok && vg_layers_ok;
+    if (vg_try && g_vgraph.built && g_vgraph.exec) {
+        // One replay.  The token rows and positions are staged into the same pinned buffers the graph was captured
+        // with; the prep / attention kernels read the base position from W.pos on the device.  The head's eight
+        // argmaxes are the only D2H, after the graph, before the host accept comparison / rollback.
+        use_dev(0);
+        Work& Wv = dev_work(0);
+        const size_t rb = (size_t) C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
+        for (int t = 0; t < T; ++t)
+            k::decode_host(M.embd_type, M.embd + (size_t) tok[t] * rb, C, Wv.emb_h + (size_t) t * C);
+        for (int t = 0; t < T; ++t) Wv.pos_h[t] = pos0 + t;
+        CU(cudaGraphLaunch(g_vgraph.exec, g_s));
+        CU(cudaMemcpyAsync(Wv.argmax_h, Wv.argmax_d, (size_t) T * 4, cudaMemcpyDeviceToHost, g_s));
+        CU(cudaStreamSynchronize(g_s));
+        argmax_out->resize(T);
+        for (int t = 0; t < T; ++t) (*argmax_out)[t] = Wv.argmax_h[t];
+        return;
+    }
     use_dev(M.L[0].dev);
     Work* Wp = &dev_work(g_cur);
     ExpertCache* ECp = &dev_cache(g_cur);
 #define W (*Wp)
 #define EC (*ECp)
+    // IK2_VERIFY_GRAPH: the first eligible window runs the ordinary device path to warm hipBLAS's GEMM shapes and
+    // internal workspace; the second is captured; later ones replay at the top.  Capture begins after use_dev (so
+    // g_s is the right stream) and before the pinned staging H2D, so staging is in the graph.
+    bool vg_capture = false;
+    if (vg_try && !g_vgraph.warmed) {
+        g_vgraph.warmed = true;
+    } else if (vg_try && !g_vgraph.disabled) {
+        cudaError_t ce = cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal);
+        if (ce == cudaSuccess) {
+            vg_capture = true;
+            g_vg_stage = VG_CAPTURE;
+        } else {
+            g_vgraph.disabled = true;
+            (void) cudaGetLastError();
+            std::printf("verify graph: begin capture failed (%s), fallback to direct launches\n", cudaGetErrorString(ce));
+            std::fflush(stdout);
+        }
+    }
     // the embedding rows, normed (pinned host staging, no stream sync needed)
     {
         const size_t rb = (size_t) C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
@@ -2414,6 +3349,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             ECp = &dev_cache(g_cur);
         }
         g_pf.start();
+        vp_attn_idx = (vprof2 && vis < 64) ? vis : -1;
+        if (vprof2 && vis < 64) cudaEventRecord(vpA[vis], g_s);
         // A looped core.  Its first pass: the stream it is given is kept.  A later pass starts again from that stream
         // and the blocks before the core, and reads the pass before through messages: that pass's bank is the blocks
         // it added after its first (the first is the kept stream) and its final stream.
@@ -2423,12 +3360,19 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 nb_pre = nb;
                 CU(cudaMemcpyAsync(W.lp_pre, W.h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
             } else {
-                n_bank = 0;
-                for (int i = nb_pre + 1; i < nb; ++i, ++n_bank)
-                    CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * TC, blk(i), TC * 4, cudaMemcpyDeviceToDevice, g_s));
-                CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * TC, W.h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
-                ++n_bank;
-                CU(cudaMemcpyAsync(W.h, W.lp_pre, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+                if (g_loopbank_fuse && nb > nb_pre) {
+                    // the same copies as one launch (row = TC floats, one per token; same thread-order guarantee)
+                    k::loop_bank_copies(W.lp_pre, W.h, W.blocks, (size_t) W.blk_ld * C, nb_pre, nb, W.lp_bank, W.h,
+                                        TC, g_s);
+                    n_bank = nb - nb_pre;
+                } else {
+                    n_bank = 0;
+                    for (int i = nb_pre + 1; i < nb; ++i, ++n_bank)
+                        CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * TC, blk(i), TC * 4, cudaMemcpyDeviceToDevice, g_s));
+                    CU(cudaMemcpyAsync(W.lp_bank + (size_t) n_bank * TC, W.h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+                    ++n_bank;
+                    CU(cudaMemcpyAsync(W.h, W.lp_pre, TC * 4, cudaMemcpyDeviceToDevice, g_s));
+                }
                 nb = nb_pre;
             }
         }
@@ -2476,11 +3420,85 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             }
         }
         g_pf.lap(g_pf.attn);
+        vp_attn_idx = -1;
+        if (vprof2 && vis < 64) { cudaEventRecord(vpB[vis], g_s); vp_n = vis + 1; }
         gemm16(Ly.router16, c.E, C, W.x16, T, W.rlog, c.E);
         const int S = T * c.K;
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
         k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
+#if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
+        // IK2_VERIFY_FAST (default OFF): a verify window's INT4 MoE entirely on the device, with no route D2H
+        // and no stream sync. The resident T=1 sequence (above) at S=T*K slots; the slots' f32 input is gathered
+        // from W.x16 (the same f16 rows run_prefill_moe gathers, so the numerics of the activation stay those
+        // of the old verify path). Layers 20+ and g_rec=false keep the old general path.
+        if (g_verify_fast && g_rec && T > 1 && T <= 8 && S <= 64 && g_int4_experts && Ly.i4_loaded && l < g_int4_layers &&
+            !g_int4_pf_off && !dual() && !g_ep_fast && !g_prof && dump.empty() && !g_trace && g_pop.empty() &&
+            C % 256 == 0 && (2 * c.F) % 16 == 0 && W.i4_Kpad_f % 256 == 0 && Ly.tab_blob && T <= W.Tm &&
+            S <= W.i4_pf_cap) {
+            const double te0 = now();
+            const int F = c.F, Kp = W.i4_Kpad_f;
+            const float inv4 = 1.0f / (float) (1 << 12);   // k::kInt4Sh8
+            // route_gather: inv[i]=i, tok[i]=i/K, sg=su=1, wt = the route weight only (the INT4 scale is
+            // folded into WS). tab_blob is a dummy E-entry table on INT4 layers (never read by this path).
+            k::route_gather(rtop, rw, Ly.tab_blob, nullptr, nullptr, nullptr, S, c.K, W.blob, W.tok,
+                            W.inv, W.sg, W.su, W.wt, g_s);
+            // IK2_MOE_GROUP_EXPERT (default OFF): group this visit's slots by routed expert ONCE on the
+            // device (deterministic build, shared by gate_up and down); the grouped matvec reads each
+            // expert's weights once for ALL its slots. Fixed grids throughout -> IK2_VERIFY_GRAPH-safe.
+            // OFF: the identical per-slot gather + k_mv_grouped sequence as before, bit-for-bit.
+            const bool grp = g_moe_group_exp && W.i4_g_cnt;
+            if (grp) k::int4_moe_group_build(rtop, S, W.i4_g_cnt, W.i4_g_slots, W.i4_g_exp, W.i4_g_n, g_s);
+            if (!grp)
+                k::int4_gather_slots(rtop, Ly.i4_tab_Wp[0], Ly.i4_tab_Wh[0], Ly.i4_tab_WS[0], S,
+                                     W.i4_Wp_s, W.i4_Wh_s, W.i4_WS_s, g_s);
+            // per-slot input rows (slot s -> token s/K): the prefill scratch holds [cap][Kmax] f32.
+            gather_f32_16_kernel<<<S, 256, 0, g_s>>>(W.x16, W.tok, S, C, W.i4_pf_x);
+            k::int4_rot_q8x(W.i4_pf_x, S, C, W.i4_xq, W.i4_xd, g_s);
+            if (grp)
+                k::int4_matvec_grouped_exp(Ly.i4_tab_Wp[0], Ly.i4_tab_Wh[0], Ly.i4_tab_WS[0], 2 * F, C,
+                                           W.i4_xq, W.i4_xd, S, W.gu32, 2 * F, inv4, g_s, C, C / 32,
+                                           W.i4_g_cnt, W.i4_g_slots, W.i4_g_exp, W.i4_g_n);
+            else
+                k::int4_matvec_grouped(W.i4_Wp_s, W.i4_Wh_s, W.i4_WS_s, 2 * F, C, W.i4_xq, W.i4_xd,
+                                       S, W.gu32, 2 * F, inv4, g_s, C, C / 32);
+            k::swiglu_cap_f32(W.gu32, S, F, W.sg, W.su, c.gate_cap, c.up_cap, W.h16, g_s);
+            k::int4_prep_down(W.h16, W.i4_hf, S, F, Kp, g_s);
+            k::int4_rot_q8x(W.i4_hf, S, Kp, W.i4_hq, W.i4_hd, g_s);
+            if (grp)
+                k::int4_matvec_grouped_exp(Ly.i4_tab_Wp[2], Ly.i4_tab_Wh[2], Ly.i4_tab_WS[2], C, Kp,
+                                           W.i4_hq, W.i4_hd, S, W.y32, C, inv4, g_s, Kp, Kp / 32,
+                                           W.i4_g_cnt, W.i4_g_slots, W.i4_g_exp, W.i4_g_n);
+            else {
+                k::int4_gather_slots(rtop, Ly.i4_tab_Wp[2], Ly.i4_tab_Wh[2], Ly.i4_tab_WS[2], S,
+                                     W.i4_Wp_dn, W.i4_Wh_dn, W.i4_WS_dn, g_s);
+                k::int4_matvec_grouped(W.i4_Wp_dn, W.i4_Wh_dn, W.i4_WS_dn, C, Kp, W.i4_hq, W.i4_hd,
+                                       S, W.y32, C, inv4, g_s, Kp, Kp / 32);
+            }
+            k::moe_combine_f32(W.y32, W.inv, W.wt, T, c.K, C, W.tmp, false, g_s);
+            t_exp += now() - te0;
+            conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
+            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);  // no-op: dump.empty() in the guard
+            continue;
+        }
+#endif
+        if (g_vg_stage != VG_NORMAL && !(g_int4_experts && Ly.i4_loaded && l < g_int4_layers)) {
+            // IK2_VERIFY_GRAPH: the layers the INT4 verify branch does not cover (l >= 20) must also be launch-only.
+            // route_d already holds this visit's picks / weights; Ly.tab_blob and Ly.tab_sc are the resident expert
+            // pointers and scales filled at load.  No D2H, no host grouping: the same launches on every replay.
+            // dtype / offsets come from Ly.ty / Ly.eb, so this is the resident NVFP4/Q8 expert sequence.
+            k::route_gather(W.route_d, (const float*) (W.route_d + S), Ly.tab_blob,
+                            Ly.tab_sc[0], Ly.tab_sc[1], Ly.tab_sc[2], S, c.K,
+                            W.blob, W.tok, W.inv, W.sg, W.su, W.wt, g_s);
+            k::experts_gate_up_swiglu(W.blob, W.tok, S, Ly.ty[0], Ly.ty[1], Ly.eb[0], W.xq, C, c.F, W.sg, W.su,
+                                      c.gate_cap, c.up_cap, W.h16, g_s);
+            k::experts_down(W.blob, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
+            k::moe_combine_f32(W.y32, W.inv, W.wt, T, c.K, C, W.tmp, false, g_s);
+            conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
+            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            continue;
+        }
         const bool cpu_lane = g_pool && g_overlap && !g_prof && T <= 8 && Ly.ty[0] == k::kNVFP4 &&
                               Ly.ty[1] == k::kNVFP4 && Ly.ty[2] == k::kNVFP4;
         const bool fast_ep_token = g_ep_fast && g_ep && T <= 8 && g_overlap && !g_prof &&
@@ -2613,7 +3631,11 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         }
         if (fast_ep_token) {
             const int F = c.F;
+#if defined(__HIPCC__)
+            static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 0;
+#else
             static const int exp_mma = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
+#endif
             const bool exp_tc = exp_mma && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, F);
 
             // 1. Send xq (TC*4 B) and route_d (S*8 B) from GPU 0 to GPU 1
@@ -2774,7 +3796,9 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
-        if (g_fast && T > 1 && S <= W.rg_slots && !Ly.tab_h.empty()) {
+        const bool i4_layer = g_int4_experts && Ly.i4_loaded && l < g_int4_layers;
+        if (g_fast && T > 1 && S <= W.rg_slots && !Ly.tab_h.empty() && !i4_layer) {
+            ++g_pf.br_rg;
             // Every expert in VRAM and a prompt of a few tokens (a chat turn): the experts straight over their
             // blocks, an expert's blocks read once for up to kGroupMax of the tokens that picked it.  (The GEMM path
             // below decodes a whole expert to FP16 for the two or three tokens it has: a 47-token prompt took 0.34 s.)
@@ -2828,7 +3852,9 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
-        if (g_mv && S <= 64) {
+        if (g_mv && S <= 64 && !i4_layer) {
+            ++g_pf.br_mv;
+            if (g_prof && g_pf.br_mv <= 3) std::printf("MVDBG S=%d T=%d K=%d\n", S, T, c.K);
             const double te0 = now();
             // the token path: each slot (token t's pick i) its expert's blob straight from the cache
             // The slots already in VRAM first, then the ones copied in now: the first group's experts run while the
@@ -3025,11 +4051,42 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
+        ++g_pf.br_pf;
+        if (g_prof && g_pf.br_pf <= 3) std::printf("PFDBG S=%d T=%d K=%d rg_slots=%d\n", S, T, c.K, W.rg_slots);
         run_prefill_moe(M, Ly, l, T, W.x16, top, w, W.r, W.h, W, EC, t_exp);
         g_pf.lap(g_pf.rest);
         dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
     }
     run_head(M, T, all_logits, out_mode, nb, W.h, W, logits_out, argmax_out);
+    if (vg_capture) {
+        // EndCapture / Instantiate do not execute the graph.  On success replay immediately so this
+        // window's eight argmaxes are produced; on failure fall back to a direct run of this same window.
+        g_vg_stage = VG_NORMAL;
+        cudaGraph_t gr = nullptr;
+        cudaError_t ce = cudaStreamEndCapture(g_s, &gr);
+        if (ce == cudaSuccess) ce = cudaGraphInstantiate(&g_vgraph.exec, gr, 0);
+        if (ce == cudaSuccess && g_vgraph.exec) {
+            g_vgraph.graph = gr;
+            g_vgraph.built = true;
+            std::printf("verify: CUDA graph captured and instantiated!\n");
+            std::fflush(stdout);
+            CU(cudaGraphLaunch(g_vgraph.exec, g_s));
+            CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) T * 4, cudaMemcpyDeviceToHost, g_s));
+            CU(cudaStreamSynchronize(g_s));
+            argmax_out->resize(T);
+            for (int t = 0; t < T; ++t) (*argmax_out)[t] = W.argmax_h[t];
+        } else {
+            std::printf("verify: graph %s failed (%s), fallback to direct launches\n",
+                        gr ? "instantiate" : "end capture", cudaGetErrorString(ce));
+            std::fflush(stdout);
+            if (gr) cudaGraphDestroy(gr);
+            g_vgraph.graph = nullptr;
+            g_vgraph.exec = nullptr;
+            g_vgraph.disabled = true;
+            (void) cudaGetLastError();
+            forward(M, tok, T, pos0, all_logits, out_mode, dump, logits_out, argmax_out, t_exp);
+        }
+    }
 #undef W
 #undef EC
 }
@@ -3100,7 +4157,7 @@ int big_begin(const Model& M, Work& W, ExpertCache& EC, int n, int ctx_end, BigS
     const Config& c = M.c;
     // the attention's scratch for 256 queries against the whole context: few, large GEMMs (the default ~400 MB left
     // room for only ~20 queries a step at 100k tokens) - also lent for a short prompt at the end of a long context
-    const size_t lg_want = (g_flash && !g_kv_fp8 && c.D == 128) ? 0 : (size_t) c.H * 256 * (size_t) ctx_end;
+    const size_t lg_want = (g_flash && !g_kv_fp8 && !kv_is_int() && c.D == 128) ? 0 : (size_t) c.H * 256 * (size_t) ctx_end;
     const bool long_ctx = lg_want > W.lg_cap;
     if (n <= W.T_sup && !long_ctx) return W.T_sup;
     int p = -1;
@@ -3372,7 +4429,33 @@ int run(int argc, char** argv) {
         return s;
     };
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
+    g_prof_fast = getenv("IK2_PROF_FAST") && std::atoi(getenv("IK2_PROF_FAST"));
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
+    g_flash_wmma = !(getenv("IK2_FLASH_WMMA") && !std::atoi(getenv("IK2_FLASH_WMMA")));
+    g_gate_fuse = !(getenv("IK2_GATE_FUSE") && !std::atoi(getenv("IK2_GATE_FUSE")));
+    g_rms_fuse = !(getenv("IK2_RMS_FUSE") && !std::atoi(getenv("IK2_RMS_FUSE")));
+    g_onepass = (getenv("IK2_ATTN_ONEPASS") && std::atoi(getenv("IK2_ATTN_ONEPASS")) != 0);
+    g_loopbank_fuse = getenv("IK2_LOOPBANK_FUSE") && std::atoi(getenv("IK2_LOOPBANK_FUSE"));
+    g_exp_prefill_wmma = getenv("IK2_EXPERTS_PREFILL_WMMA") && std::atoi(getenv("IK2_EXPERTS_PREFILL_WMMA"));
+    if (getenv("IK2_INT4_EXPERTS")) g_int4_experts = std::atoi(getenv("IK2_INT4_EXPERTS"));
+    if (getenv("IK2_INT4_LAYERS")) g_int4_layers = std::atoi(getenv("IK2_INT4_LAYERS"));
+    if (getenv("IK2_I4_MID_FUSE")) g_i4_mid_fuse = std::atoi(getenv("IK2_I4_MID_FUSE"));
+    if (getenv("IK2_I4_ROT_IN")) g_i4_rot_in = std::atoi(getenv("IK2_I4_ROT_IN"));
+    g_int4_pf_off = getenv("IK2_INT4_PF") && !std::atoi(getenv("IK2_INT4_PF"));
+    g_verify_fast = getenv("IK2_VERIFY_FAST") && std::atoi(getenv("IK2_VERIFY_FAST")) != 0;
+    g_verify_graph = getenv("IK2_VERIFY_GRAPH") && std::atoi(getenv("IK2_VERIFY_GRAPH")) != 0;
+    g_moe_group_exp = getenv("IK2_MOE_GROUP_EXPERT") && std::atoi(getenv("IK2_MOE_GROUP_EXPERT")) != 0;
+    if (getenv("IK2_INT4_DENSE")) g_int4_dense = std::atoi(getenv("IK2_INT4_DENSE"));
+    g_int4_dense_multi = getenv("IK2_INT4_DENSE_MULTI") && std::atoi(getenv("IK2_INT4_DENSE_MULTI")) != 0;
+    g_int4_prefill = getenv("IK2_INT4_PREFILL") && std::atoi(getenv("IK2_INT4_PREFILL")) != 0;
+    g_int4_head = getenv("IK2_INT4_HEAD") && std::atoi(getenv("IK2_INT4_HEAD")) != 0;
+    g_int4_head_decode = getenv("IK2_INT4_HEAD_DECODE") && std::atoi(getenv("IK2_INT4_HEAD_DECODE")) != 0;
+    if (getenv("IK2_DRAFT_HEAD_INT4")) g_draft_head_int4 = std::atoi(getenv("IK2_DRAFT_HEAD_INT4")) != 0;
+    g_int4_msg = getenv("IK2_INT4_MSG") && std::atoi(getenv("IK2_INT4_MSG")) != 0;
+    if (getenv("IK2_INT4_DENSE_MV")) g_int4_dense_mv = std::atoi(getenv("IK2_INT4_DENSE_MV")) != 0;
+    g_int4_rot_dedup = getenv("IK2_INT4_ROT_DEDUP") && std::atoi(getenv("IK2_INT4_ROT_DEDUP")) != 0;
+    g_int4_mv_alt = getenv("IK2_INT4_MV_ALT") && std::atoi(getenv("IK2_INT4_MV_ALT")) != 0;
+    g_mv_lds = getenv("IK2_MV_LDS") && std::atoi(getenv("IK2_MV_LDS")) != 0;
     g_mv = !getenv("IK2_MV") || std::atoi(getenv("IK2_MV"));
     g_group = !getenv("IK2_GROUP") || std::atoi(getenv("IK2_GROUP"));
     if (getenv("IK2_GROUP")) {
@@ -3382,10 +4465,17 @@ int run(int argc, char** argv) {
     g_dense_q8 = getenv_str("IK2_DENSE") == "q8";
     if (getenv("IK2_KV")) {
         const std::string kv = getenv_str("IK2_KV");
-        if (kv == "f16" || kv == "fp16") g_kv_fp8 = false;
-        else if (kv == "fp8" || kv == "e4m3") g_kv_fp8 = true;
-        else die("unknown IK2_KV=" + kv + " (expected fp8 or f16)");
+        if (kv == "f16" || kv == "fp16") g_kv_mode = KV_F16;
+        else if (kv == "fp8" || kv == "e4m3") g_kv_mode = KV_FP8;
+        else if (kv == "int8") g_kv_mode = KV_INT8;
+        else if (kv == "int4") g_kv_mode = KV_INT4;
+        else die("unknown IK2_KV=" + kv + " (expected fp8, f16, int8 or int4)");
+        g_kv_fp8 = g_kv_mode == KV_FP8;
+        g_kv_int8 = g_kv_mode == KV_INT8;
+        g_kv_int4 = g_kv_mode == KV_INT4;
     }
+    if (getenv("IK2_KV_HOST")) g_kv_host = std::atoi(getenv("IK2_KV_HOST"));
+    if (getenv("IK2_DENSE_HOST")) g_dense_host = std::atoi(getenv("IK2_DENSE_HOST"));
     if (getenv("IK2_TRACE") && *getenv("IK2_TRACE")) {
         g_trace = std::fopen(getenv("IK2_TRACE"), "wb");
         if (!g_trace) die(std::string("cannot write ") + getenv("IK2_TRACE"));
@@ -3573,7 +4663,15 @@ int run(int argc, char** argv) {
     // (half an FP16 copy's bytes, a token's products straight over them) and tokens take the resident path
     // (IK2_FAST=0: off; IK2_GRAPH=0: its launches one by one instead of a CUDA graph a token).
     g_graph = !(getenv("IK2_GRAPH") && !std::atoi(getenv("IK2_GRAPH")));
-    g_attn_mma = c.D == 128 && c.H / c.KV <= 8 ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : 1) : 0;
+    // gfx1100 has no CUDA mma16816: the decode tensor-core path is a HIP trap stub and would hang. Default it off on HIP.
+#if defined(__HIPCC__)
+    const int attn_mma_default = 0;
+#else
+    const int attn_mma_default = 1;
+#endif
+    g_attn_mma = c.D == 128 && c.H / c.KV <= 8
+                     ? (getenv("IK2_ATTN_MMA") ? std::atoi(getenv("IK2_ATTN_MMA")) : attn_mma_default)
+                     : 0;
     g_mma_split = k::attn_decode_mma_blocks(c.KV);
     const bool can_resident = (n_gpu == 1 || (dual() && g_ep)) && !g_pool;
     if (can_resident) {
@@ -3584,15 +4682,48 @@ int run(int argc, char** argv) {
             if (t.name.find("_exps.weight") != std::string::npos) exp_b += tensor_bytes(t);
             else if (t.name != "token_embd.weight") dense_b += tensor_bytes(t);
         }
+        // IK2_FIT_ACTUAL=1: account the REAL resident bytes, not the GGUF's. The INT4 expert sidecars (l<20)
+        // are smaller than the NVFP4 blocks they replace, so the GGUF-based estimate above over-counts and
+        // wrongly drops residency at long context. This knob makes the fit check match what is actually loaded.
+        const bool fit_actual = getenv("IK2_FIT_ACTUAL") && std::atoi(getenv("IK2_FIT_ACTUAL"));
+        if (fit_actual && g_int4_experts && c.F % 64 == 0 && c.C % 256 == 0) {
+            const size_t Kpad_gu = (size_t) c.C, Kpad_dn = (size_t) ((c.F + 255) / 256) * 256;
+            const size_t i4_per_layer =
+                (size_t) c.E * ((size_t) (2 * c.F / 2) * Kpad_gu + (size_t) (2 * c.F / 16) * (Kpad_gu / 256) * 64 + (size_t) (2 * c.F) * 4) +
+                (size_t) c.E * ((size_t) (c.C / 2) * Kpad_dn + (size_t) (c.C / 16) * (Kpad_dn / 256) * 64 + (size_t) c.C * 4);
+            size_t gguf_l20 = 0;
+            for (const auto& kv : S.by_name) {
+                const auto& t = *kv.second.second;
+                if (!k::block_values((int) t.type)) continue;
+                if (t.name.find("_exps.weight") == std::string::npos) continue;
+                int tl = -1;
+                if (sscanf(t.name.c_str(), "blk.%d.", &tl) == 1 && tl >= g_int4_layers) gguf_l20 += tensor_bytes(t);
+            }
+            exp_b = gguf_l20 + (size_t) g_int4_layers * i4_per_layer;   // l>=cut Q8_0 + l<cut INT4 sidecars
+        }
+        // bytes per KV token-position (K AND V are two buffers): int8 = 2*KD codes + 4*KV fp16 scales;
+        // int4 = KD codes (2 x KD/2) + 4*KV scales; fp8 = 2*KD; f16 = 4*KD.
+        const size_t kv_elems = (size_t) c.KV * c.D;
+        const size_t kv_per_tok = kv_is_int()
+            ? ((kv_int_bits() == 4 ? kv_elems : kv_elems * 2) + (size_t) 4 * c.KV)
+            : kv_elems * (g_kv_fp8 ? 1 : 2) * 2;
         for (int l = 0; l < c.n_layer; ++l) {
             const size_t cap = c.sliding[l] ? (size_t) std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : (size_t) ctx;
-            kv_b += (l >= c.core0 && l < c.core1 ? c.n_pass : 1) * cap * c.KV * c.D * (g_kv_fp8 ? 1 : 2) * 2;
+            const size_t visits = (l >= c.core0 && l < c.core1 ? c.n_pass : 1);
+            // IK2_KV_HOST: the full-attention visits' KV is host-mapped (0 VRAM); only sliding KV counts toward VRAM.
+            if (g_kv_host && kv_is_int() && !c.sliding[l]) continue;
+            kv_b += visits * cap * kv_per_tok;
         }
         size_t fr0 = 0, tot0 = 0;
         CU(cudaMemGetInfo(&fr0, &tot0));
-        const size_t reserve = (size_t) 3 << 29;   // (the work buffers and a quarter of a GiB of room: 1.5 GiB)
+        const size_t reserve_default = (size_t) 3 << 29;   // (the work buffers and a quarter of a GiB of room: 1.5 GiB)
+        const size_t reserve = getenv("IK2_RESERVE_MIB") ? (size_t) (std::atof(getenv("IK2_RESERVE_MIB")) * 1048576.0) : reserve_default;
         const size_t exp_b_dev0 = dual() ? (exp_b / 2) : exp_b;
         const bool fits = exp_b_dev0 + dense_b + kv_b + reserve <= fr0 && exp_b_dev0 <= (size_t) (cache_gb * 1073741824.0);
+        if (fit_actual)
+            std::printf("fit(actual): experts %.2f GiB + dense %.2f + KV %.2f + reserve %.2f = %.2f vs free %.2f GiB -> %s\n",
+                        exp_b_dev0 / 1073741824.0, dense_b / 1073741824.0, kv_b / 1073741824.0, reserve / 1073741824.0,
+                        (exp_b_dev0 + dense_b + kv_b + reserve) / 1073741824.0, fr0 / 1073741824.0, fits ? "FITS" : "no");
         if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
         g_fast_want = fits && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
         std::printf("experts %.1f GiB (%s), dense weights %.1f GiB as blocks, K / V cache %.1f GiB, %.1f GiB free: %s\n",
@@ -3605,6 +4736,7 @@ int run(int argc, char** argv) {
     const double t_dense = now();
     const size_t C = c.C, HD = (size_t) c.H * c.D, KD = (size_t) c.KV * c.D;
     M.L.resize(c.n_layer);
+    vram_mark("before-dense-layers");
     // two layouts: llama.cpp PR #32187's (ref/inkling2.py's: the short convs folded, gate and up apart) and unsloth's
     // "GGUF_shard_rewrite" one that llama.cpp's master reads (names of its own, the convs' residual and scale outside
     // their weights, gate and up fused - gate's rows first - with one scale): the second's folded here as it loads
@@ -3776,6 +4908,100 @@ int run(int argc, char** argv) {
             host_total += tensor_bytes(*ti);
             exp_jobs.push_back({l, n, pr.second});
         }
+        // IK2_INT4_EXPERTS: load rotated-int4 expert weights from int4-bin (replace NVFP4 residency)
+        if (g_int4_experts && l < g_int4_layers) {
+            const char* dir_c = getenv("IK2_INT4_DIR");
+            const std::string idir = dir_c ? dir_c : "int4-bin";
+            const char* roles[2] = {"gate_up", "down"};
+            const int rr[2][3] = {{0, 1, -1}, {-1, -1, 2}};
+            bool ok = true;
+            for (int q = 0; q < 2; ++q) {
+                const std::string pre = idir + "/L" + (l < 10 ? "0" : "") + std::to_string(l) + "_" + roles[q] + "_";
+                const int role = rr[q][0] >= 0 ? rr[q][0] : rr[q][2];
+                const int M = (q == 0) ? 2 * c.F : C;
+                const int Kpad = (q == 0) ? C : ((c.F + 255) / 256) * 256;
+                const size_t wpsz = (size_t) c.E * (M / 2) * Kpad;   //每层每专家 Wp bytes = M*Kpad/2
+                const size_t whsz = (size_t) c.E * (size_t) (M / 16) * (Kpad / 256) * 64;
+                const size_t wssz = (size_t) c.E * M * sizeof(float);
+                uint8_t* wp = dalloc<uint8_t>(wpsz);
+                uint8_t* wh = dalloc<uint8_t>(whsz);
+                float* ws = dalloc<float>(c.E * M);
+                auto rd = [&](const std::string& fn, void* dst, size_t n) -> bool {
+                    int fd = ::open(fn.c_str(), O_RDONLY);
+                    if (fd < 0) return false;
+                    size_t got = 0;
+                    while (got < n) {
+                        ssize_t r = ::pread(fd, (uint8_t*) dst + got, n - got, (int64_t) got);
+                        if (r <= 0) break;
+                        got += (size_t) r;
+                    }
+                    ::close(fd);
+                    return got == n;
+                };
+                // host stage then upload (file sizes: Wp from manifest, Ch MSVC-safe)
+                std::vector<uint8_t> hp(wpsz), hh(whsz); std::vector<float> hs(c.E * M);
+                ok = ok && rd(pre + "Wp.bin", hp.data(), wpsz) && rd(pre + "Wh.bin", hh.data(), whsz) && rd(pre + "WS.bin", hs.data(), wssz);
+                if (!ok) { std::printf("INT4: missing %s\n", pre.c_str()); break; }
+                CU(cudaMemcpy(wp, hp.data(), wpsz, cudaMemcpyHostToDevice));
+                CU(cudaMemcpy(wh, hh.data(), whsz, cudaMemcpyHostToDevice));
+                CU(cudaMemcpy(ws, hs.data(), wssz, cudaMemcpyHostToDevice));
+                Ly.i4_Wp[role] = wp; Ly.i4_Wh[role] = wh; Ly.i4_WS[role] = ws;
+                Ly.i4_wp_stride[role] = wpsz / c.E; Ly.i4_wh_stride[role] = whsz / c.E;
+                Ly.i4_Kpad[role] = Kpad;
+                std::vector<const uint8_t*> tp(c.E), th(c.E); std::vector<const float*> ts(c.E);
+                for (int e = 0; e < c.E; ++e) { tp[e] = wp + (size_t) e * Ly.i4_wp_stride[role]; th[e] = wh + (size_t) e * Ly.i4_wh_stride[role]; ts[e] = ws + (size_t) e * M; }
+                Ly.i4_tab_Wp[role] = dalloc<const uint8_t*>(c.E); Ly.i4_tab_Wh[role] = dalloc<const uint8_t*>(c.E); Ly.i4_tab_WS[role] = dalloc<const float*>(c.E);
+                CU(cudaMemcpy(Ly.i4_tab_Wp[role], tp.data(), c.E * sizeof(void*), cudaMemcpyHostToDevice));
+                CU(cudaMemcpy(Ly.i4_tab_Wh[role], th.data(), c.E * sizeof(void*), cudaMemcpyHostToDevice));
+                CU(cudaMemcpy(Ly.i4_tab_WS[role], ts.data(), c.E * sizeof(void*), cudaMemcpyHostToDevice));
+            }
+            Ly.i4_loaded = ok;
+        }
+        // IK2_INT4_DENSE: rotated-int4 sidecars for the dense projections' DECODE matvecs (default OFF). The Q8_0
+        // planar copies stay resident for prefill; decode's mv1/mv1c take the sidecar when present. Same k_repack
+        // layout as the experts (Wp nibble tiles / Wh 4-bit sub-scales / WS per-row), one matrix per role.
+        if (g_int4_dense && g_dense_q8) {
+            const char* dir_c = getenv("IK2_INT4_DENSE_DIR");
+            const std::string ddir = dir_c ? dir_c : "int4-dense-bin";
+            const std::string pre = ddir + "/L" + (l < 10 ? "0" : "") + std::to_string(l) + "_";
+            auto rd = [&](const std::string& fn, void* dst, size_t n) -> bool {
+                int fd = ::open(fn.c_str(), O_RDONLY);
+                if (fd < 0) return false;
+                size_t got = 0;
+                while (got < n) {
+                    ssize_t r = ::pread(fd, (uint8_t*) dst + got, n - got, (int64_t) got);
+                    if (r <= 0) break;
+                    got += (size_t) r;
+                }
+                ::close(fd);
+                return got == n;
+            };
+            auto attach = [&](Mat& m, const char* role, int N, int K) {
+                if (m.N != N || m.K != K || N % 16 || K % 256 || (K / 256 != 9 && K / 256 != 12)) {
+                    std::printf("INT4-DENSE: L%d %s shape %dx%d unsupported, Q8 fallback\n", l, role, m.N, m.K);
+                    return;
+                }
+                const size_t wpsz = (size_t) N * K / 2, whsz = (size_t) (N / 16) * (K / 256) * 64, wssz = (size_t) N * sizeof(float);
+                std::vector<uint8_t> hp(wpsz), hh(whsz); std::vector<float> hs(N);
+                const std::string p = pre + role + "_";
+                if (!rd(p + "Wp.bin", hp.data(), wpsz) || !rd(p + "Wh.bin", hh.data(), whsz) || !rd(p + "WS.bin", hs.data(), wssz)) {
+                    std::printf("INT4-DENSE: missing %s*, Q8 fallback\n", p.c_str());
+                    return;
+                }
+                uint8_t* wp = dalloc<uint8_t>(wpsz); uint8_t* wh = dalloc<uint8_t>(whsz); float* ws = dalloc<float>(N);
+                CU(cudaMemcpy(wp, hp.data(), wpsz, cudaMemcpyHostToDevice));
+                CU(cudaMemcpy(wh, hh.data(), whsz, cudaMemcpyHostToDevice));
+                CU(cudaMemcpy(ws, hs.data(), wssz, cudaMemcpyHostToDevice));
+                m.i4Wp = wp; m.i4Wh = wh; m.i4WS = ws;
+            };
+            if (Ly.sliding) attach(Ly.wqkvrg, "wqkvrg", (int) (2 * HD + 2 * KD + c.H * c.d_rel), (int) C);
+            else {
+                attach(Ly.wqrg, "wqrg", (int) (2 * HD + c.H * c.d_rel), (int) C);
+                attach(Ly.wk, "wk", (int) KD, (int) C);
+                attach(Ly.wv, "wv", (int) KD, (int) C);
+            }
+            attach(Ly.wo, "wo", (int) C, (int) HD);
+        }
         if (c.n_pass > 1 && l >= c.core0 && l < c.core1) {   // the core: its later passes' message gates and queries
             static const char* mod[4] = {"attn", "k", "v", "mlp"};
             for (int m = 0; m < 4; ++m) {
@@ -3802,6 +5028,7 @@ int run(int argc, char** argv) {
         }
     }
     // the visits of a token and their state (FP8 E4M3 or FP16 KV; sliding layers ring-buffered in both CLI and --serve)
+    vram_mark("before-KV-visits");
     M.V.resize(c.n_visit);
     for (int v = 0; v < c.n_visit; ++v) {
         Visit& Vi = M.V[v];
@@ -3811,7 +5038,26 @@ int run(int argc, char** argv) {
         const Layer& Ly = M.L[Vi.l];
         use_dev(Ly.dev);
         Vi.kv_cap = Ly.sliding ? std::min(ctx, c.window + std::max(chunk, ik2::draft::kBlock)) : ctx;
-        if (g_kv_fp8) {
+        if (kv_is_int()) {
+            const size_t code_b = (size_t) Vi.kv_cap * KD * kv_int_bits() / 8;
+            const size_t scale_n = (size_t) Vi.kv_cap * c.KV;
+            // IK2_KV_HOST=1: the full-attention visits' KV (kv_cap == ctx, the ctx-scaled hog) lives in host-mapped
+            // RAM so 1M fits beside the experts; sliding visits stay VRAM-resident (small, read every token).
+            if (g_kv_host && !Ly.sliding) {
+                void* hk = nullptr; void* hv = nullptr; void* hks = nullptr; void* hvs = nullptr;
+                Vi.kci = halloc_mapped<uint8_t>(code_b, &hk);
+                Vi.vci = halloc_mapped<uint8_t>(code_b, &hv);
+                Vi.ks = halloc_mapped<uint16_t>(scale_n, &hks);
+                Vi.vs = halloc_mapped<uint16_t>(scale_n, &hvs);
+                Vi.hkci = (uint8_t*) hk; Vi.hvci = (uint8_t*) hv; Vi.hks = (uint16_t*) hks; Vi.hvs = (uint16_t*) hvs;
+                Vi.kv_host_cap = Vi.kv_cap;
+            } else {
+                Vi.kci = dalloc<uint8_t>(code_b);
+                Vi.vci = dalloc<uint8_t>(code_b);
+                Vi.ks = dalloc<uint16_t>(scale_n);
+                Vi.vs = dalloc<uint16_t>(scale_n);
+            }
+        } else if (g_kv_fp8) {
             Vi.kc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * KD);
             Vi.vc8 = dalloc<uint8_t>((size_t) Vi.kv_cap * KD);
         } else {
@@ -3823,8 +5069,58 @@ int run(int argc, char** argv) {
         Vi.h_attn = dalloc<float>(3 * C);
         Vi.h_mlp = dalloc<float>(3 * C);
     }
+    vram_mark("after-KV-visits");
     c.n_rows = (int) (S.info("output.weight")->elements() / C);
-    M.out_w = load_mat(S, "output.weight", c.n_rows, (int) C);
+    // IK2_INT4_HEAD_DECODE: skip the head's Q8/raw copy entirely; the INT4 sidecar (loaded below) is the only
+    // weight copy. Saves ~490 MiB (host-mapped pinned RAM or VRAM) so the 1M-ctx budget keeps the expert cache.
+    M.out_w = load_mat(S, "output.weight", c.n_rows, (int) C, false, false);
+    vram_mark("after-out_w-load");
+    // IK2_INT4_HEAD: rotated-int4 sidecar for the verify HEAD GEMM (out_w, T=2..8), same k_repack layout as the
+    // dense sidecars (gw4 sh12). i4_head_only keeps it out of mv1/mv1c and the DENSE_MULTI gate: T=1 decode and the
+    // prompt path keep their existing route. The drafter's fold/propose read M.out_w.f16 (the f16 weight copy built
+    // below when --draft), which stays resident and untouched; the INT4 GEMM only writes W.logits (f32).
+    if (g_int4_head && g_dense_q8) {
+        const char* dir_c = getenv("IK2_INT4_DENSE_DIR");
+        const std::string ddir = dir_c ? dir_c : "int4-dense-bin";
+        const int N = M.out_w.N, K = M.out_w.K;
+        auto rd = [&](const std::string& fn, void* dst, size_t n) -> bool {
+            int fd = ::open(fn.c_str(), O_RDONLY);
+            if (fd < 0) return false;
+            size_t got = 0;
+            while (got < n) {
+                ssize_t r = ::pread(fd, (uint8_t*) dst + got, n - got, (int64_t) got);
+                if (r <= 0) break;
+                got += (size_t) r;
+            }
+            ::close(fd);
+            return got == n;
+        };
+        if (N % 16 || K % 256 || (K / 256 != 9 && K / 256 != 12)) {
+            std::printf("INT4-HEAD: out_w shape %dx%d unsupported, f16/Q8 fallback\n", N, K);
+        } else {
+            const size_t wpsz = (size_t) N * K / 2, whsz = (size_t) (N / 16) * (K / 256) * 64, wssz = (size_t) N * sizeof(float);
+            std::vector<uint8_t> hp(wpsz), hh(whsz); std::vector<float> hs(N);
+            const std::string p = ddir + "/out_w_";
+            if (!rd(p + "Wp.bin", hp.data(), wpsz) || !rd(p + "Wh.bin", hh.data(), whsz) || !rd(p + "WS.bin", hs.data(), wssz)) {
+                std::printf("INT4-HEAD: missing %s*, f16/Q8 fallback\n", p.c_str());
+            } else {
+                // IK2_INT4_HEAD_DECODE: the decode head reads this VRAM sidecar, never the Q8 blocks. Free the Q8
+                // head FIRST (host-mapped ~462 MiB pinned RAM, or VRAM) so the sidecar fits the 1M-ctx budget.
+                if (g_int4_head_decode && M.out_w.q8) {
+                    cudaFree(M.out_w.q8); cudaFree(M.out_w.q8d);
+                    M.out_w.q8 = nullptr; M.out_w.q8d = nullptr;
+                    std::printf("INT4-HEAD-DECODE: freed Q8 head before sidecar (decode head over the int4 sidecar)\n");
+                }
+                uint8_t* wp = dalloc<uint8_t>(wpsz); uint8_t* wh = dalloc<uint8_t>(whsz); float* ws = dalloc<float>(N);
+                CU(cudaMemcpy(wp, hp.data(), wpsz, cudaMemcpyHostToDevice));
+                CU(cudaMemcpy(wh, hh.data(), whsz, cudaMemcpyHostToDevice));
+                CU(cudaMemcpy(ws, hs.data(), wssz, cudaMemcpyHostToDevice));
+                M.out_w.i4Wp = wp; M.out_w.i4Wh = wh; M.out_w.i4WS = ws;
+                M.out_w.i4_head_only = true;
+                std::printf("INT4-HEAD: out_w sidecar %dx%d (%.1f MiB)\n", N, K, (double) (wpsz + whsz + wssz) / (1024.0 * 1024.0));
+            }
+        }
+    }
     if (g_dense_q8) {   // (a layer's largest; the head's logits go a token at a time over its blocks)
         g_w16_n = (2 * HD + 2 * KD + (size_t) c.H * c.d_rel) * C;
         g_w16 = dalloc<uint16_t>(g_w16_n);
@@ -3835,10 +5131,17 @@ int run(int argc, char** argv) {
     M.embd_type = (int) S.info("token_embd.weight")->type;
     if (!k::block_values(M.embd_type)) die("token_embd's type");
     if (g_stage) cudaFree(g_stage), g_stage = nullptr, g_stage_bytes = 0;
+    vram_mark("after-dense-out_w");
     {
         size_t kv_bytes = 0;
-        for (const auto& Vi : M.V) kv_bytes += (size_t) Vi.kv_cap * KD * (g_kv_fp8 ? 1 : 2) * 2;
-        std::printf("kv cache: %s (%.2f GiB across %d layer%s)\n", g_kv_fp8 ? "FP8 E4M3" : "FP16",
+        for (const auto& Vi : M.V) {
+            if (kv_is_int())
+                kv_bytes += (size_t) Vi.kv_cap * ((KD * kv_int_bits()) / 4 + 4 * c.KV);  // K+V codes + K+V fp16 scales
+            else
+                kv_bytes += (size_t) Vi.kv_cap * KD * (g_kv_fp8 ? 1 : 2) * 2;
+        }
+        const char* kv_name = kv_is_int() ? (kv_int_bits() == 4 ? "INT4 (per-head fp16 scale)" : "INT8 (per-head fp16 scale)") : (g_kv_fp8 ? "FP8 E4M3" : "FP16");
+        std::printf("kv cache: %s (%.2f GiB across %d layer%s)\n", kv_name,
                     kv_bytes / 1073741824.0, c.n_visit, c.n_pass > 1 ? " visits" : "s");
         std::fflush(stdout);
     }
@@ -3880,6 +5183,7 @@ int run(int argc, char** argv) {
         }
         std::printf("experts: read where the files are mapped (IK2_HOST=mmap)\n");
         std::fflush(stdout);
+        vram_mark("after-expert-host-mmap");
     } else {
         // Pinned host memory: anonymous mappings read into and then registered with CUDA, a layer as soon as its
         // reads are done (323 GiB in ~60 s from VAST); IK2_ALLOC=hostalloc: cudaHostAlloc instead, which pins at
@@ -4059,6 +5363,23 @@ int run(int argc, char** argv) {
         try {
             drafter = ik2::draft::load(draft_path, c.C, ctx, g_blas, g_s);
             ik2::draft::fold(drafter, M.out_w.f16, c.n_rows);
+            // IK2_DRAFT_HEAD_INT4: arm propose()'s base logits over the head's INT4 sidecar when it is
+            // loaded (IK2_INT4_HEAD=1). Documented choice: if the sidecar is absent (IK2_INT4_HEAD off
+            // or bins missing) fall back to gemm_h -- no second sidecar load here. fold keeps its f16 copy.
+            if (g_draft_head_int4) {
+                if (ik2::draft::set_head_int4(drafter, M.out_w.i4Wp, M.out_w.i4Wh, M.out_w.i4WS, c.n_rows)) {
+                    std::printf("DRAFT-HEAD-INT4: propose base logits over the out_w int4 sidecar (NC=%d)\n",
+                                ik2::draft::kBlock - 1);
+                    // fold() already consumed the f16 head copy (one-time load cost); propose now reads the
+                    // INT4 sidecar and the verify head uses it too, so nothing reads M.out_w.f16 anymore.
+                    // Free it (~926 MiB) to leave room for the expert cache / long-context KV residency.
+                    cudaFree(M.out_w.f16);
+                    M.out_w.f16 = nullptr;
+                } else {
+                    std::printf("DRAFT-HEAD-INT4: requested but the out_w sidecar is unavailable/unsupported, "
+                                "gemm_h fallback\n");
+                }
+            }
         } catch (const std::exception& e) {
             die(e.what());
         }
@@ -4077,6 +5398,8 @@ int run(int argc, char** argv) {
     }
 
     // the work buffers and the expert cache, a set a GPU
+    if (getenv("IK2_VRAM_TRACE")) { size_t f0 = 0, t0 = 0; CU(cudaMemGetInfo(&f0, &t0));
+        std::printf("VRAM-TRACE before work-buffer loop: free %.2f GiB (ctx %d)\n", f0 / 1073741824.0, ctx); }
     for (int d = 0; d < n_gpu; ++d) {
     use_dev(d);
     CU(cudaMemGetInfo(&fr, &tot));
@@ -4101,7 +5424,12 @@ int run(int argc, char** argv) {
     W.vconv = dalloc<float>(Tm * KD);
     W.rr = dalloc<float>(Tm * c.H * c.d_rel), W.sink = dalloc<float>(Tm * c.H);
     W.dyn = dalloc<float>(2 * Tm * c.KV * 4);   // (a full layer's dynamic taps: k's, and on the resident path v's beside)
-    W.lg_cap = std::max((size_t) 8 * c.H * (size_t) ctx + (size_t) 8 * c.H * 128 * 130, (size_t) 64 << 20);
+    // IK2_LG_CTX: cap the linear-in-ctx logits scratch (W.lg / W.gu32 alias) at this many tokens instead of the
+    // full --ctx. The flash decode path never touches W.lg, and prefill chunks (<= --prefill) only need scratch
+    // for the chunk, not the whole context. At 1M ctx the default lg/gu32 pair is ~24 GiB; capping to the chunk
+    // size frees it so the Q8 expert pool stays fully resident. Default 0 = unchanged (full ctx).
+    const size_t lg_ctx = getenv("IK2_LG_CTX") ? (size_t) std::max(1, std::atoi(getenv("IK2_LG_CTX"))) : (size_t) ctx;
+    W.lg_cap = std::max((size_t) 8 * c.H * lg_ctx + (size_t) 8 * c.H * 128 * 130, (size_t) 64 << 20);
     W.lg = dalloc<float>(W.lg_cap);
     W.blocks = dalloc<float>((size_t) (c.n_layer / c.block + 1) * T_buf * C);
     W.x16 = dalloc<uint16_t>(Tm * std::max(C, HD)), W.xk16 = dalloc<uint16_t>(Tm * C), W.xv16 = dalloc<uint16_t>(Tm * C);
@@ -4110,7 +5438,7 @@ int run(int argc, char** argv) {
         W.relb_ext = std::max(c.extent, c.extent_swa);
         W.relb = dalloc<float>((size_t) Work::kRelbRows * c.H * W.relb_ext);
     }
-    if (g_kv_fp8) {
+    if (g_kv_fp8 || kv_is_int()) {
         W.kv_tmp_cap = std::min(ctx, 32768);
         W.kv_k16 = dalloc<uint16_t>((size_t) W.kv_tmp_cap * KD);
         W.kv_v16 = dalloc<uint16_t>((size_t) W.kv_tmp_cap * KD);
@@ -4124,6 +5452,9 @@ int run(int argc, char** argv) {
                                         (2 * HD + (size_t) c.H * c.d_rel + c.H) + 2 * (KD + (size_t) c.KV * 4)),
                   T_buf * 2 * (size_t) c.F, (W.lg_cap + 1) / 2});
     W.gu32 = dalloc<float>(W.gu32_bytes / 4);
+    if (getenv("IK2_VRAM_TRACE")) { size_t f2 = 0, t2 = 0; CU(cudaMemGetInfo(&f2, &t2));
+        std::printf("VRAM-TRACE after work buffers: free %.2f GiB (lg %.2f gu32 %.2f GiB)\n", f2 / 1073741824.0,
+                    W.lg_cap * 4 / 1073741824.0, W.gu32_bytes / 1073741824.0); }
     W.qkv = W.gu32;
     W.lg16 = (uint16_t*) W.gu32;
     W.y32 = dalloc<float>(std::max<size_t>(64, T_buf) * C);
@@ -4132,6 +5463,47 @@ int run(int argc, char** argv) {
     W.sg = dalloc<float>(S_buf), W.su = dalloc<float>(S_buf), W.wt = dalloc<float>(S_buf);
     W.gidx = dalloc<int>(S_buf), W.inv = dalloc<int>(S_buf);
     W.blob = dalloc<const uint8_t*>(S8), W.tok = dalloc<int>(S8);
+    if (g_int4_experts) {
+        const int Kpad_f = ((c.F + 255) / 256) * 256;
+        W.i4_Kpad_f = Kpad_f;
+        // verify-fast rotates S=T*K slot rows into i4_xq/i4_xd; without it these hold the T=1 token only (unchanged).
+        const int i4_act_rows = g_verify_fast ? (int) std::max<size_t>(Tm, 8) : 1;
+        W.i4_xq = dalloc<int8_t>((size_t) i4_act_rows * C); W.i4_xd = dalloc<float2>((size_t) i4_act_rows * (C / 32 + 2));
+        W.i4_hf = dalloc<float>(S8 * Kpad_f); W.i4_hq = dalloc<int8_t>(S8 * Kpad_f); W.i4_hd = dalloc<float2>(S8 * (Kpad_f / 32 + 2));
+        W.i4_Wp_s = dalloc<const uint8_t*>(S8); W.i4_Wh_s = dalloc<const uint8_t*>(S8); W.i4_WS_s = dalloc<const float*>(S8);
+        W.i4_Wp_dn = dalloc<const uint8_t*>(S8); W.i4_Wh_dn = dalloc<const uint8_t*>(S8); W.i4_WS_dn = dalloc<const float*>(S8);
+        if (g_moe_group_exp) {   // IK2_MOE_GROUP_EXPERT scratch: fixed 64-slot capacity (verify-fast guard: S<=64)
+            W.i4_g_cnt = dalloc<int>(64); W.i4_g_slots = dalloc<int>(64 * 8);
+            W.i4_g_exp = dalloc<int>(64); W.i4_g_n = dalloc<int>(1);
+        }
+#if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
+        // prefill scratch: one expert's rows at a time, capped at T_buf (rot_pack8 pads rows to 256)
+        const int cap = (int) ((T_buf + 255) / 256 * 256);
+        const size_t Kmax_sz = std::max<size_t>(C, (size_t) Kpad_f);
+        const int Kmax = (int) ((g_int4_dense_multi || g_int4_prefill) ? std::max<size_t>(Kmax_sz, HD) : Kmax_sz);
+        W.i4_pf_cap = cap;
+        W.i4_pf_Kmax = Kmax;
+        W.i4_pf_x = dalloc<float>((size_t) cap * Kmax);
+        W.i4_pf_x4 = dalloc<uint8_t>((size_t) cap * Kmax);   // two planes of cap * Kmax / 2 bytes
+        W.i4_pf_xm = dalloc<uint8_t>((size_t) (cap / 16) * (Kmax / 256) * 16);
+        W.i4_pf_xr = dalloc<float>(cap);
+        // IK2_INT4_DENSE_MV: decode-style matvec activation scratch (T rows, up to Kmax wide).
+        if (g_int4_dense_mv) {
+            W.i4_mv_xq = dalloc<int8_t>((size_t) i4_act_rows * Kmax);
+            W.i4_mv_xd = dalloc<float2>((size_t) i4_act_rows * (Kmax / 32 + 2));
+            if (g_int4_rot_dedup)   // per-input slots: in_q's codes survive the in_k/in_v rotations (msg branch)
+                for (int i = 0; i < Work::kI4RotSlots; ++i) {
+                    W.i4_rd_xq[i] = dalloc<int8_t>((size_t) i4_act_rows * Kmax);
+                    W.i4_rd_xd[i] = dalloc<float2>((size_t) i4_act_rows * (Kmax / 32 + 2));
+                }
+            if (g_int4_mv_alt)   // IK2_INT4_MV_ALT: in_q/in_k/in_v codes live concurrently for the fused msg matvec
+                for (int i = 0; i < 3; ++i) {
+                    W.i4_ma_xq[i] = dalloc<int8_t>((size_t) i4_act_rows * Kmax);
+                    W.i4_ma_xd[i] = dalloc<float2>((size_t) i4_act_rows * (Kmax / 32 + 2));
+                }
+        }
+#endif
+    }
     for (int i = 0; i < Work::kPackRing; ++i) {
         CU(cudaHostAlloc(&W.pack_h[i], 8192, cudaHostAllocPortable));
         W.pack_d[i] = dalloc<uint8_t>(8192);
@@ -4203,13 +5575,20 @@ int run(int argc, char** argv) {
     }
     ExpertCache& EC = g_dev[d].EC;
     CU(cudaMemGetInfo(&fr, &tot));
+    if (getenv("IK2_VRAM_TRACE"))
+        std::printf("VRAM-TRACE GPU%d before EC: free %.2f GiB (tot %.2f)\n", d, fr / 1073741824.0, tot / 1073741824.0);
     // (what is left free: 2 GiB beside a cache that streams experts in and out; a quarter of one when every expert
-    //  stays in VRAM - nothing more is allocated but a token's graph)
-    const size_t room = (g_fast_want ? (size_t) 256 << 20 : (size_t) 2 << 30) +
+    //  stays in VRAM - nothing more is allocated but a token's graph). IK2_EC_ROOM_MIB overrides the resident 256 MiB
+    //  margin for the tight 1M-ctx budget (the graph + small buffers need < 128 MiB).
+    const size_t resident_room = getenv("IK2_EC_ROOM_MIB")
+        ? (size_t) (std::atof(getenv("IK2_EC_ROOM_MIB")) * 1048576.0) : (size_t) 256 << 20;
+    const size_t room = (g_fast_want ? resident_room : (size_t) 2 << 30) +
                         (vram_reserve_mib > 0 ? (size_t) (vram_reserve_mib * 1048576.0) : 0);
     const size_t budget = std::min((size_t) (cache_gb * 1073741824.0), fr > room ? fr - room : (size_t) 0);
+    std::printf("EC budget: free %.2f GiB, room %.2f GiB, cache_gb %.1f -> budget %.2f GiB (fast_want %d)\n",
+                fr / 1073741824.0, room / 1073741824.0, cache_gb, budget / 1073741824.0, (int) g_fast_want);
     EC.tp = g_tp ? d : -1;
-    EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget);
+    EC.init(M.L, dual() ? -1 : d, c.n_layer, c.E, budget, (g_int4_experts && !g_int4_pf_off) ? g_int4_layers : 0);
     std::printf("expert cache, GPU %d: %d slots across %zu pools (%.1f GiB); load %.1f s in all\n", d, EC.total_slots(),
                 EC.pools.size(), EC.total_bytes() / 1073741824.0, now() - t_start);
     for (size_t p = 0; p < EC.pools.size(); ++p)
@@ -4271,33 +5650,73 @@ int run(int argc, char** argv) {
     if (g_fast_want && d == 0) {   // the resident path: every expert in now, and where each is on the device
         auto blocks = [](const Mat& m) { return m.raw || m.q8; };   // (kept as the GGUF's blocks, whole or planar)
         bool all = !EC.pools.empty(), raw = blocks(M.out_w);
-        for (const auto& P : EC.pools) all = all && P.n_active >= P.n_layers * c.E;
+        if (g_int4_experts) {   // only the l>=20 Q8_0 layers need the cache; l<20 live in i4_* buffers
+            std::vector<bool> need(EC.pools.size(), false);
+            for (int l = g_int4_layers; l < c.n_layer; ++l) need[EC.layer_pool[l]] = true;
+            for (size_t p = 0; p < EC.pools.size(); ++p)
+                if (need[p]) all = all && EC.pools[p].n_active >= EC.pools[p].n_layers * c.E;
+            // IK2_INT4_DENSE / IK2_INT4_HEAD load rotated-int4 sidecars for the dense decode matvecs IN ADDITION to
+            // the Q8_0 planar copies (kept for prefill). When every projection that decode reads carries its sidecar,
+            // the resident decode path never touches the raw Q8 blocks -> residency holds without them. (raw still
+            // gates the no-sidecar fallback so a missing/unsupported sidecar cannot silently drop residency.)
+            if (g_int4_dense) {
+                bool dense_i4 = M.out_w.i4Wp != nullptr || !g_int4_head;
+                for (const auto& Ly : M.L) {
+                    dense_i4 = dense_i4 && Ly.wo.i4Wp != nullptr &&
+                               (Ly.sliding ? Ly.wqkvrg.i4Wp != nullptr
+                                           : (Ly.wqrg.i4Wp != nullptr && Ly.wk.i4Wp != nullptr && Ly.wv.i4Wp != nullptr));
+                }
+                if (dense_i4) raw = true;
+            }
+        } else {
+            for (const auto& P : EC.pools) all = all && P.n_active >= P.n_layers * c.E;
+        }
         for (const auto& Ly : M.L)
             raw = raw && blocks(Ly.wo) && (Ly.sliding ? blocks(Ly.wqkvrg) : (blocks(Ly.wqrg) && blocks(Ly.wk) && blocks(Ly.wv)));
+        if (g_int4_experts && g_int4_dense) {
+            // every decode projection carries an int4 sidecar -> residency holds without the Q8 planar dense copies
+            bool dense_i4 = M.out_w.i4Wp != nullptr || !g_int4_head;
+            for (const auto& Ly : M.L)
+                dense_i4 = dense_i4 && Ly.wo.i4Wp != nullptr &&
+                           (Ly.sliding ? Ly.wqkvrg.i4Wp != nullptr
+                                       : (Ly.wqrg.i4Wp != nullptr && Ly.wk.i4Wp != nullptr && Ly.wv.i4Wp != nullptr));
+            if (dense_i4) raw = true;
+        }
         if (all && raw) {
             const double tw = now();
             const uint64_t m0 = EC.misses, b0 = EC.bytes_up;
             int n = 0;
-            for (int l = 0; l < c.n_layer; ++l)
+            // INT4 layers (<20) keep their weights in i4_* buffers: no NVFP4 cache copy for them.
+            for (int l = (g_int4_experts ? g_int4_layers : 0); l < c.n_layer; ++l)
                 for (int e = 0; e < c.E; ++e)
                     if (!EC.has(l, e)) EC.get(M.L[l], l, e, EC.tick, g_cs, nullptr, true, true), ++n;
             CU(cudaStreamSynchronize(g_cs));
             ++EC.tick;
             for (int l = 0; l < c.n_layer; ++l) {
                 Layer& Ly = M.L[l];
-                const auto& P = EC.pools[EC.layer_pool[l]];
-                std::vector<const uint8_t*> tab(c.E);
-                for (int e = 0; e < c.E; ++e) tab[e] = P.data + (size_t) EC.loc[(size_t) l * c.E + e] * P.slot_bytes;
-                Ly.tab_blob = dalloc<const uint8_t*>(c.E);
-                CU(cudaMemcpy(Ly.tab_blob, tab.data(), (size_t) c.E * sizeof(void*), cudaMemcpyHostToDevice));
-                Ly.tab_h = tab;
-                for (int r = 0; r < 3; ++r)
-                    if (!Ly.scale[r].empty()) Ly.tab_sc[r] = dev_f32(Ly.scale[r]);
+                if (g_int4_experts && l < g_int4_layers) {   // dummy blob: route_token writes it, the i4 path ignores it
+                    std::vector<const uint8_t*> tab(c.E, Ly.i4_Wp[0]);
+                    Ly.tab_blob = dalloc<const uint8_t*>(c.E);
+                    CU(cudaMemcpy(Ly.tab_blob, tab.data(), (size_t) c.E * sizeof(void*), cudaMemcpyHostToDevice));
+                    Ly.tab_h = tab;
+                } else {   // layers 20-23 stay Q8_0: real expert pointers from the cache
+                    const auto& P = EC.pools[EC.layer_pool[l]];
+                    std::vector<const uint8_t*> tab(c.E);
+                    for (int e = 0; e < c.E; ++e) tab[e] = P.data + (size_t) EC.loc[(size_t) l * c.E + e] * P.slot_bytes;
+                    Ly.tab_blob = dalloc<const uint8_t*>(c.E);
+                    CU(cudaMemcpy(Ly.tab_blob, tab.data(), (size_t) c.E * sizeof(void*), cudaMemcpyHostToDevice));
+                    Ly.tab_h = tab;
+                    for (int r = 0; r < 3; ++r)
+                        if (!Ly.scale[r].empty()) Ly.tab_sc[r] = dev_f32(Ly.scale[r]);
+                }
             }
             EC.misses = m0, EC.bytes_up = b0;
             g_fast = true;
-            std::printf("resident: every expert in VRAM (%d copied in %.1f s); tokens take the resident path%s\n", n,
-                        now() - tw, g_graph ? ", a CUDA graph each" : "");
+            if (g_int4_experts)
+                std::printf("resident: INT4 experts (l<20) + Q8_0 (l>=20) all in VRAM; tokens take the resident path\n");
+            else
+                std::printf("resident: every expert in VRAM (%d copied in %.1f s); tokens take the resident path%s\n", n,
+                            now() - tw, g_graph ? ", a CUDA graph each" : "");
         } else {
             std::printf("resident path off: %s\n", all ? "a dense matrix is not kept as blocks" : "the cache does not hold every expert");
         }
@@ -4370,21 +5789,52 @@ int run(int argc, char** argv) {
             int pos = -1;
             std::vector<float*> h;   // [layer * 4 + conv]
             std::vector<std::vector<uint8_t>> kv_k, kv_v;
+            std::vector<std::vector<uint8_t>> kv_ks, kv_vs;   // int8/int4: per-head fp16 scales
         };
         const size_t kv_elem_b = g_kv_fp8 ? 1 : 2;
-        std::vector<Snap> snaps(8);
+        const size_t kv_code_b = kv_is_int() ? (size_t) kv_int_bits() / 8 : kv_elem_b;
+        // IK2_CONV_CACHE_MIB: conversation-cache budget in host RAM (default 8192 = 8 GiB). The cache parks each
+        // session's snapshot (conv histories + sliding KV windows +, with IK2_CONV_CACHE_FULL, the full-attention
+        // KV) so an agent's next turn reuses the shared prefix instead of re-running it. The number of snapshots is
+        // sized to fit the budget; more snapshots = more concurrent conversations parked.
+        const size_t conv_cache_mib = getenv("IK2_CONV_CACHE_MIB") ? (size_t) std::atof(getenv("IK2_CONV_CACHE_MIB")) : 8192;
+        const bool conv_cache_full = getenv("IK2_CONV_CACHE_FULL") && std::atoi(getenv("IK2_CONV_CACHE_FULL"));
+        size_t snap_bytes = 0;   // host bytes per snapshot (sliding KV + scales; conv histories are VRAM)
+        for (size_t l = 0; l < M.V.size(); ++l) {
+            const Layer& Ly = bind_visit(M, (int) l);
+            const bool park_full = conv_cache_full && !Ly.sliding;
+            if ((Ly.sliding && Ly.kv_cap < ctx) || park_full) {
+                const size_t cap = park_full ? (size_t) ctx : (size_t) c.window;
+                snap_bytes += 2 * cap * KD * kv_code_b;
+                if (kv_is_int()) snap_bytes += 2 * cap * c.KV * 2;
+            }
+        }
+        int n_snaps = 8;
+        if (snap_bytes > 0) n_snaps = (int) std::max<size_t>(1, std::min<size_t>(64, (conv_cache_mib << 20) / snap_bytes));
+        std::printf("conversation cache: %zu MiB budget, %d snapshots of %.1f MiB host RAM (%s)\n",
+                    conv_cache_mib, n_snaps, snap_bytes / 1048576.0, conv_cache_full ? "full KV" : "sliding KV");
+        std::fflush(stdout);
+        std::vector<Snap> snaps(n_snaps);
         for (auto& sn : snaps) {
             sn.kv_k.resize(M.V.size());
             sn.kv_v.resize(M.V.size());
+            sn.kv_ks.resize(M.V.size());
+            sn.kv_vs.resize(M.V.size());
             for (size_t l = 0; l < M.V.size(); ++l) {   // (l: a visit)
                 auto& Ly = bind_visit(M, (int) l);
                 use_dev(Ly.dev);
                 const size_t cc[4] = {KD, KD, C, C};
                 for (int i = 0; i < 4; ++i) sn.h.push_back(dalloc<float>(3 * cc[i]));
-                if (Ly.sliding && Ly.kv_cap < ctx) {
-                    const size_t bytes = (size_t) c.window * KD * kv_elem_b;
+                const bool park_full = conv_cache_full && !Ly.sliding;
+                if ((Ly.sliding && Ly.kv_cap < ctx) || park_full) {
+                    const size_t cap = park_full ? (size_t) ctx : (size_t) c.window;
+                    const size_t bytes = cap * KD * kv_code_b;
                     sn.kv_k[l].resize(bytes);
                     sn.kv_v[l].resize(bytes);
+                    if (kv_is_int()) {
+                        sn.kv_ks[l].resize(cap * c.KV * 2);
+                        sn.kv_vs[l].resize(cap * c.KV * 2);
+                    }
                 }
             }
         }
@@ -4392,7 +5842,6 @@ int run(int argc, char** argv) {
         auto snap_copy = [&](Snap& sn, bool save) {
             const size_t cc[4] = {KD, KD, C, C};
             const cudaMemcpyKind kv_dir = save ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice;
-            const size_t row_b = (size_t) KD * kv_elem_b;
             for (size_t l = 0; l < M.V.size(); ++l) {   // (l: a visit)
                 Layer& Ly = bind_visit(M, (int) l);
                 use_dev(Ly.dev);
@@ -4401,25 +5850,31 @@ int run(int argc, char** argv) {
                     float* sv = sn.h[l * 4 + i];
                     CU(cudaMemcpyAsync(save ? sv : hs[i], save ? hs[i] : sv, 3 * cc[i] * 4, cudaMemcpyDeviceToDevice, g_s));
                 }
-                if (sn.pos > 0 && Ly.sliding && Ly.kv_cap < ctx) {
-                    const int w = std::min(sn.pos, c.window);
+                const bool park_full = conv_cache_full && !Ly.sliding;
+                if (sn.pos > 0 && ((Ly.sliding && Ly.kv_cap < ctx) || park_full)) {
+                    const int w = park_full ? sn.pos : std::min(sn.pos, c.window);
                     const int k_start = sn.pos - w;
                     const int s0 = k_start % Ly.kv_cap;
                     const int n1 = std::min(w, Ly.kv_cap - s0);
                     const int n2 = w - n1;
-                    uint8_t* dk = g_kv_fp8 ? Ly.kc8 : (uint8_t*) Ly.kc;
-                    uint8_t* dv = g_kv_fp8 ? Ly.vc8 : (uint8_t*) Ly.vc;
+                    const size_t row_b = (size_t) KD * kv_code_b;
+                    uint8_t* dk = kv_is_int() ? Ly.kci : (g_kv_fp8 ? Ly.kc8 : (uint8_t*) Ly.kc);
+                    uint8_t* dv = kv_is_int() ? Ly.vci : (g_kv_fp8 ? Ly.vc8 : (uint8_t*) Ly.vc);
                     uint8_t* hk = sn.kv_k[l].data();
                     uint8_t* hv = sn.kv_v[l].data();
-                    CU(cudaMemcpyAsync(save ? hk : dk + (size_t) s0 * row_b, save ? dk + (size_t) s0 * row_b : hk,
-                                       (size_t) n1 * row_b, kv_dir, g_s));
-                    CU(cudaMemcpyAsync(save ? hv : dv + (size_t) s0 * row_b, save ? dv + (size_t) s0 * row_b : hv,
-                                       (size_t) n1 * row_b, kv_dir, g_s));
-                    if (n2 > 0) {
-                        CU(cudaMemcpyAsync(save ? hk + (size_t) n1 * row_b : dk,
-                                           save ? dk : hk + (size_t) n1 * row_b, (size_t) n2 * row_b, kv_dir, g_s));
-                        CU(cudaMemcpyAsync(save ? hv + (size_t) n1 * row_b : dv,
-                                           save ? dv : hv + (size_t) n1 * row_b, (size_t) n2 * row_b, kv_dir, g_s));
+                    auto ring_copy = [&](uint8_t* d, uint8_t* h, size_t rb) {
+                        CU(cudaMemcpyAsync(save ? h : d + (size_t) s0 * rb, save ? d + (size_t) s0 * rb : h,
+                                           (size_t) n1 * rb, kv_dir, g_s));
+                        if (n2 > 0)
+                            CU(cudaMemcpyAsync(save ? h + (size_t) n1 * rb : d,
+                                               save ? d : h + (size_t) n1 * rb, (size_t) n2 * rb, kv_dir, g_s));
+                    };
+                    ring_copy(dk, hk, row_b);
+                    ring_copy(dv, hv, row_b);
+                    if (kv_is_int()) {
+                        const size_t srow = (size_t) c.KV * 2;
+                        ring_copy((uint8_t*) Ly.ks, sn.kv_ks[l].data(), srow);
+                        ring_copy((uint8_t*) Ly.vs, sn.kv_vs[l].data(), srow);
                     }
                 }
             }
@@ -4459,7 +5914,8 @@ int run(int argc, char** argv) {
             eos_ids.push_back(199999);   // (Inkling 2's <|endoftext|>)
         }
         if (serve_strata) {
-            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d\n", g_kv_fp8 ? "fp8" : "f16", ctx, n_gpu);
+            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d\n",
+                        kv_is_int() ? (kv_int_bits() == 4 ? "int4" : "int8") : (g_kv_fp8 ? "fp8" : "f16"), ctx, n_gpu);
             std::printf("READY %d stop\n", ctx);
         } else {
             std::printf("@READY ctx %d\n", ctx);
@@ -4821,6 +6277,7 @@ int run(int argc, char** argv) {
         logits.clear();
     }
     // greedy generation
+    const Prof pf_prefill = g_pf;   // snapshot prefill profiling before the reset
     g_pf = Prof{};
     std::vector<int> out;
     const double tg = now();
@@ -4876,14 +6333,20 @@ int run(int argc, char** argv) {
         auto argmax_row = [&](const float* r) { return (int) (std::max_element(r, r + c.n_vocab) - r); };
         int anchor = first_best, P = (int) prompt.size();
         out.push_back(anchor);
-        const int B = ik2::draft::kBlock;
+        // IK2_SPEC_N (default 8): verify window B = N tokens (anchor + N-1 drafts), 2..8. Smaller B trades
+        // accept-per-step against verify cost (fewer tokens, fewer experts touched); the drafter still computes
+        // all kBlock-1 Markov steps, only the host copy / verify window is truncated. B=8 is the trained block.
+        int B = ik2::draft::kBlock;
+        if (getenv("IK2_SPEC_N")) B = std::atoi(getenv("IK2_SPEC_N"));
+        if (B < 2) B = 2;
+        if (B > ik2::draft::kBlock) B = ik2::draft::kBlock;
         const bool margin_check = getenv("IK2_MARGIN") != nullptr;
         while ((int) out.size() < gen && P + B <= ctx) {
             use_dev(0);
             const double t0 = now();
             embed_row(M, anchor, raw, anchor_h);
             int dr[ik2::draft::kBlock - 1];
-            ik2::draft::propose(drafter, anchor, anchor_h, P, M.out_w.f16, c.n_rows, c.n_vocab, dr);
+            ik2::draft::propose(drafter, anchor, anchor_h, P, M.out_w.f16, c.n_rows, c.n_vocab, dr, B - 1);
             const double t1 = now();
             int tk[ik2::draft::kBlock];
             tk[0] = anchor;
@@ -4892,8 +6355,12 @@ int run(int argc, char** argv) {
             logits.clear();
             std::vector<int> ag;
             const bool need_logits = n_steps < verify_check || margin_check;
+            const double tv0 = now();
+            const double t_exp_before = t_exp;
             forward(M, tk, B, P, true, need_logits ? OutMode::kLogits : OutMode::kArgmax, std::string(), logits, &ag,
                     t_exp);
+            const double tv1 = now();
+            const double vexp_ms = (t_exp - t_exp_before) * 1e3;
             if (n_steps < verify_check) {
                 // the same window again through each other path (the convs' history taken back first): the
                 // logits' largest difference and the argmax disagreements against the grouped run
@@ -4950,10 +6417,44 @@ int run(int argc, char** argv) {
                 for (int j = 0; j < B; ++j) std::printf("%d%s", g[j], j + 1 < B ? " " : "");
                 std::printf("] match=%d\n", n);
             }
+            const double tv2 = now();
             if (n + 1 < B) rollback(M, n + 1);
             use_dev(0);
+            const double tv3 = now();
             ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n + 1, P);
             ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n);
+            const double tv4 = now();
+            if (getenv("IK2_VPROF")) {
+                static double sv_fwd = 0, sv_rb = 0, sv_wc = 0, sv_exp = 0; static int sv_n = 0;
+                sv_fwd += (tv1 - tv0) * 1e3; sv_rb += (tv3 - tv2) * 1e3; sv_wc += (tv4 - tv3) * 1e3; sv_exp += vexp_ms; ++sv_n;
+                if (sv_n % 8 == 0) std::printf("vprof: fwd %.1f (exp %.1f) rb %.1f wc %.1f ms/step (n=%d)\n",
+                                               sv_fwd / sv_n, sv_exp / sv_n, sv_rb / sv_n, sv_wc / sv_n, sv_n);
+            }
+            if (getenv("IK2_VPROF2")) {
+                // vpA[vis]..vpB[vis] = attention (proj+attn) of visit vis; vpB[vis]..vpA[vis+1] = MoE+rest.
+                static double sv_attn = 0, sv_moe = 0; static int sv_n2 = 0;
+                for (int q = 0; q + 1 < vp_n; ++q) { float a = 0, b = 0;
+                    cudaEventElapsedTime(&a, vpA[q], vpB[q]); cudaEventElapsedTime(&b, vpB[q], vpA[q + 1]);
+                    sv_attn += a; sv_moe += b; }
+                ++sv_n2;
+                if (sv_n2 % 8 == 0) std::printf("vprof2: attn %.1f moe+rest %.1f ms/step over %d visits (n=%d)\n",
+                                                sv_attn / sv_n2, sv_moe / sv_n2, vp_n - 1, sv_n2);
+            }
+            if (getenv("IK2_VPROF3") || getenv("IK2_VPROF4")) {
+                // vpA..vpR = attn_res+loop_gates+rms; vpR..vpS = rms/gate tail; vpS..vpP = proj matmul;
+                // vpP..vpK = prep+conv; vpK..vpF = attn kernel; vpF..vpB = gate+wo+resnorm.
+                static double s_res = 0, s_rms = 0, s_mm = 0, s_prep = 0, s_attn = 0, s_wo = 0; static int sv_n3 = 0;
+                for (int q = 0; q + 1 < vp_n; ++q) { float a = 0;
+                    cudaEventElapsedTime(&a, vpA[q], vpR[q]); s_res += a;
+                    cudaEventElapsedTime(&a, vpR[q], vpS[q]); s_rms += a;
+                    cudaEventElapsedTime(&a, vpS[q], vpP[q]); s_mm += a;
+                    cudaEventElapsedTime(&a, vpP[q], vpK[q]); s_prep += a;
+                    cudaEventElapsedTime(&a, vpK[q], vpF[q]); s_attn += a;
+                    cudaEventElapsedTime(&a, vpF[q], vpB[q]); s_wo += a; }
+                ++sv_n3;
+                if (sv_n3 % 8 == 0) std::printf("vprof3: res %.1f rms %.1f mm %.1f prep %.1f attn %.1f wo %.1f ms/step (n=%d)\n",
+                                                s_res / sv_n3, s_rms / sv_n3, s_mm / sv_n3, s_prep / sv_n3, s_attn / sv_n3, s_wo / sv_n3, sv_n3);
+            }
             for (int j = 0; j < n && (int) out.size() < gen; ++j) out.push_back(dr[j]);
             if ((int) out.size() < gen) out.push_back(g[n]);
             anchor = g[n];
@@ -4975,9 +6476,25 @@ int run(int argc, char** argv) {
     if (g_pool)
         std::printf("CPU lane: %d threads, %llu experts computed on the CPU (%.2f ms each at the end), %llu waited for\n",
                     g_pool->size(), (unsigned long long) g_n_cpu, g_t_cpu * 1e3, (unsigned long long) g_n_wait);
-    if (g_prof)
+    if (g_prof) {
         std::printf("profile (all calls): attention %.2f s, router %.2f s, uploads %.2f s, experts %.2f s, rest %.2f s\n",
                     g_pf.attn, g_pf.route, g_pf.upload, g_pf.experts, g_pf.rest);
+        std::printf("prefill-moe detail: host %.2f s, gpu %.2f s (sync %.2f s), calls %d\n", g_pf.pf_host, g_pf.pf_gpu,
+                    g_pf.pf_sync, g_pf.pf_calls);
+        std::printf("MoE branch counts: resident-grouped %ld, token %ld, run_prefill_moe %ld\n", g_pf.br_rg, g_pf.br_mv,
+                    g_pf.br_pf);
+        std::printf("PREFILL profile: attention %.2f s, router %.2f s, uploads %.2f s, experts %.2f s, rest %.2f s\n",
+                    pf_prefill.attn, pf_prefill.route, pf_prefill.upload, pf_prefill.experts, pf_prefill.rest);
+        std::printf("PREFILL moe detail: host %.2f s, gpu %.2f s (sync %.2f s), calls %d; branches rg %ld mv %ld pf %ld\n",
+                    pf_prefill.pf_host, pf_prefill.pf_gpu, pf_prefill.pf_sync, pf_prefill.pf_calls, pf_prefill.br_rg,
+                    pf_prefill.br_mv, pf_prefill.br_pf);
+        std::printf("PREFILL run_exp (cnt>=128 experts): gather %.3f s, decode_f16 %.3f s, gemm16 %.3f s, scatter %.3f s\n",
+                    pf_prefill.pf_gather, pf_prefill.pf_dec, pf_prefill.pf_gemm, pf_prefill.pf_scatter);
+        std::printf("PREFILL attn sub: proj %.3f s, conv/prep %.3f s, QK %.3f s, probs %.3f s, PV %.3f s, out %.3f s\n",
+                    pf_prefill.a_proj, pf_prefill.a_conv, pf_prefill.a_qk, pf_prefill.a_probs, pf_prefill.a_pv,
+                    pf_prefill.a_out);
+        std::printf("PREFILL loop_gates (FP32 cuBLAS): %.3f s\n", pf_prefill.pf_loopgate);
+    }
     if (out.size() > 1)
         std::printf("generation: %d tokens in %.2f s (%.2f tok/s); cache %llu hits, %llu misses in it\n",
                     (int) out.size() - 1, gen_s, (out.size() - 1) / gen_s, (unsigned long long) (ec_sum([](ExpertCache& e) { return e.hits; }) - h0),
@@ -4985,6 +6502,7 @@ int run(int argc, char** argv) {
     std::printf("generated:");
     for (int t : out) std::printf(" %d", t);
     std::printf("\n");
+    pf_fast::report();
     std::fflush(stdout);
     if (g_trace) std::fclose(g_trace);
     pop_dump();

@@ -151,6 +151,80 @@ __global__ void gemm_wmma_16x16_1w(
 }
 
 // ===========================================================================
+// Variant 1b: 16x16_1w_ld - single-wave kernel with explicit row strides ldx (X)
+// and ldw (W), so a strided sub-view (e.g. one KV head's K rows at stride KD) feeds
+// WMMA without a copy. Same fragment layout as 16x16_1w (lane_lo = row/col).
+// ===========================================================================
+template <typename ElemT>
+__global__ void gemm_wmma_16x16_1w_ld(
+    const uint16_t* __restrict__ X,
+    const uint16_t* __restrict__ W,
+    float* __restrict__ Y,
+    int64_t T, int64_t N, int64_t K, int64_t ldx, int64_t ldw, int64_t ldy, float beta) {
+
+    using vec_t = typename WmmaTraits<ElemT>::vec_t;
+    const int m_tile = blockIdx.y * 16;
+    const int n_tile = blockIdx.x * 16;
+    if (m_tile >= T || n_tile >= N) return;
+
+    const int lane = threadIdx.x;
+    const int lane_lo = lane & 15;
+    const int lane_hi = lane >> 4;
+
+    v8fp32 c_acc = {0, 0, 0, 0, 0, 0, 0, 0};
+    const int m_row = m_tile + lane_lo;
+    const int n_row = n_tile + lane_lo;
+
+    for (int k_tile = 0; k_tile < K; k_tile += 16) {
+        vec_t a_frag, b_frag;
+        if (m_row < T) {
+            __builtin_memcpy(&a_frag, X + (int64_t)m_row * ldx + k_tile, sizeof(a_frag));
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) a_frag[i] = 0;
+        }
+        if (n_row < N) {
+            __builtin_memcpy(&b_frag, W + (int64_t)n_row * ldw + k_tile, sizeof(b_frag));
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) b_frag[i] = 0;
+        }
+        c_acc = WmmaTraits<ElemT>::mma(a_frag, b_frag, c_acc);
+    }
+
+    const int out_n = n_tile + lane_lo;
+    if (out_n < N) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int out_m = m_tile + 2 * i + lane_hi;
+            if (out_m < T) {
+                float* dst = Y + (int64_t)out_m * ldy + out_n;
+                if (beta == 0.0f) {
+                    *dst = c_acc[i];
+                } else {
+                    *dst = beta * (*dst) + c_acc[i];
+                }
+            }
+        }
+    }
+}
+
+bool strata_wmma_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y,
+                             int64_t T, int64_t N, int64_t K, int64_t ldy, float beta, void* stream) {
+    if (!X || !W || !Y || T <= 0 || N <= 0 || K <= 0) return false;
+    if (!strata_wmma_gfx11_device()) return false;
+    if (K % 16 != 0 || (beta != 0.0f && beta != 1.0f)) return false;
+    if (ldx < K || ldw < K) return false;
+    if (ldy <= 0) ldy = N;
+    if (ldy < N) return false;
+    hipStream_t s = static_cast<hipStream_t>(stream);
+    dim3 block(32);
+    dim3 grid((uint32_t)((N + 15) / 16), (uint32_t)((T + 15) / 16), 1);
+    gemm_wmma_16x16_1w_ld<_Float16><<<grid, block, 0, s>>>(X, W, Y, T, N, K, ldx, ldw, ldy, beta);
+    return true;
+}
+
+// ===========================================================================
 // Variant 2: 64x64_4w - 4 waves per block (128 threads), 64T x 64N tile.
 // Double-buffered LDS tile for W (4 KB LDS total), cooperative 128-bit global loads.
 // ===========================================================================
@@ -280,7 +354,9 @@ static inline bool strata_wmma_gemm_dispatch(const uint16_t* X, const uint16_t* 
 
     hipStream_t s = static_cast<hipStream_t>(stream);
 
-    if (T >= 32 && N >= 32) {
+    // IK2_WMMA_TILE=1 forces the single-wave 16x16 kernel for every shape (debug: isolate the 64x64 double-buffer).
+    static const int force_small = getenv("IK2_WMMA_TILE") ? std::atoi(getenv("IK2_WMMA_TILE")) : 0;
+    if (!force_small && T >= 32 && N >= 32) {
         dim3 block(128);
         dim3 grid((uint32_t)((N + 63) / 64), (uint32_t)((T + 63) / 64), 1);
         gemm_wmma_64x64_4w<ElemT><<<grid, block, 0, s>>>(X, W, Y, T, N, K, ldy, beta);

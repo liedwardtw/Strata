@@ -38,17 +38,27 @@ int taps(const Drafter* d);
 
 /// Loads mtp.safetensors (path) onto the current device; ctx: positions the context caches hold.  C: the target's
 /// width (2304 for Mini, 4608 for Small).  Throws (std::runtime_error) on a file it does not understand.
+/// IK2_DRAFT_KV_FP8 (default OFF): the context K/V caches in FP8 E4M3 (1 byte) instead of F32 -- 4x less
+/// cache VRAM and 4x less draft_attn context traffic; NOT bit-exact (e4m3 quantization, near-tie drift).
 Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cudaStream_t s);
 /// The Markov head's bias folded through the target's output head (FP16 [n_rows][C], on the device).
 void fold(Drafter* d, const uint16_t* lm_f16, int n_rows);
+/// IK2_DRAFT_HEAD_INT4 (default OFF): propose()'s base logits over the target head's INT4 sidecar
+/// (the IK2_INT4_HEAD Wp/Wh/WS bins, device pointers the engine owns) instead of the FP16 head copy.
+/// Call after fold(). False = not armed (sidecar missing / shape unsupported / no int4 kernels):
+/// propose() keeps its FP16 gemm_h path, byte-identical to before.
+bool set_head_int4(Drafter* d, const uint8_t* Wp, const uint8_t* Wh, const float* WS, int n_rows);
 /// The context caches for positions pos0 .. pos0 + m - 1 from tap rows r0 .. r0 + m - 1 (taps [8][ld][C] F32).
 void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos0);
 /// f_rnn from tap row `row`.
 void set_f_rnn(Drafter* d, const float* taps, int ld, int row);
 /// Drafts 7 tokens (out, host) after the anchor at position P; anchor_h: its embedding, normed (device [C] F32).
 /// lm_f16: the target's output head; n_vocab: the real rows (the argmax's range).
+/// n_draft (default kBlock-1=7): how many tokens to draft (<= kBlock-1). The drafter always computes the full
+/// kBlock-1 Markov steps; n_draft only truncates the host copy, so a smaller verify window keeps the same draft
+/// cost but verifies fewer tokens (used by IK2_SPEC_N to trade accept-per-step against verify cost).
 void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows, int n_vocab,
-             int* out);
+             int* out, int n_draft = kBlock - 1);
 /// VRAM it holds, bytes.
 size_t bytes(const Drafter* d);
 

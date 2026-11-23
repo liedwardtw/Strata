@@ -5,6 +5,16 @@
 #if defined(__HIPCC__)
 #include <hip/hip_version.h>
 
+// Pull HIP's own half/bfloat16/fp8 headers in BEFORE the __shfl*_sync macros
+// below. Those headers define __shfl_down_sync/__shfl_sync/... overloads for
+// __hip_bfloat16 and __half; if the function-like macros were active first they
+// would rewrite those definitions into out-of-line strata::hip_compat members
+// and fail to compile. Including them here sets their include guards, so later
+// includes (cuda_fp16.h / cuda_fp8.h shims) are no-ops and never re-parse them.
+#include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
+#include <hip/hip_fp8.h>
+
 #include <cstdint>
 
 namespace strata::hip_compat {

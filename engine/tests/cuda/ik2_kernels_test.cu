@@ -15,6 +15,7 @@
 //     real model's seams cover them.)
 #include "../../src/ik2/ik2_iq_tables.h"
 #include "../../src/ik2/ik2_kernels.cuh"
+#include "../../src/prefill/wmma_gemm.h"
 
 #include <cuda_fp16.h>
 
@@ -23,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <random>
 #include <vector>
 
@@ -1367,6 +1369,11 @@ float e4m3fn_to_f32_host(uint8_t q);
 // first token, a context shorter than a step, splits with and without keys; the FP8 cache with every finite byte
 // (the subnormals among them).
 void test_attn_decode_mma() {
+#if defined(__HIPCC__)
+    // CUDA tensor-core decode attention (mma.sync/ldmatrix PTX); HIP scalar path uses attn_decode.
+    std::printf("skip attn_decode_mma (CUDA tensor-core; HIP scalar path uses attn_decode)\n");
+    return;
+#else
     const int D = 128, d_rel = 16;
     struct Case {
         int H, KV, qpos, window, extent, kv_cap, n_split;
@@ -1477,11 +1484,19 @@ void test_attn_decode_mma() {
             cudaFree(dq), cudaFree(dpos), cudaFree(dout16);
             for (float* p : {dr, dp, ds, dout, dscr, dg}) cudaFree(p);
         }
+#endif  // __HIPCC__
 }
 
 // attn_flash_f16 (the fused prefill attention) against a double reference: linear and ring caches, a window, the
 // relative bias table, the sink, a chunk from 0 and one at an offset, 1 to 7 key splits (some of them empty).
 void test_attn_flash() {
+#if defined(__HIPCC__) && !defined(STRATA_WMMA_GFX11)
+    // attn_flash_f16 is the CUDA tensor-core prefill kernel (mma.sync/ldmatrix/cp.async PTX).
+    // On HIP without the WMMA port those helpers are trap stubs and the engine runs scalar
+    // prefill (IK2_FLASH=0), so this parity test does not apply.
+    std::printf("skip attn_flash (CUDA tensor-core prefill; HIP scalar path uses attn_probs)\n");
+    return;
+#else
     const int H = 12, KV = 2, D = 128;
     struct Case {
         int Tq, qpos0, window, extent, kv_cap, n_split;
@@ -1517,8 +1532,13 @@ void test_attn_flash() {
         float *db = dev(bias), *ds = dev(sink), *dout = dev_n<float>((size_t) c.Tq * o_ld);
         const size_t scr = (size_t) 8 * c.Tq * H * (D + 2);
         float* dscr = dev_n<float>(scr);
+#if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
+        k::attn_flash_wmma_f16(dq, q_ld, dk, dv, c.kv_cap, H, KV, D, c.Tq, c.qpos0, scale, db, c.extent, c.window, ds,
+                               dout, o_ld, dscr, scr, c.n_split, 0);
+#else
         k::attn_flash_f16(dq, q_ld, dk, dv, c.kv_cap, H, KV, D, c.Tq, c.qpos0, scale, db, c.extent, c.window, ds, dout,
                           o_ld, dscr, scr, c.n_split, 0);
+#endif
         const auto out = host(dout, (size_t) c.Tq * o_ld);
         std::vector<float> got;
         std::vector<double> want;
@@ -1553,6 +1573,7 @@ void test_attn_flash() {
         for (uint16_t* p : {dq, dk, dv}) cudaFree(p);
         for (float* p : {db, ds, dout, dscr}) cudaFree(p);
     }
+#endif  // __HIPCC__
 }
 
 void test_round2_fused() {
@@ -2514,6 +2535,11 @@ void test_round6() {
 // One token's NVFP4 experts through the tensor cores against the scalar kernels over the same blocks (every scale
 // byte, the subnormal ones and 0x7F with them): gate | up with the input as two FP16 limbs, down over the FP16 h.
 void test_experts_mma() {
+#if defined(__HIPCC__)
+    // CUDA tensor-core NVFP4 expert GEMM (mma.sync PTX); HIP scalar experts already parity-tested in test_round6.
+    std::printf("skip experts_mma (CUDA tensor-core; HIP scalar experts covered by test_round6)\n");
+    return;
+#else
     constexpr int C = 256, F = 128, S = 5;
     const int ty = k::kNVFP4;
     const size_t matrix_bytes = (size_t) C * F / k::block_values(ty) * k::block_bytes(ty);
@@ -2544,7 +2570,314 @@ void test_experts_mma() {
     const auto want = host(y_ref, S * C);
     expect("experts_down_mma", host(y_got, S * C), std::vector<double>(want.begin(), want.end()), 2e-5, 0.25);   // (random scales reach 240: sums of terms of 1e4 and more that cancel)
     expect_true("experts_mma_fits", k::experts_mma_fits(ty, ty, ty, 2304, 1152) && !k::experts_mma_fits(ty, k::kQ8_0, ty, 2304, 1152));
+#endif  // __HIPCC__
 }
+
+// INT4/INT8 WMMA path: repack a known Q4_0 weight on the host (mirrors k_repack), rotate+quant the
+// activation on the host, and check the GEMM / matvec against the dequantized-weight dot product.
+#if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
+namespace {
+int i4_P(int s) { return (s < 8) ? ((s & 1) ? 4 + (s >> 1) : (s >> 1)) : 8 + (((s - 8) & 1) ? 4 + ((s - 8) >> 1) : ((s - 8) >> 1)); }
+float i4_sign(int j) { return (((uint32_t) j * 2654435761u) >> 31) ? -1.0f : 1.0f; }
+// host H256 rotation of a 256-vector: y = (H/16 D) x, H[r][c] = (-1)^popcount(r&c)
+void i4_rot256(const float* x, float* y) {
+    for (int r = 0; r < 256; r++) {
+        double acc = 0;
+        for (int c = 0; c < 256; c++) {
+            const int pc = __builtin_popcount((unsigned) (r & c));
+            const float h = (pc & 1) ? -1.0f : 1.0f;
+            acc += (double) h * i4_sign(c) * x[c];
+        }
+        y[r] = (float) (acc / 16.0);
+    }
+}
+}  // namespace
+void test_int4() {
+    const int M = 64, K = 256, N = 8, sh = k::kInt4Sh8, gw = 4;
+    const int nb = K / 32, nsb = K / 256;
+    // random symmetric int4 weights, one fp16 scale per 32*gw group, stored as Q4_0
+    std::vector<float> d_f(M * nb);
+    std::vector<int> codes(M * K);
+    std::vector<uint8_t> q40(M * nb * 18, 0);
+    for (int m = 0; m < M; m++) {
+        for (int g = 0; g < nb; g++) {
+            float scale = (g % gw == 0) ? std::fabs(frand(0.05f)) + 0.001f : d_f[m * nb + (g / gw) * gw];
+            d_f[m * nb + g] = scale;
+            uint16_t dh = f2h_host(scale);
+            q40[(m * nb + g) * 18 + 0] = dh & 0xFF; q40[(m * nb + g) * 18 + 1] = dh >> 8;
+            for (int j = 0; j < 32; j++) {
+                int q = (int) std::lround(frand(7.0f));
+                q = std::max(-7, std::min(7, q));
+                codes[m * K + g * 32 + j] = q;
+                int nib = q + 8;
+                uint8_t& byte = q40[(m * nb + g) * 18 + 2 + (j % 16)];
+                if (j < 16) byte = (byte & 0xF0) | nib; else byte = (byte & 0x0F) | (nib << 4);
+            }
+        }
+    }
+    // row scale WS = max|d| * (1<<sh)/15
+    std::vector<float> WS(M);
+    for (int m = 0; m < M; m++) {
+        float mx = 0; for (int g = 0; g < nb; g++) mx = std::max(mx, std::fabs(d_f[m * nb + g]));
+        WS[m] = mx * ((float) (1 << sh) / 15.f);
+    }
+    // repack (mirror k_repack)
+    std::vector<uint8_t> Wp((size_t) M * K / 2, 0), Wh((size_t) (M / 16) * nsb * 16 * 4, 0);
+    for (int m = 0; m < M; m++) {
+        int ft = m >> 4, r = m & 15;
+        for (int sb = 0; sb < nsb; sb++)
+            for (int g = 0; g < 8; g++) {
+                uint32_t w[4] = {0, 0, 0, 0};
+                for (int sl = 0; sl < 2; sl++)
+                    for (int dw = 0; dw < 2; dw++) {
+                        uint32_t word = 0;
+                        for (int s2 = 0; s2 < 8; s2++) {
+                            int e = 16 * sl + i4_P(dw * 8 + s2);
+                            int q = codes[m * K + (sb * 8 + g) * 32 + e];
+                            word |= (uint32_t) (q & 15) << (4 * s2);
+                        }
+                        w[sl * 2 + dw] = word;
+                    }
+                size_t off = ((size_t) ((ft * nsb + sb) * 8 + g)) * 256 + r * 16;
+                std::memcpy(Wp.data() + off, w, 16);
+                if ((g & 1) == 0) {
+                    float s = WS[m] > 0 ? WS[m] : 1.f;
+                    int q0 = std::min(15, std::max(0, (int) std::lround(std::fabs(d_f[m * nb + sb * 8 + g]) / s * (1 << sh))));
+                    int q1 = std::min(15, std::max(0, (int) std::lround(std::fabs(d_f[m * nb + sb * 8 + g + 1]) / s * (1 << sh))));
+                    Wh[((size_t) ((ft * nsb + sb) * 16 + r)) * 4 + g / 2] = (uint8_t) (q0 | (q1 << 4));
+                }
+            }
+    }
+    // dequantized weight (rotated space): W'[m][k] = code * d[group]
+    std::vector<double> Wdeq((size_t) M * K);
+    for (int m = 0; m < M; m++)
+        for (int k = 0; k < K; k++) Wdeq[(size_t) m * K + k] = (double) codes[(size_t) m * K + k] * d_f[m * nb + k / 32];
+    // activation X [N][K], rotate per 256-block
+    auto X = fvec((size_t) N * K, 2.0f);
+    std::vector<float> Xrot((size_t) N * K);
+    for (int n = 0; n < N; n++) i4_rot256(X.data() + (size_t) n * K, Xrot.data() + (size_t) n * K);
+    // reference: out[n][m] = sum_k Xrot[n][k] * Wdeq[m][k]
+    std::vector<double> want((size_t) N * M);
+    for (int n = 0; n < N; n++)
+        for (int m = 0; m < M; m++) {
+            double acc = 0;
+            for (int k = 0; k < K; k++) acc += (double) Xrot[(size_t) n * K + k] * Wdeq[(size_t) m * K + k];
+            want[(size_t) n * M + m] = acc;
+        }
+    float *dX = dev(X), *dWS = dev(WS), *dout = dev_n<float>((size_t) N * M);
+    uint8_t *dWp = dev(Wp), *dWh = dev(Wh);
+    const int Npad = ((N + 255) / 256) * 256;
+    const size_t plane = (size_t) Npad * K / 2;
+    uint8_t* dx4 = dev_n<uint8_t>(2 * plane); uint8_t* dxm = dev_n<uint8_t>((size_t) (Npad / 16) * nsb * 16);
+    float* dxr = dev_n<float>((size_t) Npad);
+    k::int4_rot_pack8(dX, N, K, dx4, dxm, dxr, 0);
+    CU(cudaDeviceSynchronize());
+    k::int4_gemm8(dWp, dWh, dWS, M, K, dx4, dxm, dxr, N, gw, 8, dout, nullptr, sh, 0);
+    CU(cudaDeviceSynchronize());
+    expect("int4_gemm8 (8-bit act)", host(dout, (size_t) N * M), want, 3e-2, 0.5);
+    // matvec path (decode-only N<=8; fresh output buffer; sync between launches)
+    int8_t* dxq = dev_n<int8_t>((size_t) N * K); float2* dxd = dev_n<float2>((size_t) N * nb);
+    k::int4_rot_q8x(dX, N, K, dxq, dxd, 0);
+    CU(cudaDeviceSynchronize());
+    float* dmv = dev_n<float>((size_t) N * M);
+    k::int4_matvec(dWp, dWh, dWS, M, K, dxq, dxd, N, dmv, M, nullptr, 1.f / (1 << sh), 0);
+    CU(cudaDeviceSynchronize());
+    expect("int4_matvec (8-bit act)", host(dmv, (size_t) N * M), want, 3e-2, 0.5);
+    cudaFree(dX); cudaFree(dWS); cudaFree(dout); cudaFree(dWp); cudaFree(dWh);
+    cudaFree(dx4); cudaFree(dxm); cudaFree(dxr); cudaFree(dxq); cudaFree(dxd); cudaFree(dmv);
+}
+// Definitive converter<->device check: load the ACTUAL converted L0 expert-0 weights
+// (from tools/nvfp4_to_int4.py) plus a Python reference out = X @ dequant(W).T, run the
+// device int4_rot_pack8 + int4_gemm8, and compare. Rotation is orthogonal so it cancels.
+void test_int4_real() {
+    const char* bin = std::getenv("IK2_INT4_DIR");
+    if (!bin) { std::printf("skip int4_real (no IK2_INT4_DIR)\n"); return; }
+    const int M = 2304, K = 2304, N = 64, sh = k::kInt4Sh8, gw = 4;
+    const std::string dir = bin;
+    auto rd = [&](const std::string& fn, void* dst, size_t bytes) -> bool {
+        std::ifstream f(dir + "/" + fn, std::ios::binary);
+        if (!f) { std::printf("int4_real: cannot open %s\n", fn.c_str()); return false; }
+        f.read((char*) dst, bytes);
+        return (size_t) f.gcount() == bytes;
+    };
+    const size_t wp_sz = (size_t) M * K / 2, wh_sz = (size_t) (M/16) * (K/256) * 64;
+    std::vector<uint8_t> Wp(wp_sz), Wh(wh_sz);
+    std::vector<float> WS(M), X((size_t) N * K), ref((size_t) N * M);
+    if (!rd("L00_gate_up_Wp.bin", Wp.data(), wp_sz) || !rd("L00_gate_up_Wh.bin", Wh.data(), wh_sz)
+        || !rd("L00_gate_up_WS.bin", WS.data(), M*4)) { ++g_fail; return; }
+    const char* refdir = std::getenv("IK2_INT4_REF");
+    const std::string rd_ = refdir ? refdir : "int4-ref";
+    { std::ifstream f(rd_ + "/gate_up_X.bin", std::ios::binary); f.read((char*)X.data(), X.size()*4); if ((size_t)f.gcount()!=X.size()*4){++g_fail;return;} }
+    { std::ifstream f(rd_ + "/gate_up_ref.bin", std::ios::binary); f.read((char*)ref.data(), ref.size()*4); if ((size_t)f.gcount()!=ref.size()*4){++g_fail;return;} }
+    uint8_t *dWp = dev(Wp), *dWh = dev(Wh); float* dWS = dev(WS), *dX = dev(X);
+    const int Npad = ((N + 255)/256)*256; const size_t plane = (size_t) Npad * K / 2;
+    uint8_t* dx4 = dev_n<uint8_t>(2*plane); uint8_t* dxm = dev_n<uint8_t>((size_t)(Npad/16)*(K/256)*16);
+    float* dxr = dev_n<float>(Npad); float* dout = dev_n<float>((size_t) N * M);
+    k::int4_rot_pack8(dX, N, K, dx4, dxm, dxr, 0);
+    k::int4_gemm8(dWp, dWh, dWS, M, K, dx4, dxm, dxr, N, gw, 8, dout, nullptr, sh, 0);
+    std::vector<double> want(ref.begin(), ref.end());
+    expect("int4_real gate_up (converter->device)", host(dout, (size_t) N * M), want, 5e-2, 0.25);
+    // Small-N cases (short prompt): reuse the first n rows of the N=64 reference.
+    // Reproduces the tiny-cnt_e path where rot_pack8 writes n rows but gemm pads to Npad=256.
+    for (int nsmall : {1, 2, 4, 8, 16}) {
+        std::vector<float> Xs((size_t) nsmall * K), refs((size_t) nsmall * M);
+        std::copy(X.begin(), X.begin() + Xs.size(), Xs.begin());
+        std::copy(ref.begin(), ref.begin() + refs.size(), refs.begin());
+        float* dXs = dev(Xs); float* douts = dev_n<float>((size_t) nsmall * M);
+        uint8_t* dx4s = dev_n<uint8_t>(2 * plane); uint8_t* dxms = dev_n<uint8_t>((size_t)(Npad/16)*(K/256)*16);
+        float* dxrs = dev_n<float>(Npad);
+        k::int4_rot_pack8(dXs, nsmall, K, dx4s, dxms, dxrs, 0);
+        k::int4_gemm8(dWp, dWh, dWS, M, K, dx4s, dxms, dxrs, nsmall, gw, 8, douts, nullptr, sh, 0);
+        std::vector<double> wants(refs.begin(), refs.end());
+        char nm[64]; std::snprintf(nm, sizeof(nm), "int4_real gate_up N=%d", nsmall);
+        expect(nm, host(douts, refs.size()), wants, 5e-2, 0.25);
+        // Same case with POISONED scratch (mimics engine dalloc reuse): if this fails, stale tail is the bug.
+        cudaMemset(dx4s, 0xA5, 2 * plane); cudaMemset(dxms, 0x5A, (size_t)(Npad/16)*(K/256)*16);
+        for (size_t z = 0; z < Npad; ++z) { float nan = NAN; cudaMemcpy(dxrs + z, &nan, 4, cudaMemcpyHostToDevice); }
+        k::int4_rot_pack8(dXs, nsmall, K, dx4s, dxms, dxrs, 0);
+        k::int4_gemm8(dWp, dWh, dWS, M, K, dx4s, dxms, dxrs, nsmall, gw, 8, douts, nullptr, sh, 0);
+        char nm2[64]; std::snprintf(nm2, sizeof(nm2), "int4_real gate_up N=%d poisoned", nsmall);
+        expect(nm2, host(douts, refs.size()), wants, 5e-2, 0.25);
+        cudaFree(dXs); cudaFree(douts); cudaFree(dx4s); cudaFree(dxms); cudaFree(dxrs);
+    }
+    cudaFree(dWp); cudaFree(dWh); cudaFree(dWS); cudaFree(dX); cudaFree(dx4); cudaFree(dxm); cudaFree(dxr); cudaFree(dout);
+
+    // down projection: real converted weights, Kpad=1280 (zero-padded from F=1152)
+    const int Md = 2304, Kd = 1280;
+    const size_t wpd = (size_t) Md * Kd / 2, whd = (size_t) (Md/16) * (Kd/256) * 64;
+    std::vector<uint8_t> Wpd(wpd), Whd(whd); std::vector<float> WSd(Md), Xd((size_t) N * Kd), refd((size_t) N * Md);
+    if (!rd("L00_down_Wp.bin", Wpd.data(), wpd) || !rd("L00_down_Wh.bin", Whd.data(), whd)
+        || !rd("L00_down_WS.bin", WSd.data(), Md*4)) { ++g_fail; return; }
+    { std::ifstream f(rd_ + "/down_X.bin", std::ios::binary); f.read((char*)Xd.data(), Xd.size()*4); if ((size_t)f.gcount()!=Xd.size()*4){++g_fail;return;} }
+    { std::ifstream f(rd_ + "/down_ref.bin", std::ios::binary); f.read((char*)refd.data(), refd.size()*4); if ((size_t)f.gcount()!=refd.size()*4){++g_fail;return;} }
+    uint8_t *dWpd = dev(Wpd), *dWhd = dev(Whd); float* dWSd = dev(WSd), *dXd = dev(Xd);
+    const size_t planed = (size_t) Npad * Kd / 2;
+    uint8_t* dx4d = dev_n<uint8_t>(2*planed); uint8_t* dxmd = dev_n<uint8_t>((size_t)(Npad/16)*(Kd/256)*16);
+    float* dxrd = dev_n<float>(Npad); float* doutd = dev_n<float>((size_t) N * Md);
+    k::int4_rot_pack8(dXd, N, Kd, dx4d, dxmd, dxrd, 0);
+    k::int4_gemm8(dWpd, dWhd, dWSd, Md, Kd, dx4d, dxmd, dxrd, N, gw, 8, doutd, nullptr, sh, 0);
+    std::vector<double> wantd(refd.begin(), refd.end());
+    expect("int4_real down (converter->device)", host(doutd, (size_t) N * Md), wantd, 5e-2, 0.25);
+    cudaFree(dWpd); cudaFree(dWhd); cudaFree(dWSd); cudaFree(dXd); cudaFree(dx4d); cudaFree(dxmd); cudaFree(dxrd); cudaFree(doutd);
+}
+#else
+void test_int4() { std::printf("skip int4 (no WMMA)\n"); }
+void test_int4_real() { std::printf("skip int4_real (no WMMA)\n"); }
+#endif
+
+#if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
+// Microbenchmark: INT4 rotated-int4 GEMM vs the FP16 WMMA GEMM at expert shapes.
+// Reports wall ms for a fixed iter count so the two paths can be compared directly.
+void bench_int4() {
+    if (!std::getenv("IK2_INT4_BENCH")) return;
+    auto bench = [](const char* name, int iters, auto&& fn) {
+        for (int i = 0; i < 5; ++i) fn();
+        CU(cudaDeviceSynchronize());
+        cudaEvent_t a, b; CU(cudaEventCreate(&a)); CU(cudaEventCreate(&b));
+        CU(cudaEventRecord(a, 0));
+        for (int i = 0; i < iters; ++i) fn();
+        CU(cudaEventRecord(b, 0)); CU(cudaEventSynchronize(b));
+        float ms = 0; CU(cudaEventElapsedTime(&ms, a, b));
+        std::printf("BENCH %-28s %8.3f ms / %d iters = %7.1f us/call\n", name, ms, iters, ms * 1000.f / iters);
+        cudaEventDestroy(a); cudaEventDestroy(b);
+    };
+    const int M = 2304, K = 2304, sh = k::kInt4Sh8, gw = 4;
+    const int nb = K / 32, nsb = K / 256;
+    // Build repacked INT4 weights once (M x K), from random symmetric codes.
+    std::vector<int> codes((size_t) M * K);
+    std::vector<float> df((size_t) M * nb);
+    for (int m = 0; m < M; ++m) {
+        float mx = 0;
+        for (int kk = 0; kk < K; ++kk) { codes[(size_t) m * K + kk] = (int)(rng() % 15) - 7; mx = std::max(mx, (float)std::abs(codes[(size_t) m * K + kk])); }
+        float d = mx / 7.f; for (int b2 = 0; b2 < nb; ++b2) df[(size_t) m * nb + b2] = d;
+    }
+    std::vector<float> WS(M);
+    for (int m = 0; m < M; ++m) { float mx = 0; for (int b2 = 0; b2 < nb; ++b2) mx = std::max(mx, std::fabs(df[(size_t) m * nb + b2])); WS[m] = mx * ((1 << sh) / 15.f); }
+    std::vector<uint8_t> Wp((size_t) M * K / 2, 0), Wh((size_t) (M / 16) * nsb * 16 * 4, 0);
+    for (int m = 0; m < M; ++m) {
+        int ft = m >> 4, r = m & 15;
+        for (int sb = 0; sb < nsb; ++sb) for (int g = 0; g < 8; ++g) {
+            uint32_t w[4] = {0, 0, 0, 0};
+            for (int sl = 0; sl < 2; ++sl) for (int dw = 0; dw < 2; ++dw) {
+                uint32_t word = 0;
+                for (int s2 = 0; s2 < 8; ++s2) { int e = 16*sl + i4_P(dw*8 + s2); word |= (uint32_t)(codes[(size_t) m*K + (sb*8+g)*32 + e] & 15) << (4*s2); }
+                w[sl*2+dw] = word;
+            }
+            size_t off = (size_t)((ft*nsb+sb)*8 + g)*256 + r*16;
+            std::memcpy(Wp.data() + off, w, 16);
+            if ((g & 1) == 0) {
+                float s = WS[m] > 0 ? WS[m] : 1.f;
+                int q0 = std::min(15, std::max(0, (int)std::lround(std::fabs(df[(size_t) m*nb + sb*8+g])/s*(1<<sh))));
+                int q1 = std::min(15, std::max(0, (int)std::lround(std::fabs(df[(size_t) m*nb + sb*8+g+1])/s*(1<<sh))));
+                Wh[(size_t)((ft*nsb+sb)*16 + r)*4 + g/2] = (uint8_t)(q0 | (q1<<4));
+            }
+        }
+    }
+    uint8_t *dWp = dev(Wp), *dWh = dev(Wh); float* dWS = dev(WS);
+    for (int N : {64, 256, 512}) {
+        std::printf("BENCH --- expert gate_up M=%d K=%d N=%d ---\n", M, K, N);
+        std::vector<uint16_t> hW((size_t) M * K), hX((size_t) N * K);
+        for (auto& v : hW) v = f2h_host(frand(0.05f));
+        for (auto& v : hX) v = f2h_host(frand(2.0f));
+        uint16_t *dW = dev(hW), *dX = dev(hX);
+        float* dY = dev_n<float>((size_t) N * M);
+        bench("fp16_wmma_gemm", 50, [&]() { strata_pf_gemm_f16(dX, dW, dY, N, M, K, M, 0.f, nullptr); });
+        const int Npad = ((N + 255) / 256) * 256; size_t plane = (size_t) Npad * K / 2;
+        uint8_t *dx4 = dev_n<uint8_t>(2 * plane), *dxm = dev_n<uint8_t>((size_t) (Npad / 16) * nsb * 16);
+        float* dxr = dev_n<float>(Npad);
+        std::vector<float> hXf((size_t) N * K);
+        for (size_t i = 0; i < hXf.size(); ++i) hXf[i] = __half2float(hX[i]);
+        float* dXf = dev(hXf);
+        bench("int4 rot_pack8 + gemm8", 50, [&]() {
+            k::int4_rot_pack8(dXf, N, K, dx4, dxm, dxr, 0);
+            k::int4_gemm8(dWp, dWh, dWS, M, K, dx4, dxm, dxr, N, gw, 8, dY, nullptr, sh, 0);
+        });
+        cudaFree(dW); cudaFree(dX); cudaFree(dY); cudaFree(dx4); cudaFree(dxm); cudaFree(dxr); cudaFree(dXf);
+    }
+    // Decode-shape matvec: INT4 dp4a vs the scalar NVFP4 expert dot (the 26% decode phase).
+    // 8 experts x (gate_up 2304x2304 + down 2304x1152->1280), N=1 activation each.
+    {
+        const int Md = 2304, Kd = 2304;
+        std::vector<float> hXf((size_t) Kd);
+        for (auto& v : hXf) v = frand(1.0f);
+        float* dXf = dev(hXf);
+        int8_t* dXq = dev_n<int8_t>(Kd); float2* dXd = dev_n<float2>(Kd / 32);
+        k::int4_rot_q8x(dXf, 1, Kd, dXq, dXd, 0);
+        float* dY = dev_n<float>(Md);
+        std::printf("BENCH --- decode expert matvec gate_up M=%d K=%d N=1 ---\n", Md, Kd);
+        bench("int4 rot_q8x (1 tok)", 200, [&]() { k::int4_rot_q8x(dXf, 1, Kd, dXq, dXd, 0); });
+        bench("int4 matvec N=1", 200, [&]() { k::int4_matvec(dWp, dWh, dWS, Md, Kd, dXq, dXd, 1, dY, Md, nullptr, 1.f / ((1<<sh)*16), 0); });
+        bench("int4 rot+matvec N=1", 200, [&]() {
+            k::int4_rot_q8x(dXf, 1, Kd, dXq, dXd, 0);
+            k::int4_matvec(dWp, dWh, dWS, Md, Kd, dXq, dXd, 1, dY, Md, nullptr, 1.f / ((1<<sh)*16), 0);
+        });
+        cudaFree(dXf); cudaFree(dXq); cudaFree(dXd); cudaFree(dY);
+        // Grouped matvec: 8 slots (distinct experts), one shared activation. Compare to 8 serial calls.
+        const int S = 8;
+        std::vector<const uint8_t*> hWp(S), hWh(S); std::vector<const float*> hWS(S);
+        for (int s = 0; s < S; ++s) { hWp[s] = dWp; hWh[s] = dWh; hWS[s] = dWS; }
+        const uint8_t** dWpa = dev(hWp); const uint8_t** dWha = dev(hWh); const float** dWSa = dev(hWS);
+        float* dYg = dev_n<float>((size_t) S * Md);
+        std::printf("BENCH --- grouped decode matvec S=%d M=%d K=%d ---\n", S, Md, Kd);
+        bench("int4_grouped_matvec S=8", 200, [&]() {
+            k::int4_matvec_grouped(dWpa, dWha, dWSa, Md, Kd, dXq, dXd, S, dYg, Md, 1.f / ((1<<sh)*16), 0);
+        });
+        bench("int4 8x serial matvec N=1", 200, [&]() {
+            for (int s = 0; s < S; ++s) k::int4_matvec(dWp, dWh, dWS, Md, Kd, dXq, dXd, 1, dYg + (size_t) s * Md, Md, nullptr, 1.f / ((1<<sh)*16), 0);
+        });
+        // correctness: grouped slot s output == single matvec output (same weights here)
+        CU(cudaMemcpy(dY, dYg, Md * 4, cudaMemcpyDeviceToDevice));
+        k::int4_matvec(dWp, dWh, dWS, Md, Kd, dXq, dXd, 1, dY, Md, nullptr, 1.f / ((1<<sh)*16), 0);
+        std::vector<float> hG(Md), hS(Md);
+        CU(cudaMemcpy(hG.data(), dYg, Md * 4, cudaMemcpyDeviceToHost));
+        CU(cudaMemcpy(hS.data(), dY, Md * 4, cudaMemcpyDeviceToHost));
+        float wg = 0; for (int i = 0; i < Md; ++i) wg = std::max(wg, std::fabs(hG[i] - hS[i]));
+        std::printf("%s grouped matvec slot0 vs single worst %.4g\n", wg < 1e-3f ? "ok  " : "FAIL", wg);
+        cudaFree(dWpa); cudaFree(dWha); cudaFree(dWSa); cudaFree(dYg);
+    }
+    cudaFree(dWp); cudaFree(dWh); cudaFree(dWS);
+}
+#endif
 
 int main() {
     int dev_count = 0;
@@ -2576,6 +2909,11 @@ int main() {
     test_cand_topk();
     test_token_path();
     test_experts_mma();
+    test_int4();
+    test_int4_real();
+#if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
+    bench_int4();
+#endif
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

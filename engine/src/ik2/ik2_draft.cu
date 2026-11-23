@@ -5,6 +5,9 @@
 // src/ik2/ik2_draft.cu - strata-ik2's drafter (the design: ik2_draft.hpp).
 #include "ik2_draft.hpp"
 #include "ik2_kernels.cuh"
+#if defined(STRATA_USE_HIP)
+#include "wmma_gemm.h"   // src/prefill: gfx11 WMMA GEMM (IK2_DRAFT_WMMA opt-in). Included in strata_ik2 only on HIP.
+#endif
 
 #include <cuda_fp16.h>
 #include <fcntl.h>
@@ -140,7 +143,11 @@ struct DLayer {
     bool local = false;
     float *in_norm, *post_norm, *dflare, *q_norm, *k_norm, *k_norm_ctx;
     uint16_t *wq, *wk, *wv, *wo, *wkc, *wvc, *wgu, *wd;   // BF16 [out][in]
-    float *kc, *vc;                                        // the context caches [ctx][KV * 128]
+    float *kc = nullptr, *vc = nullptr;                    // the context caches [cap][KV * 128]
+    uint8_t *kc8 = nullptr, *vc8 = nullptr;                // IK2_DRAFT_KV_FP8: E4M3 caches [cap][KV * 128], 1 byte
+    // IK2_DRAFT_CTX_CAP: local layers use a ring of cap=window+block rows (only the last `window` context
+    // positions are attended), so the cache is cap rows, not ctx. Global layers (local=false) keep cap=ctx.
+    int cap = 0, ring_mask = 0;   // ring_mask = cap-1 (cap is a power of two for local layers)
 };
 
 struct Drafter {
@@ -158,16 +165,56 @@ struct Drafter {
     size_t vram = 0;
     // work
     float *x, *res, *h, *q, *kk, *vv, *o, *gu, *f_rnn, *base, *state, *latent, *proj, *scratch, *mix;
+    // IK2_DRAFT_KV_FP8 (opt-in, default OFF): the context caches are kc8/vc8 in FP8 E4M3 (1 byte)
+    // instead of kc/vc F32 (4 bytes). write_context stages K in kk (max(T, kMixRows) rows) and V in
+    // ctx_v, rms + rope in F32, then packs. NOT bit-exact (e4m3 quantization); the block's own kk/vv
+    // stay F32.
+    bool kv_fp8 = false;
+    float* ctx_v = nullptr;   // F32 V staging [kMixRows][KV * 128], allocated only when kv_fp8
     uint16_t *hb, *hb2, *rnn_in;
     __half* x16;
     int *pos, *ctx_pos, *toks;
     int* h_out = nullptr;   // pinned host [kBlock - 1]
+    // IK2_DRAFT_HEAD_INT4 (opt-in, default OFF): base logits over the target head's INT4 sidecar
+    // (the IK2_INT4_HEAD bins) instead of the full FP16 head copy. Armed by set_head_int4(); the
+    // sidecar pointers are borrowed (owned by the engine's Mat), the scratch is ours.
+    bool head_int4 = false;
+    const uint8_t* h_i4Wp = nullptr;
+    const uint8_t* h_i4Wh = nullptr;
+    const float* h_i4WS = nullptr;
+    int8_t* h_xq = nullptr;    // [(kBlock - 1)][C] rotated int8 codes
+    float2* h_xd = nullptr;    // [(kBlock - 1)][C / 32] per-32 (d, d*sum) scales
+    // IK2_DRAFT_MARKOV_FUSE: the fused step reads ALL of old state while peers write new state, so
+    // state is double-buffered (state / state2, parity per t). Lazily allocated on first fused use;
+    // the default path never touches it.
+    float* state2 = nullptr;
+    // IK2_DRAFT_CAND (opt-in, default OFF): candidate-restricted Markov argmax. All these buffers are
+    // lazily allocated on the first enabled propose() and reused by every step (the stream serializes
+    // them). The default path never touches them. Only one score-set pair is live at a time.
+    float *cand_part_val = nullptr, *cand_val = nullptr;
+    int *cand_part_id = nullptr, *cand_id = nullptr;
+    int cand_nblocks = 0, cand_n = 0, cand_ld = 0, cand_k = 0;
 };
 
 namespace {
 
 constexpr int kMixRows = 512;
 constexpr int kFoldChunk = 4096;
+
+// IK2_DRAFT_CAND: allocate the four small work buffers on first use / shape change. One step's
+// topk partials and candidate list are enough: the stream serializes screen -> argmax per step.
+void ensure_cand_buffers(Drafter* d, int ld, int n, int K) {
+    const int nb = std::max(1, (n + 1023) / 1024);
+    if (d->cand_id && d->cand_ld == ld && d->cand_n == n && d->cand_k == K) return;
+    cudaFree(d->cand_part_val), cudaFree(d->cand_part_id), cudaFree(d->cand_val), cudaFree(d->cand_id);
+    const size_t nparts = (size_t) nb * k::kDraftCandPerBlk;
+    d->cand_part_val = dalloc<float>(2 * nparts);
+    d->cand_part_id = dalloc<int>(2 * nparts);
+    d->cand_val = dalloc<float>(2 * (size_t) K);
+    d->cand_id = dalloc<int>(2 * (size_t) K);
+    d->cand_nblocks = nb, d->cand_ld = ld, d->cand_n = n, d->cand_k = K;
+    d->vram += 2 * nparts * (sizeof(float) + sizeof(int)) + 2 * (size_t) K * (sizeof(float) + sizeof(int));
+}
 
 __global__ void iota_kernel(int* out, int start, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -211,14 +258,155 @@ float* up32(Drafter* d, const std::vector<uint16_t>& v) {
     return p;
 }
 
+// IK2_DRAFT_WMMA (opt-in, default 0): send the skinny drafter GEMMs to the gfx11 16x16 single-wave WMMA path.
+// The 16x16 path needs T<32 (wmma_gemm.cu:359 selects 64x64_4w at T>=32, which races on gfx1100).
+// Default stays byte-identical: no env => hipBLAS, and a false return from the WMMA gate falls back to hipBLAS.
+static bool draft_wmma_enabled() {
+    static const int v = getenv("IK2_DRAFT_WMMA") ? std::atoi(getenv("IK2_DRAFT_WMMA")) : 0;
+    return v != 0;
+}
+
+// IK2_DRAFT_ATTN_GQA (opt-in, default 0): GQA-shared draft attention. One block per (KV head, query)
+// reads that head's K/V once for its R = H / KV query heads instead of R times (3x less K/V traffic;
+// the win is at long context where draft_attn dominates the draft step). Same per-head math as the
+// original kernel, so outputs stay bit-exact. Default stays byte-identical: no env => draft_attn.
+static bool draft_attn_gqa_enabled() {
+    static const int v = getenv("IK2_DRAFT_ATTN_GQA") ? std::atoi(getenv("IK2_DRAFT_ATTN_GQA")) : 0;
+    return v != 0;
+}
+// IK2_DRAFT_KV_FP8 (opt-in, default 0): the drafter's context K/V caches in FP8 E4M3 (1 byte) instead
+// of F32 (4 bytes): 4x less draft_attn context K/V traffic and 4x less cache VRAM. The attention grid
+// stays (H, nq) -- this lever cuts BYTES, not blocks (the GQA grid reduction above measured slower).
+// NOT bit-exact: e4m3 has 3 mantissa bits, expect near-tie accept-rate drift. Default byte-identical.
+static bool draft_kv_fp8_enabled() {
+    static const int v = getenv("IK2_DRAFT_KV_FP8") ? std::atoi(getenv("IK2_DRAFT_KV_FP8")) : 0;
+    return v != 0;
+}
+// IK2_DRAFT_MARKOV_FUSE (opt-in, default 0): one markov_step_kernel launch per Markov step instead of
+// rnn_inputs + gemm_bf(rnn) + rnn_gates (3 launches -> 1; the vocab argmax stays its own launch).
+// Default OFF is byte-identical: no env => the original three calls. NOT bit-exact when ON: the custom
+// GEMV sums K in per-lane strided F32 fmaf chains + a shfl tree, a different reduction order than
+// cublas COMPUTE_32F, so near-tie logits (and thus drafted tokens) can drift. state/latent stay F32
+// exactly like rnn_gates (no SGLang-style BF16 rounding of the gate/tanh ops).
+static bool draft_markov_fuse_enabled() {
+    static const int v = getenv("IK2_DRAFT_MARKOV_FUSE") ? std::atoi(getenv("IK2_DRAFT_MARKOV_FUSE")) : 0;
+    return v != 0;
+}
+// IK2_DRAFT_CTX_CAP (opt-in, default 0): local draft layers attend only the last 1024 context positions,
+// so their K/V cache is a ring of next-pow2(1024+kBlock)=2048 rows instead of ctx rows (global layers keep
+// the full ctx cache). Cuts the drafter's local-layer cache VRAM ~ctx/2048 x (e.g. ~10x at ctx20000), freeing
+// room for the expert cache / long-context residency. Bit-exact: the same positions are attended, only the
+// storage index changes (pos & (cap-1)). Default OFF is byte-identical (full ctx linear cache).
+static bool draft_ctx_cap_enabled() {
+    static const int v = getenv("IK2_DRAFT_CTX_CAP") ? std::atoi(getenv("IK2_DRAFT_CTX_CAP")) : 0;
+    return v != 0;
+}
+// IK2_DRAFT_CAND (opt-in, default 0): screen each step's base logits to kDraftCandK top ids by base
+// alone and kDraftCandK more by base + fold_b (the static part of the Markov bias), then apply the
+// R=256-fold bias only to those ids. Cuts fold_w traffic from 7 full [R][n_rows] reads (~721 MB at
+// n_rows=200058) to a few MB. APPROXIMATION: a large per-step bias can move the true argmax outside
+// the screened union (default OFF keeps argmax_gemv_f16, byte-identical). IK2_DRAFT_CAND_K sets K.
+static bool draft_cand_enabled() {
+    static const int v = getenv("IK2_DRAFT_CAND") ? std::atoi(getenv("IK2_DRAFT_CAND")) : 0;
+    return v != 0;
+}
+static int draft_cand_k() {
+    static const int k = getenv("IK2_DRAFT_CAND_K") ? std::max(k::kDraftCandPerBlk,
+                                                              std::min(4096, std::atoi(getenv("IK2_DRAFT_CAND_K"))))
+                                                    : k::kDraftCandK;
+    return k;
+}
+
+// BF16 round/widen: the exact ops of ik2_kernels.cu's f2bf_rn / bf2f (those are file-local there).
+__device__ __forceinline__ uint16_t mk_f2bf_rn(float f) {
+    uint32_t u = __float_as_uint(f);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return 0x7fc0;   // NaN
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (uint16_t) (u >> 16);
+}
+__device__ __forceinline__ float mk_bf2f(uint16_t b) { return __uint_as_float((uint32_t) b << 16); }
+
+// 8 BF16 pairs (uint4 = 8 x uint16) dotted into one F32 accumulator.
+__device__ __forceinline__ void mk_dot8(uint4 w, uint4 x, float& acc) {
+    const uint32_t wu[4] = {w.x, w.y, w.z, w.w}, xu[4] = {x.x, x.y, x.z, x.w};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        acc = fmaf(mk_bf2f((uint16_t) (wu[j] & 0xffffu)), mk_bf2f((uint16_t) (xu[j] & 0xffffu)), acc);
+        acc = fmaf(mk_bf2f((uint16_t) (wu[j] >> 16)), mk_bf2f((uint16_t) (xu[j] >> 16)), acc);
+    }
+}
+
+// One Markov step fused: rnn_inputs -> proj = rnn_w . rnn_in -> rnn_gates. Grid R/4, block 128
+// (4 warps, wave32 like the other ik2 kernels); warp w owns cell i = blockIdx.x*4 + w and its three
+// proj rows i, R+i, 2R+i, so the gate epilogue needs no cross-warp traffic. Every block rebuilds
+// rnn_in [2R+2C] BF16 in its own dynamic LDS (K*2 bytes; no grid sync needed). state is DOUBLE-
+// BUFFERED by the caller: all blocks read state_old while peers write state_new -- an in-place
+// update would race the prologue's state reads across blocks. Host guard: R%4==0, K%8==0 (uint4
+// loads), LDS <= 48 KiB; otherwise propose() keeps the original three launches.
+__global__ void markov_step_kernel(const float* state_old, float* state_new, const uint16_t* emb, const int* prev,
+                                   const float* hidden, const float* f, const uint16_t* rnn_w, const float* bias,
+                                   int R, int C, float* latent) {
+    extern __shared__ __align__(16) uint16_t s_in[];
+    const int K = 2 * R + 2 * C, tid = threadIdx.x;
+    // prologue: rnn_inputs_kernel's exact math (F32 sources rounded once to BF16, same as rnn_inputs).
+    const int pv = *prev;
+    for (int i = tid; i < K; i += blockDim.x) {
+        float v;
+        if (i < R) v = state_old[i];
+        else if (i < 2 * R) v = mk_bf2f(emb[(size_t) pv * R + (i - R)]);
+        else if (i < 2 * R + C) v = hidden[i - 2 * R];
+        else v = f[i - 2 * R - C];
+        s_in[i] = mk_f2bf_rn(v);
+    }
+    __syncthreads();
+    // middle: warp-per-cell GEMV over K, uint4 (8 x BF16) loads from global rows and LDS, F32 fmaf.
+    const int lane = tid & 31, warp = tid >> 5;
+    const int i = blockIdx.x * 4 + warp;
+    const uint16_t* wr0 = rnn_w + (size_t) i * K;
+    const uint16_t* wr1 = rnn_w + (size_t) (R + i) * K;
+    const uint16_t* wr2 = rnn_w + (size_t) (2 * R + i) * K;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+    for (int k = lane * 8; k < K; k += 32 * 8) {
+        const uint4 x = *(const uint4*) (s_in + k);
+        mk_dot8(__ldg((const uint4*) (wr0 + k)), x, a0);
+        mk_dot8(__ldg((const uint4*) (wr1 + k)), x, a1);
+        mk_dot8(__ldg((const uint4*) (wr2 + k)), x, a2);
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        a0 += __shfl_xor_sync(0xffffffffu, a0, o);
+        a1 += __shfl_xor_sync(0xffffffffu, a1, o);
+        a2 += __shfl_xor_sync(0xffffffffu, a2, o);
+    }
+    // epilogue: rnn_gates_kernel's exact math, F32 throughout (gate = sigmoid, cand/out = tanh).
+    if (lane == 0) {
+        const float gr = a0 + bias[i], cr = a1 + bias[R + i], orw = a2 + bias[2 * R + i];
+        const float gate = 1.0f / (1.0f + expf(-gr));
+        state_new[i] = gate * state_old[i] + (1.0f - gate) * tanhf(cr);
+        latent[i] = tanhf(orw);
+    }
+}
+
 // Y [T][N] (ldy) = X [T][K] BF16 . W [N][K]^T BF16, F32 sums
-void gemm_bf(Drafter* d, const uint16_t* W, int N, int K, const uint16_t* X, int T, float* Y, int ldy) {
+void gemm_bf(Drafter* d, const uint16_t* W, int N, int K, const uint16_t* X, int T, float* Y, int ldy,
+             bool allow_wmma = false) {
+#if defined(STRATA_USE_HIP)
+    // BF16 data must use the BF16 WMMA entry point; the f16 one would reinterpret BF16 bits as FP16.
+    if (allow_wmma && draft_wmma_enabled() && K % 16 == 0 && T > 0 && T < 32 && ldy >= N &&
+        strata_wmma_gemm_bf16(X, W, Y, T, N, K, ldy, 0.0f, (void*) d->s))
+        return;
+#endif
     const float one = 1.0f, zero = 0.0f;
     cb(cublasGemmEx(d->blas, CUBLAS_OP_T, CUBLAS_OP_N, N, T, K, &one, W, CUDA_R_16BF, K, X, CUDA_R_16BF, K, &zero, Y,
                     CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
        "gemm_bf");
 }
 void gemm_h(Drafter* d, const uint16_t* W, int N, int K, const void* X, int T, float* Y, int ldy) {
+#if defined(STRATA_USE_HIP)
+    if (draft_wmma_enabled() && K % 16 == 0 && T > 0 && T < 32 && ldy >= N &&
+        strata_wmma_gemm_f16((const uint16_t*) X, W, Y, T, N, K, ldy, 0.0f, (void*) d->s))
+        return;
+#endif
     const float one = 1.0f, zero = 0.0f;
     cb(cublasGemmEx(d->blas, CUBLAS_OP_T, CUBLAS_OP_N, N, T, K, &one, W, CUDA_R_16F, K, X, CUDA_R_16F, K, &zero, Y,
                     CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
@@ -228,9 +416,9 @@ void gemm_h(Drafter* d, const uint16_t* W, int N, int K, const void* X, int T, f
 void layer_attn(Drafter* d, DLayer& l, int P, float* out) {
     const int T = kBlock, HD = d->H * 128, KD = d->KV * 128;
     k::to_bf16(d->h, (size_t) T * d->C, d->hb, d->s);
-    gemm_bf(d, l.wq, HD, d->C, d->hb, T, d->q, HD);
-    gemm_bf(d, l.wk, KD, d->C, d->hb, T, d->kk, KD);
-    gemm_bf(d, l.wv, KD, d->C, d->hb, T, d->vv, KD);
+    gemm_bf(d, l.wq, HD, d->C, d->hb, T, d->q, HD, true);
+    gemm_bf(d, l.wk, KD, d->C, d->hb, T, d->kk, KD, true);
+    gemm_bf(d, l.wv, KD, d->C, d->hb, T, d->vv, KD, true);
     k::rms(d->q, l.q_norm, T * d->H, 128, d->eps, d->q, d->s);
     k::rms(d->kk, l.k_norm, T * d->KV, 128, d->eps, d->kk, d->s);
     k::rope_neox(d->q, T, d->H, d->pos, d->theta, d->s);
@@ -238,18 +426,27 @@ void layer_attn(Drafter* d, DLayer& l, int P, float* out) {
     // Local layers (0, 1, 3, 4) match SGLang inkling2_mtp.py's window_anchor_at_start=True with window=1024:
     // every query in the block [P .. P+7] sees context [max(0, P - 1023) .. P-1] plus all 8 block tokens.
     const int k_lo = l.local ? std::max(0, P - 1023) : 0;
-    k::draft_attn(d->q, l.kc, l.vc, k_lo, P, d->kk, d->vv, T, d->H, d->KV, 1.0f / std::sqrt(128.0f), d->scratch, d->o,
-                  d->s);
+    if (d->kv_fp8) {
+        // FP8 context caches take precedence over IK2_DRAFT_ATTN_GQA (the GQA kernel is F32-only).
+        k::draft_attn_fp8(d->q, l.kc8, l.vc8, k_lo, P, d->kk, d->vv, T, d->H, d->KV, 1.0f / std::sqrt(128.0f),
+                          d->scratch, d->o, d->s);
+    } else if (draft_attn_gqa_enabled() && d->KV > 0 && d->H % d->KV == 0) {
+        k::draft_attn_gqa(d->q, l.kc, l.vc, k_lo, P, d->kk, d->vv, T, d->H, d->KV, 1.0f / std::sqrt(128.0f),
+                          d->scratch, d->o, d->s);
+    } else {
+        k::draft_attn(d->q, l.kc, l.vc, k_lo, P, d->kk, d->vv, T, d->H, d->KV, 1.0f / std::sqrt(128.0f), d->scratch,
+                      d->o, d->s, l.ring_mask);
+    }
     k::to_bf16(d->o, (size_t) T * HD, d->hb, d->s);
-    gemm_bf(d, l.wo, d->C, HD, d->hb, T, out, d->C);
+    gemm_bf(d, l.wo, d->C, HD, d->hb, T, out, d->C, true);
 }
 
 void layer_mlp(Drafter* d, DLayer& l, float* out) {
     const int T = kBlock;
     k::to_bf16(d->h, (size_t) T * d->C, d->hb, d->s);
-    gemm_bf(d, l.wgu, 2 * d->F, d->C, d->hb, T, d->gu, 2 * d->F);
+    gemm_bf(d, l.wgu, 2 * d->F, d->C, d->hb, T, d->gu, 2 * d->F, true);
     k::silu_mul_bf16(d->gu, T, d->F, d->hb2, d->s);
-    gemm_bf(d, l.wd, d->C, d->F, d->hb2, T, out, d->C);
+    gemm_bf(d, l.wd, d->C, d->F, d->hb2, T, out, d->C, true);
 }
 
 }  // namespace
@@ -265,6 +462,7 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     const StFile f = st_open(path);
     auto* d = new Drafter;
     d->C = C, d->ctx = ctx, d->blas = blas, d->s = s;
+    d->kv_fp8 = draft_kv_fp8_enabled();
 
     auto find_tensor = [&](const std::string& n1, const std::string& n2 = "") -> std::string {
         if (f.t.find(n1) != f.t.end()) return n1;
@@ -345,9 +543,29 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
             l.wgu = up16(d, g);
         }
         l.wd = up16(d, st_bf16(f, b + "mlp.down_proj.weight", {C, F}));
-        l.kc = dalloc<float>((size_t) ctx * KV * 128);
-        l.vc = dalloc<float>((size_t) ctx * KV * 128);
-        d->vram += (size_t) ctx * KV * 128 * 8;
+        // IK2_DRAFT_CTX_CAP (opt-in, default OFF = full ctx cache, byte-identical): local layers attend only
+        // the last `window` (1024) context positions, so their K/V cache can be a ring of cap = next-pow2 of
+        // (window + kBlock) rows instead of ctx rows. At ctx20000 this cuts the drafter's local-layer caches
+        // ~10x (e.g. 2 local layers x 20000 x 8 x 128 x 4B x 2 = 327MB -> 2 x 2048 x ... = 33MB), freeing VRAM
+        // for the expert cache / long-context residency. Global layers keep the full ctx cache. The ring index
+        // is pos & (cap-1); layer_attn passes the ring base/mask to draft_attn, write_context writes pos & mask.
+        int cap = ctx;
+        if (l.local && draft_ctx_cap_enabled()) {
+            cap = 1;
+            while (cap < 1024 + kBlock) cap <<= 1;   // 2048 for window 1024 + block 8
+            if (cap > ctx) cap = ctx;
+        }
+        l.cap = cap;
+        l.ring_mask = (l.local && cap < ctx) ? cap - 1 : 0;   // 0 = linear (full ctx) indexing
+        if (d->kv_fp8) {
+            l.kc8 = dalloc<uint8_t>((size_t) cap * KV * 128);
+            l.vc8 = dalloc<uint8_t>((size_t) cap * KV * 128);
+            d->vram += (size_t) cap * KV * 128 * 2;
+        } else {
+            l.kc = dalloc<float>((size_t) cap * KV * 128);
+            l.vc = dalloc<float>((size_t) cap * KV * 128);
+            d->vram += (size_t) cap * KV * 128 * 8;
+        }
     }
 
     std::string norm_name = find_tensor("norm.weight", "output_norm.weight");
@@ -371,6 +589,8 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     d->x = dalloc<float>(T * C), d->res = dalloc<float>(T * C), d->h = dalloc<float>(T * C);
     d->q = dalloc<float>(T * H * 128), d->o = dalloc<float>(T * H * 128);
     d->kk = dalloc<float>(std::max<size_t>(T, kMixRows) * KV * 128), d->vv = dalloc<float>(T * KV * 128);
+    // kv_fp8: K stages in kk (already max(T, kMixRows) rows); V needs its own kMixRows-row F32 staging.
+    if (d->kv_fp8) d->ctx_v = dalloc<float>((size_t) kMixRows * KV * 128);
     d->gu = dalloc<float>(T * 2 * F);
     d->hb = dalloc<uint16_t>(std::max<size_t>(T * std::max<int64_t>(C, H * 128), (size_t) kMixRows * C));
     d->hb2 = dalloc<uint16_t>(T * F);
@@ -421,6 +641,31 @@ void fold(Drafter* d, const uint16_t* lm_f16, int n_rows) {
     d->vram += ((size_t) R + 1) * n_rows * 2 + (size_t) (kBlock - 1) * n_rows * 4;
 }
 
+// IK2_DRAFT_HEAD_INT4: arm the base-logits head GEMM over the target head's INT4 sidecar (the same
+// Wp/Wh/WS bins IK2_INT4_HEAD loads for the verify head; pointers borrowed, engine-owned). Call after
+// fold(). Returns false (stays on the FP16 gemm_h path) when the sidecar is missing or the shape does
+// not fit int4_matvec (M % 16, K % 256, K/256 in {9,12} -- the engine's own sidecar-load guard).
+bool set_head_int4(Drafter* d, const uint8_t* Wp, const uint8_t* Wh, const float* WS, int n_rows) {
+#if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
+    // The int4 kernels only exist under this gate (ik2_kernels.cu); elsewhere they are no-op stubs,
+    // so arming there would silently produce zero logits. Refuse instead.
+    if (!d || !Wp || !Wh || !WS) return false;
+    if (n_rows != d->n_rows || n_rows % 16 != 0 || d->C % 256 != 0 || (d->C / 256 != 9 && d->C / 256 != 12))
+        return false;
+    if (!d->h_xq) {
+        d->h_xq = dalloc<int8_t>((size_t) (kBlock - 1) * d->C);
+        d->h_xd = dalloc<float2>((size_t) (kBlock - 1) * (d->C / 32));
+        d->vram += (size_t) (kBlock - 1) * d->C + (size_t) (kBlock - 1) * (d->C / 32) * sizeof(float2);
+    }
+    d->h_i4Wp = Wp; d->h_i4Wh = Wh; d->h_i4WS = WS;
+    d->head_int4 = true;
+    return true;
+#else
+    (void) d; (void) Wp; (void) Wh; (void) WS; (void) n_rows;
+    return false;
+#endif
+}
+
 void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos0) {
     const int C = d->C, KD = d->KV * 128, n_taps = d->n_taps;
     for (int a = 0; a < m; a += kMixRows) {
@@ -431,11 +676,25 @@ void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos
             k::mix_rms(taps + (size_t) (r0 + a) * C, n_taps, (size_t) ld * C, n, C, d->alpha + li * n_taps, l.dflare,
                        d->eps, d->mix, d->s);
             k::to_bf16(d->mix, (size_t) n * C, d->hb, d->s);
-            float* kd = l.kc + (size_t) (pos0 + a) * KD;
-            gemm_bf(d, l.wkc, KD, C, d->hb, n, kd, KD);
-            gemm_bf(d, l.wvc, KD, C, d->hb, n, l.vc + (size_t) (pos0 + a) * KD, KD);
-            k::rms(kd, l.k_norm_ctx, n * d->KV, 128, d->eps, kd, d->s);
-            k::rope_neox(kd, n, d->KV, d->ctx_pos, d->theta, d->s);
+            if (d->kv_fp8) {
+                // F32 staging (K in kk, V in ctx_v), rms + rope in F32, then pack to the E4M3 caches.
+                // f32_to_e4m3fn saturates at +-448: K is RMS-normed (O(1)); V is a gemm output, rarely
+                // that large -- saturation is the documented quantization risk, not a crash.
+                float* kd = d->kk;
+                gemm_bf(d, l.wkc, KD, C, d->hb, n, kd, KD);
+                gemm_bf(d, l.wvc, KD, C, d->hb, n, d->ctx_v, KD);
+                k::rms(kd, l.k_norm_ctx, n * d->KV, 128, d->eps, kd, d->s);
+                k::rope_neox(kd, n, d->KV, d->ctx_pos, d->theta, d->s);
+                k::pack_e4m3(kd, (size_t) n * KD, l.kc8 + (size_t) (pos0 + a) * KD, d->s);
+                k::pack_e4m3(d->ctx_v, (size_t) n * KD, l.vc8 + (size_t) (pos0 + a) * KD, d->s);
+            } else {
+                const int wpos = l.ring_mask ? ((pos0 + a) & l.ring_mask) : (pos0 + a);
+                float* kd = l.kc + (size_t) wpos * KD;
+                gemm_bf(d, l.wkc, KD, C, d->hb, n, kd, KD);
+                gemm_bf(d, l.wvc, KD, C, d->hb, n, l.vc + (size_t) wpos * KD, KD);
+                k::rms(kd, l.k_norm_ctx, n * d->KV, 128, d->eps, kd, d->s);
+                k::rope_neox(kd, n, d->KV, d->ctx_pos, d->theta, d->s);
+            }
         }
     }
 }
@@ -447,8 +706,10 @@ void set_f_rnn(Drafter* d, const float* taps, int ld, int row) {
 }
 
 void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_t* lm_f16, int n_rows, int n_vocab,
-             int* out) {
+             int* out, int n_draft) {
     const int C = d->C, T = kBlock;
+    if (n_draft < 1) n_draft = 1;
+    if (n_draft > kBlock - 1) n_draft = kBlock - 1;
     // Initialize the residual stream [anchor_h; mask x 7], block positions, and anchor token in one kernel.
     // Layer 0 reads d->res and overwrites d->x, so d->x does not need pre-filling.
     init_block_kernel<<<dim3((unsigned) ((C + 255) / 256), (unsigned) T), 256, 0, d->s>>>(
@@ -467,21 +728,77 @@ void propose(Drafter* d, int anchor, const float* anchor_h, int P, const uint16_
     k::add(d->x, d->res, TC, d->res, d->s);
     k::rms(d->res, d->norm, T, C, d->eps, d->h, d->s);   // the draft hidden, rows 1 .. 7 used
     // base logits of rows 1 .. 7 through the target's head
-    k::to_f16(d->h + C, (size_t) (T - 1) * C, (uint16_t*) d->x16, d->s);
-    gemm_h(d, lm_f16, n_rows, C, d->x16, T - 1, d->base, n_rows);
+    if (d->head_int4) {
+        // IK2_DRAFT_HEAD_INT4: the head's rotated-int4 sidecar (~228 MiB) instead of the FP16 copy (~926 MiB).
+        // Same rotate+quant pair the verify head uses (k_rot_q8x and k_rot_pack8 share rotate_block), so
+        // dot(rot(W), rot(x)) = dot(W, x). k_mv writes dst[j * stride_dst + row]: stride_dst = n_rows matches
+        // base [7][n_rows], F32 like gemm_h's output (the Markov argmax below is unchanged). inv = 1/4096 (sh12).
+        k::int4_rot_q8x(d->h + C, T - 1, C, d->h_xq, d->h_xd, d->s);
+        k::int4_matvec(d->h_i4Wp, d->h_i4Wh, d->h_i4WS, n_rows, C, d->h_xq, d->h_xd, T - 1, d->base, n_rows,
+                       nullptr, 1.0f / (1 << k::kInt4Sh8), d->s);
+    } else {
+        k::to_f16(d->h + C, (size_t) (T - 1) * C, (uint16_t*) d->x16, d->s);
+        gemm_h(d, lm_f16, n_rows, C, d->x16, T - 1, d->base, n_rows);
+    }
     // the Markov head, a token at a time (note: k::rnn_gates keeps state/latent in F32 whereas SGLang mtp.py
     // rounds intermediate gate/tanh ops to BF16; fused argmax_gemv_f16 reads FP16 fold_w/fold_b + F32 base/latent)
+    const int Kmark = 2 * d->R + 2 * C;
+    // IK2_DRAFT_MARKOV_FUSE (default OFF): one markov_step_kernel per step (rnn_inputs + rnn GEMV +
+    // rnn_gates); shape guard mirrors the kernel (R%4 warp cells, K%8 uint4 loads, LDS <= 48 KiB).
+    // OFF or guard-false: the original three launches below, byte-identical.
+    const bool markov_fuse = draft_markov_fuse_enabled() && d->R % 4 == 0 && Kmark % 8 == 0 &&
+                             (size_t) Kmark * 2 <= 48 * 1024;
+    if (markov_fuse && !d->state2) {
+        d->state2 = dalloc<float>(d->R);
+        d->vram += (size_t) d->R * 4;
+    }
+    // IK2_DRAFT_CAND (opt-in, default OFF): the base logits are already complete here, so screen
+    // each step just before its Markov argmax. OFF changes nothing in the loop below.
+#if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
+    const bool cand_on = draft_cand_enabled() && n_vocab > 0 && n_rows >= n_vocab;
+    int cand_K = 0;
+    if (cand_on) {
+        cand_K = draft_cand_k();
+        ensure_cand_buffers(d, n_rows, n_vocab, cand_K);
+    }
+#else
+    const bool cand_on = false;
+    int cand_K = 0;
+#endif
     cu(cudaMemsetAsync(d->state, 0, d->R * 4, d->s), "state");
     for (int t = 0; t < T - 1; ++t) {
-        k::rnn_inputs(d->state, d->w1, d->toks + t, d->h + (size_t) (t + 1) * C, d->f_rnn, d->R, C, d->rnn_in, d->s);
-        gemm_bf(d, d->rnn_w, 3 * d->R, 2 * d->R + 2 * C, d->rnn_in, 1, d->proj, 3 * d->R);
-        k::rnn_gates(d->proj, d->rnn_b, d->R, d->state, d->latent, d->s);
-        k::argmax_gemv_f16(d->fold_w, n_rows, d->latent, d->base + (size_t) t * n_rows, d->fold_b, d->R, n_vocab,
-                           d->toks + t + 1, d->s);
+        if (markov_fuse) {
+            // state parity: even t reads state / writes state2, odd t the reverse (double buffer,
+            // see the kernel comment). latent is only consumed by the argmax below within the step.
+            float* s_old = (t & 1) ? d->state2 : d->state;
+            float* s_new = (t & 1) ? d->state : d->state2;
+            markov_step_kernel<<<(unsigned) (d->R / 4), 128, (size_t) Kmark * 2, d->s>>>(
+                s_old, s_new, d->w1, d->toks + t, d->h + (size_t) (t + 1) * C, d->f_rnn, d->rnn_w, d->rnn_b,
+                d->R, C, d->latent);
+            cu(cudaGetLastError(), "markov_step");
+        } else {
+            k::rnn_inputs(d->state, d->w1, d->toks + t, d->h + (size_t) (t + 1) * C, d->f_rnn, d->R, C, d->rnn_in,
+                          d->s);
+            gemm_bf(d, d->rnn_w, 3 * d->R, Kmark, d->rnn_in, 1, d->proj, 3 * d->R);
+            k::rnn_gates(d->proj, d->rnn_b, d->R, d->state, d->latent, d->s);
+        }
+        if (cand_on) {
+            const float* step_base = d->base + (size_t) t * n_rows;
+            const int nparts = d->cand_nblocks * k::kDraftCandPerBlk;
+            k::draft_base_topk_part(step_base, n_rows, d->fold_b, n_vocab, d->cand_nblocks, d->cand_part_val,
+                                    d->cand_part_id, d->s);
+            k::draft_base_topk_reduce(d->cand_part_val, d->cand_part_id, nparts, cand_K, d->cand_id, d->cand_val,
+                                      d->s);
+            k::draft_cand_argmax(d->fold_w, n_rows, d->latent, step_base, d->fold_b, d->R, n_vocab, d->cand_id,
+                                 2 * cand_K, d->toks + t + 1, d->s);
+        } else {
+            k::argmax_gemv_f16(d->fold_w, n_rows, d->latent, d->base + (size_t) t * n_rows, d->fold_b, d->R, n_vocab,
+                               d->toks + t + 1, d->s);
+        }
     }
-    cu(cudaMemcpyAsync(d->h_out, d->toks + 1, (T - 1) * 4, cudaMemcpyDeviceToHost, d->s), "tokens");
+    cu(cudaMemcpyAsync(d->h_out, d->toks + 1, n_draft * 4, cudaMemcpyDeviceToHost, d->s), "tokens");
     cu(cudaStreamSynchronize(d->s), "propose");
-    std::memcpy(out, d->h_out, (T - 1) * sizeof(int));
+    std::memcpy(out, d->h_out, n_draft * sizeof(int));
 }
 
 size_t bytes(const Drafter* d) { return d->vram; }

@@ -54,7 +54,11 @@ inline rocblas_status cublasGemmEx(rocblas_handle h, rocblas_operation trans_a,
 #define cublasGemmEx hipblasGemmEx
 #define cublasSgemm hipblasSgemm                              // the Qwen3.6 engine's FP32 prompt products
 #define cublasSgemmStridedBatched hipblasSgemmStridedBatched
+#define cublasSgemv hipblasSgemv                              // ik2 drafter FP32 GEMV
 #define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx    // (the Qwen3.6 prompt attention, FP16)
+// CUDA's PEDANTIC compute type only disables TF32 reassociation; AMD has no TF32,
+// so HIPBLAS_COMPUTE_32F is already exact F32 accumulation.
+#define CUBLAS_COMPUTE_32F_PEDANTIC HIPBLAS_COMPUTE_32F
 #define cublasHandle_t hipblasHandle_t
 #define cublasSetMathMode hipblasSetMathMode
 #define cublasSetStream hipblasSetStream

@@ -1,189 +1,223 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="app/host/public/brand/strata-lockup-dark.svg">
-    <img src="app/host/public/brand/strata-lockup-light.svg" alt="Strata" width="340">
-  </picture>
-</p>
+# Strata — Inkling-2-Mini Optimized Build for RX 7900 XTX
 
-<h3 align="center">Run powerful AI on your own computer.</h3>
-<p align="center">Chat, code and work with images, locally.</p>
+An optimized fork of [Strata](https://github.com/Niko1221/Strata) (original ik2 engine from PR #6506) for running **Thinking Machines Inkling-2-Mini** at maximum speed on a single **AMD RX 7900 XTX (gfx1100, 24 GB)** under **Windows native HIP**.
 
-<p align="center">
-  <a href="#models">Models</a> · <a href="#install"><b>Install</b></a> ·
-  <a href="#hardware">Hardware</a> · <a href="#tools">Tools</a> ·
-  <a href="#help">Help</a> · <a href="#support-strata">Support</a>
-</p>
+Upstream Strata's ik2 engine was CUDA-only. This build adds a wave32 RDNA3 compatibility layer, a gfx1100 WMMA flash-attention kernel, rotated-INT4 weight paths (experts + dense projections + head), native DSpark speculative decoding, and int4 KV — plus a 1M-context / host-RAM tiering path. Every optimization is environment-gated; the defaults are the validated correct + fast configuration.
 
-<p align="center">
-  <a href="https://github.com/Niko1221/Strata/releases/latest"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?label=download&color=0ab887" alt="Download Strata"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/Niko1221/Strata" alt="MIT license"></a>
-  <a href="https://github.com/sponsors/Niko1221"><img src="https://img.shields.io/badge/Sponsor-EA4AAA?logo=githubsponsors&logoColor=fff" alt="Sponsor Strata on GitHub Sponsors"></a>
-  <a href="https://buymeacoffee.com/strataengine"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=000" alt="Support Strata on Buy Me a Coffee"></a>
-</p>
+**Headline results (all greedy bit-exact vs. llama.cpp V3 reference):**
 
-<p align="center"><sub><b>English</b> · <a href="docs/lang/README.zh-CN.md">简体中文</a> · <a href="docs/lang/README.ja.md">日本語</a> · <a href="docs/lang/README.de.md">Deutsch</a> · <a href="docs/lang/README.fr.md">Français</a> · <a href="docs/lang/README.es.md">Español</a> · <a href="docs/lang/README.pt-BR.md">Português</a> · <a href="docs/lang/README.pl.md">Polski</a></sub></p>
+| Metric | Result |
+|---|---|
+| Prefill (16k prompt) | **3053 tok/s** |
+| AR decode (no speculation) | **107 tok/s** (short), **103 tok/s** (4k) |
+| DSpark decode (native draft, sustained) | **247 tok/s** (structured prompt, accept 7.73/8) |
+| Long context, all-VRAM resident | 640k context @ 15.6 tok/s decode |
+| 1M context | fits in 24 GB (KV in VRAM + host tiering), 4k-populated @ 103 tok/s decode |
 
-**Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
+See [Measured results](#measured-results) for the full tables and conditions.
 
-## Models
+---
 
-We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where a compatible model fits.
+## Contents
 
-<details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.8-Flash-Next</b></summary>
+- [Why this build](#why-this-build)
+- [Architecture notes](#architecture-notes)
+- [Requirements](#requirements)
+- [Build (Windows / HIP / gfx1100)](#build-windows--hip--gfx1100)
+- [Prepare model & token files](#prepare-model--token-files)
+- [INT4 weight conversion](#int4-weight-conversion)
+- [Run & benchmark](#run--benchmark)
+- [Measured results](#measured-results)
+- [Correctness validation](#correctness-validation)
+- [Environment variable reference](#environment-variable-reference)
+- [Source changes](#source-changes)
+- [Credits & license](#credits--license)
 
-| Provider | Choices |
-| --- | --- |
-| **ISTA-DASLab · recommended** | Q2\_0, IQ2\_XS, IQ3\_XXS, IQ3\_S. [Coder: IQ1\_M](docs/MODELS.md#coder) for coding. |
-| **Unsloth** | UD-IQ4\_XS, UD-Q4\_K\_XL, UD-Q5\_K\_XL, UD-Q6\_K\_XL, Q8\_0 |
-| **Gyro · agentionai** | [Gyro-S, Gyro-M](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF). Lower memory use but slower. |
-| **Other options** | [Swift 1.5](docs/MODELS.md#swift-15), [NVFP4](docs/NVFP4.md), [OrcaRouter](docs/ORCA.md) |
+---
 
-[Compare sizes, memory needs and compatibility](docs/MODELS.md).
+## Why this build
 
-</details>
+Inkling-2-Mini is a looped multimodal MoE: 24 physical layers, core layers 6–17 executed **3×** per token (48 visits/token), 128 experts with top-8 routing, hidden 2304, 24 Q / 8 KV heads (head dim 128), sliding-window attention (1024) plus full layers, learned relative-position bias + attention sink. At ~26 B total / 5.4 B active parameters it is memory-bandwidth- and latency-bound on a single GPU.
 
-<details>
-<summary><img src="docs/media/models/qwen.svg" width="22" alt="" align="middle"> &nbsp;<b>Qwen3.6-35B-A3B</b></summary>
+The stock engines did not meet the target on gfx1100:
 
-**Unsloth:** UD-Q4_K_XL, UD-Q6_K_XL, Q8_0. These are the currently documented packs for this model.
+| Engine | Verdict |
+|---|---|
+| **Strata ik2 (this build)** | Chosen base. Resident expert cache + CUDA graph; portable to HIP. |
+| Strata ink2 (alternate fork) | Native NVFP4 checkpoint; decode limited by ~1200 kernel launches/token. |
+| Basalt | Blackwell sm_120 FP4 tensor cores only; no HIP. |
+| LexiSuite | Closed source, custom OS; below target on 7900 XTX. |
+| RustingStrata | AMD Vulkan; prefill well below target. |
+| SGLang-radeon / vLLM | gfx942 / RDNA4-only kernels; Inkling recipe NVIDIA-only. |
+| hipfire | No Inkling architecture support; NVFP4 dequant missing. |
+| llama.cpp (banded-FA fork) | Correctness reference only: decode 44–47, prefill 1679 tok/s. |
 
-[Model guide and compatibility](docs/QWEN36.md).
+The final build is ~2.3× the decode and ~1.8× the prefill of the corrected llama.cpp baseline, and its DSpark mode reaches 97% of the B=8 perfect-accept theoretical ceiling.
 
-</details>
+## Architecture notes
 
-<a id="the-other-sizes"></a>
+Inkling-2-Mini (authoritative spec in `notes/inkling-math-spec.md` of the development workspace):
 
-Not sure what fits? [Choose a model for your computer](docs/MODELS.md#pick-by-memory).
+- 24 physical layers; layers 6–17 loop 3× (48 visits/token); cross-pass messages via 4 rank-64 gates.
+- 128 experts, top-8, route scale 8.0; SiTU activation with gate/up softcaps 4 / 25.
+- Attention: 5 sliding-window (1024) + 1 full layer per 6-layer block; learned rel-pos (dim 16, extent 1024) + learned sink; qk L2 clip 22.63, rel L2 clip 8.0.
+- Extended context: 1M tokens native; final logit softcap 30; vocab 201024.
 
-## Install
+Key porting facts:
 
-<a id="option-a-the-strata-app"></a>
+- **CUDA → HIP**: a wave32 compat layer under `engine/include/strata/hip_compat/` maps cuBLAS/cuda-runtime/intrinsics; NVIDIA-only PTX helpers (mma16816, ldsm, cp.async, wgmma) are guarded with `__builtin_trap` stubs so the scalar path compiles and runs. HIP device paths use `__HIP_DEVICE_COMPILE__` gates.
+- **WMMA flash attention**: `attn_flash_wmma_kernel<BN,NW>` uses RDNA3 `wmma_f32_16x16x16_f16_w32`; shared memory 20–25 KB (fits gfx1100's 64 KB LDS), unlike the NVIDIA kernel's 88 KB. Replaces the F32 logits round-trip (`W.lg[H,Tq,nk]` ~201 MB/visit). Largest prefill lever: **+83% at 16k/chunk10240**.
+- **Rotated INT4 weights**: experts, dense projections and the output head are converted from the model's NVFP4/Q8_0 format to symmetric int4 with Hadamard rotation and per-row/per-128 scales (`Wp` nibble tiles, `Wh` 4-bit sub-scales, `WS` per-row fp32). INT4 uses `wmma_i32_16x16x16_iu4_w32`; gfx1100 WMMA supports f16/bf16/int8/int4 but **not** fp8.
+- **What did NOT help** (measured, kept off): WMMA single-token expert GEMV / QKᵀ / multi-token NVFP4 experts (tensor cores waste 15/16 columns at N=1), fp8 KV for decode (launch/serial-bound, not KV-bandwidth), chunk > 10240 (expert-cache thrash), resident-fp16 projection cache (breaks expert residency), decode graph (graph ≈ direct).
 
-### Desktop app
+## Requirements
 
-**[Download Strata for Windows, Linux or Mac →](https://github.com/Niko1221/Strata/releases/latest)**
+- **GPU**: AMD RX 7900 XTX (gfx1100), 24 GB, ROCm Windows SDK with `hipcc`/clang targeting gfx1100.
+- **OS**: Windows 11; Visual Studio build tools (for `mt.exe` manifest embedding); CMake + Ninja.
+- **RAM**: 32 GB recommended. The engine keeps all experts resident in VRAM; never run two model-loading processes concurrently.
+- **Model**: `Inkling-2-Mini-UD-Q4_K_XL.gguf` (Unsloth quantization, ~17.6 GB). Draft head for DSpark: native `mtp.safetensors` (BF16).
+- **Python 3.12** with `numpy` + `scipy` and a `gguf-py` checkout for the conversion tools.
 
-Install the app, choose a model, and start chatting. There is one installer for each system. On first start the app
-downloads the engine for your graphics card. [Help with the installer](docs/INSTALL.md#the-app).
-
-<sub>Files: `Strata-0.2.18-windows-x64-setup.exe` · `Strata-0.2.18-linux-x86_64.AppImage` · `Strata-0.2.18-macos-arm64.dmg`</sub>
-
-<p align="center">
-  <img src="docs/media/app-chat.png" width="900" alt="Strata desktop app with a chat and live code preview side by side">
-  <br><sub>Chat, files and a live preview in one window.</sub>
-</p>
-
-<a id="option-b-the-terminal-one-line"></a>
-
-### Terminal app
-
-Prefer the terminal? Install Strata, then run **`strata launch`**.
-
-<details open>
-<summary><b>Install commands</b></summary>
-
-**Linux / Mac**
-
-```sh
-curl -fsSL --connect-timeout 15 --max-time 120 https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
-```
-
-**Windows PowerShell**
+## Build (Windows / HIP / gfx1100)
 
 ```powershell
-irm -TimeoutSec 120 https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
+# 1) Configure + build the ik2 target (see script header for all params)
+.\scripts\build-windows-hip.ps1 `
+  -EngineDir  <repo>\engine `
+  -BuildDir   <repo>\build-hip-win `
+  -RocmSdk    <path\to\_rocm_sdk_devel> `
+  -Target     strata-ik2
+
+# 2) Build the kernel parity test (optional)
+.\scripts\build-windows-hip.ps1 ... -Target ik2_kernels_test
 ```
 
-On Windows, open a new terminal afterwards. Then:
+At runtime put the ROCm SDK `bin` and `lib\llvm\bin` on `PATH` (the bench script does this). Compilation uses the SDK's clang/headers; runtime links the SDK's HIP/hipBLAS/rocBLAS DLLs. Set `AMDGPU_TARGETS=gfx1100`, `GGML_HIP=ON`, `STRATA_ENABLE_CUDA=OFF`, `STRATA_ENABLE_HIP=ON`.
 
-```sh
-strata launch
+## Prepare model & token files
+
+The CLI consumes **token-id files** (`--tokens @file`), not raw text: comma-separated integers, one prompt per file. Generate them with your Inkling-2 tokenizer (`inkling2` / O200K BPE, `ignore_merges=true`). A diverse ~325-token prompt and a long structured ~16k-token prompt are useful for reproduction; see the benchmark section for which prompt class each number uses.
+
+## INT4 weight conversion
+
+The INT4 paths need converted sidecar files generated from the GGUF (the engine still reads the GGUF for routing/metadata). Scripts live in `tools/int4/`:
+
+```powershell
+python tools\int4\nvfp4_to_int4.py   ...   # NVFP4 experts (layers 0-19) -> int4-bin
+python tools\int4\q8_to_int4_l20.py  ...   # Q8_0 experts (layers 20-23) -> int4-bin
+python tools\int4\q8_dense_to_int4.py ...  # dense projections + out_w -> int4-dense-bin (Wp/Wh/WS)
 ```
 
-Follow the prompts to download and start a model. [Terminal guide](docs/TERMINAL_LAUNCH.md).
+Each script takes explicit input GGUF / output dir arguments (see `--help` / file header). Set `IK2_INT4_DIR` and `IK2_INT4_DENSE_DIR` to the output directories. The conversion is byte-deterministic: `Wp`/`Wh`/`WS` repacking matches the device kernels; a round-trip verification tool is included. INT4 sidecars **replace** (not coexist with) the original NVFP4 residency because of the 24 GB VRAM budget.
 
-</details>
+## Run & benchmark
 
-<p align="center">
-  <img src="docs/media/terminal-monitor.png" width="900" alt="Strata terminal app showing model activity, speed, memory and recent requests">
-  <br><sub>Watch your model and hardware while it runs.</sub>
-</p>
+```powershell
+# Standard AR benchmark (prefill + decode), correct+fast defaults
+.\scripts\bench.ps1 -Exe <repo>\build-hip-win\strata-ik2.exe `
+  -Model <path>\Inkling-2-Mini-UD-Q4_K_XL.gguf `
+  -PromptFile <path>\prompt-ids.txt -RocmSdk <path\to\_rocm_sdk_devel> `
+  -Mode ar -Gen 128 -Chunk 9216
 
-<a id="build-from-source"></a>
+# DSpark speculative decode (native draft) — sustained 200+ on structured prompts
+.\scripts\bench.ps1 ... -Mode dspark -Draft <path>\mtp.safetensors `
+  -PromptFile <structured-prompt-ids.txt> -Gen 256 -Ctx 4096
 
-[Build from source](docs/SOURCE_INSTALL.md) · [Docker](docs/DOCKER.md) · [Full install guide](docs/INSTALL.md)
+# 1M-context decode (KV in VRAM, host tiering, INT4 head decode)
+.\scripts\bench.ps1 ... -Mode longctx -Ctx 1052672 -Gen 64 -PromptFile <short-prompt-ids.txt>
+```
 
-<a id="what-you-need"></a>
+**GPU safety**: keep only one model-loading process at a time. The engine refuses to over-commit VRAM; on a 24 GB WDDM card, spilling to host memory collapses decode by >10×. The bench script refuses to start if another model process is running.
 
-## Hardware
+## Measured results
 
-| Supported hardware | Guide |
-| --- | --- |
-| **NVIDIA GeForce RTX 20 / 30 / 40 / 50 series** | [NVIDIA setup](docs/INSTALL.md#what-you-need) |
-| **AMD Radeon RX 7700 / 7800 / 7900, RX 9060 / 9070, AI PRO R9700** | [AMD setup](docs/AMD_HIP.md) |
-| **AMD Radeon RX 6800 / 6900 · experimental** | [RX 6000 setup](docs/AMD_HIP.md#rdna2-gfx1030) |
-| **Intel Arc · Linux** | [Intel setup](docs/INTEL_ARC.md) |
-| **Apple Silicon · M1 or newer** | [Mac setup](docs/MAC.md) |
-| **AMD Ryzen AI Max · Strix Halo** | [Strix Halo setup](docs/STRIX_HALO.md) |
-| **NVIDIA DGX Spark · Linux** | [DGX Spark setup](docs/DGX_SPARK_LINUX.md) |
+All numbers: Windows 11, RX 7900 XTX 24 GB (gfx1100, 960 GB/s), 32 GB RAM, greedy decoding, default config = WMMA flash (NW8/BN32) + INT4 experts + INT4 dense, KV as noted, experts fully resident, CUDA graph captured.
 
-<a id="using-it"></a>
+### Short / medium context
 
-## Tools
+| Config | Prefill | AR decode |
+|---|---|---|
+| 16k prompt, chunk 9216, f16 KV | **3053 tok/s** | 92.9 tok/s |
+| 4k prompt, chunk 4096, f16 KV | 2463 tok/s | **103.5 tok/s** |
+| Short prompt gen256 | — | **107.3 tok/s** |
+| 64k prompt, fp8 KV | 2463 tok/s | 59.2 tok/s |
+| Baseline llama.cpp V3 (diverse 325) | 539 tok/s | 44.5 tok/s |
 
-**Claude Code · Codex CLI · OpenCode · oh-my-pi · pi.dev · Hermes Agent · OpenClaw**, and more through the OpenAI- and Anthropic-compatible APIs.
+Prefill scaling (16k, chunk sweep): chunk 8192 → 2567, **9216 → 2679**, 10240 → 2636, 11264 → 1010 tok/s (expert-cache thrash). WMMA flash attention raised 16k prefill 1450 → 2661 tok/s (+83%).
 
-Run **`strata connect`** to see setup instructions for your tool. [Connection guide](docs/TERMINAL_LAUNCH.md#connect-your-apps-strata-connect).
+### DSpark speculative decode
 
-<a id="guides"></a>
-<a id="how-fast-is-it"></a>
-<a id="how-does-it-work"></a>
-<a id="something-went-wrong"></a>
+| Prompt class | Accept (drafts/step) | Decode |
+|---|---|---|
+| Long structured table, gen256 | 7.73 / 8 | **246.8 tok/s** |
+| Long code, gen256 | 7.50 / 8 | 217.4 tok/s |
+| Prose | 5.73 / 8 | 176 tok/s |
+| Short capital prompt | 2.25 / 8 | ~47 tok/s |
 
-## Help
+Verify cost dropped 155.9 → 27.4 ms/step via device-only verify (no host routing sync), WMMA drafting (10.3 → 5.8 ms), INT4 verify paths and slot-major MoE. B=8 is the trained draft block; B∈{2,4,6} all measured worse (86/148/151 tok/s). 246.8 tok/s ≈ 97% of the B=8 perfect-accept ceiling (~255 tok/s).
 
-[All guides](docs) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Report a bug](https://github.com/Niko1221/Strata/issues/new/choose) ·
-[Benchmarks](docs/COMMUNITY_BENCHMARKS.md) · [How it works](docs/HOW_IT_WORKS.md) · [Contribute](.github/CONTRIBUTING.md)
+### Long context (int4 KV, cut24 experts, fully resident)
 
-## Support Strata
+| Context | Prefill | Decode |
+|---|---|---|
+| 4k | 2262 tok/s | 102 tok/s |
+| 128k | 1614 tok/s | 46.6 tok/s |
+| 256k | 1097 tok/s | 31.7 tok/s |
+| 512k | 661 tok/s | 18.8 tok/s |
+| 640k | 552 tok/s | 15.6 tok/s |
+| 768k | OOM in all-VRAM (EC budget < 1 GiB hard minimum) | — |
+| 1M (host-mapped KV) | prefill PCIe-write-bound (slow) | ~3–10 tok/s |
 
-**Help keep local AI open to everyone.** A GitHub sponsorship or a coffee helps fund development and testing on more hardware.
+1M context **fits** with the host-tiering path (`IK2_KV_HOST=1`, or KV in VRAM via `IK2_DENSE_HOST=1` + INT4 sidecars). With only 4k tokens populated in a 1M-allocation config, decode reaches **103 tok/s** (head-decode fix: the output-head Q8 read was 60 ms/token over PCIe; routing it through the VRAM INT4 sidecar cut it to 0.3 ms). With a truly populated 256k context the bottleneck is attention's O(ctx) KV scan (~85 GB/s effective vs. 846 GB/s tensor-core path on the same architecture). The 8× full-attention visits per token make the decay architectural; NVIDIA's reference keeps ~26% at 131k even with tensor cores. An 8-snapshot conversation cache parks prefix state in host RAM for multi-turn reuse (93× prefix-reuse speedup measured).
 
-<a href="https://github.com/sponsors/Niko1221"><img src="https://img.shields.io/badge/Sponsor_on_GitHub-EA4AAA?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="GitHub Sponsors: sponsor Strata" height="48"></a>
-<a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me a Coffee: support Strata" height="48"></a>
+## Correctness validation
 
-### Loyal supporters
+- Kernel parity: **315 ok / 0 fail / 3 PTX-skip** on gfx1100 (double-reference parity for RMS, L2 clip, conv4, attention residual/probs/decode/multi, routing ties, NVFP4/Q8_0 experts, fp8 KV, loop gates, token path).
+- Greedy parity: bit-exact token streams vs. llama.cpp V3 reference (temperature 0, top_k 1) over 31–96 tokens on diverse / capital prompts, across scalar, WMMA-flash, INT4 and DSpark configs.
+- FP8/INT4 KV and INT4 expert conversions verified bit-exact against FP16/Q8 references; residual differences are near-tie router tokens from INT4 requantization only.
 
-Thank you to everyone who supports Strata.
+## Environment variable reference
 
-<!-- supporters:start (generated from the public GitHub sponsors: one row per level, the biggest supporters first and largest; private sponsors are not listed) -->
-<a href="https://github.com/codeconduit-official"><img src="https://images.weserv.nl/?url=github.com/codeconduit-official.png&w=240&h=240&fit=cover&mask=circle&output=png" width="120" height="120" alt="codeconduit-official" title="codeconduit-official"></a>
+Defaults are the validated correct + fast setup. Escape hatches let you fall back to strict FP16/NVFP4 paths.
 
-<a href="https://github.com/kod88vn"><img src="https://images.weserv.nl/?url=github.com/kod88vn.png&w=160&h=160&fit=cover&mask=circle&output=png" width="80" height="80" alt="kod88vn" title="kod88vn"></a>
-<a href="https://github.com/router0mail"><img src="https://images.weserv.nl/?url=github.com/router0mail.png&w=160&h=160&fit=cover&mask=circle&output=png" width="80" height="80" alt="router0mail" title="router0mail"></a>
-<a href="https://github.com/kingdonb"><img src="https://images.weserv.nl/?url=github.com/kingdonb.png&w=160&h=160&fit=cover&mask=circle&output=png" width="80" height="80" alt="kingdonb" title="kingdonb"></a>
-<a href="https://github.com/Daisame"><img src="https://images.weserv.nl/?url=github.com/Daisame.png&w=160&h=160&fit=cover&mask=circle&output=png" width="80" height="80" alt="Daisame" title="Daisame"></a>
+| Variable | Default | Meaning |
+|---|---|---|
+| `IK2_FLASH` / `IK2_FLASH_WMMA` | 1 | gfx1100 WMMA flash attention (prefill +83% at 16k) |
+| `IK2_FLASH_NW` / `IK2_FLASH_BN` | 8 / 32 | flash tile geometry (swept optimum) |
+| `IK2_WMMA_GEMM` | 1 | dense projection WMMA/BK64 (prefill +50–70%) |
+| `IK2_INT4_EXPERTS` | 1 | rotated INT4 experts (escape 0 → NVFP4/Q8) |
+| `IK2_INT4_DENSE` | 1 | rotated INT4 dense projections |
+| `IK2_INT4_LAYERS` | 20 | number of expert layers converted to INT4 (24 = all) |
+| `IK2_INT4_HEAD` / `IK2_INT4_HEAD_DECODE` | 1 | INT4 output-head sidecar + VRAM token-1 head decode |
+| `IK2_INT4_DIR` / `IK2_INT4_DENSE_DIR` | relative | converted sidecar directories |
+| `IK2_KV` | f16 | KV cache format: f16 / fp8 / int8 / int4 |
+| `IK2_KV_HOST` | 0 | host-mapped KV (1M tiering; decode PCIe-slow) |
+| `IK2_DENSE_HOST` / `IK2_INT4_PREFILL` | 0 | host-map dense copies / prefill from VRAM INT4 sidecar |
+| `IK2_EC_ROOM_MIB` | 256 | extra MiB reserved for the resident expert cache |
+| `IK2_LG_CTX` | — | cap logits scratch to reduce work-buffer VRAM |
+| `IK2_VERIFY_FAST` / `IK2_DRAFT_WMMA` | 0 | DSpark device-only verify / WMMA drafting |
+| `IK2_INT4_DENSE_MULTI` / `_DENSE_MV` / `_MSG` / `_HEAD` / `IK2_MV_SLOT_MAJOR` / `IK2_MV_NW` / `IK2_DRAFT_HEAD_INT4` | 0 | validated DSpark speed opts (see bench.ps1) |
+| `IK2_ATTN_MMA` / `IK2_EXPERT_MMA` / `IK2_EXPERTS_PREFILL_WMMA` | 0 | NVIDIA-PTX paths — keep 0 on HIP |
+| `IK2_GATE_FUSE` / `IK2_RMS_FUSE` | 1 | small launch-fusion opts |
+| `IK2_PROF` / `IK2_PROF_FAST` | 0 | phase profiling (disables resident fast path / event-based) |
+| `GGML_HIP_NO_VMM` | set | use plain allocations instead of VMM |
 
-<a href="https://github.com/ryan4yin"><img src="https://images.weserv.nl/?url=github.com/ryan4yin.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="ryan4yin" title="ryan4yin"></a>
-<a href="https://github.com/themactep"><img src="https://images.weserv.nl/?url=github.com/themactep.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="themactep" title="themactep"></a>
-<a href="https://github.com/macintog"><img src="https://images.weserv.nl/?url=github.com/macintog.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="macintog" title="macintog"></a>
-<a href="https://github.com/bisonbet"><img src="https://images.weserv.nl/?url=github.com/bisonbet.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="bisonbet" title="bisonbet"></a>
-<a href="https://github.com/vizv"><img src="https://images.weserv.nl/?url=github.com/vizv.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="vizv" title="vizv"></a>
-<a href="https://github.com/seoulworker"><img src="https://images.weserv.nl/?url=github.com/seoulworker.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="seoulworker" title="seoulworker"></a>
-<a href="https://github.com/jaceknoga"><img src="https://images.weserv.nl/?url=github.com/jaceknoga.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="jaceknoga" title="jaceknoga"></a>
-<a href="https://github.com/jackyini"><img src="https://images.weserv.nl/?url=github.com/jackyini.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="jackyini" title="jackyini"></a>
-<a href="https://github.com/moruku36"><img src="https://images.weserv.nl/?url=github.com/moruku36.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="moruku36" title="moruku36"></a>
-<a href="https://github.com/hrkgk"><img src="https://images.weserv.nl/?url=github.com/hrkgk.png&w=112&h=112&fit=cover&mask=circle&output=png" width="56" height="56" alt="hrkgk" title="hrkgk"></a>
-<!-- supporters:end -->
+## Source changes
 
-All supporters and how to support Strata: [SUPPORTERS.md](SUPPORTERS.md)
+All optimizations live under `engine/`. Key files:
 
-[MIT license](LICENSE) · [Credits and model licenses](docs/HOW_IT_WORKS.md#credits) · [Privacy](docs/SAFETY.md)
+| File | Change |
+|---|---|
+| `include/strata/hip_compat/{cublas_v2.h,cuda_runtime.h,intrinsics.hpp,cuda_fp8.h}` | wave32 CUDA→HIP shim; cuBLAS/runtime/intrinsics/fp8 coverage |
+| `src/ik2/ik2_kernels.cu` / `.cuh` | PTX guards; WMMA flash `<BN,NW,KVT,IBITS>`; INT4 experts/dense/head/KV kernels; warp-shuffle reductions; parity test hooks |
+| `src/ik2/ik2_engine.cu` | hybrid WMMA GEMM dispatch; INT4 expert/dense/head loading; DSpark verify + host tiering; residency/fit logic; profiler |
+| `src/ik2/ik2_draft.cu` / `.hpp` | native DSpark drafter, ring-cache context, draft-window env |
+| `src/prefill/wmma_gemm.cu` / `.h` | strided WMMA GEMM + tile-size switch |
+| `tests/cuda/ik2_kernels_test.cu` | double-reference parity, WMMA flash + INT4 cases |
+| `cmake/strata_gpu_engine.cmake` | ik2 target guard `OR HIP`, link `strata_core`, HIP WMMA sources |
 
-<a id="option-c-let-your-ai-set-it-up"></a>
+Conversion tools: `tools/int4/*.py`. Reproducible bench/build helpers: `scripts/*.ps1`.
 
-<sub>For AI tools and automated readers: <a href="AGENTS.md">technical reference</a> · <a href="docs/AI_SETUP.md">setup instructions</a>.</sub>
+## Credits & license
 
-**Sponsorships, hardware partnerships or collaborations:** [niko.veit@outlook.com](mailto:niko.veit@outlook.com).
-
+Based on [Strata](https://github.com/Niko1221/Strata) by Niko1221 and contributors; the ik2 engine originates from Strata PR #6506. Inkling-2-Mini is by Thinking Machines. Original Strata is MIT-licensed; see `LICENSE`. This fork adds the Windows/HIP port and optimizations described above.

@@ -573,20 +573,32 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endif()
 
   # the Inkling 2 engine path (GGUF architecture inkling2)
-  if(STRATA_ENABLE_CUDA)
+  # HIP (wave32 RDNA) builds the same sources through the hip_compat shim; the
+  # CUDA path is unchanged. PTX-only kernels are guarded out under __HIPCC__.
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_library(strata_ik2 STATIC src/ik2/ik2_engine.cu src/ik2/ik2_draft.cu src/ik2/ik2_kernels.cu src/ik2/ik2_cpu.cpp)
     target_include_directories(strata_ik2 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include src/ik2 PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(strata_ik2 PRIVATE strata_warnings ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target} Threads::Threads)
+    if(STRATA_ENABLE_HIP)
+      # IK2_WMMA_GEMM: the gfx11 WMMA FP16 GEMM lives in wmma_gemm.cu (AMD-only). Compile it straight into strata_ik2
+      # so the standalone strata-ik2 links it without pulling the whole strata_prefill library.
+      target_sources(strata_ik2 PRIVATE src/prefill/wmma_gemm.cu)
+      target_include_directories(strata_ik2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill)
+      if(IK2_WMMA_DEBUG)
+        target_compile_definitions(strata_ik2 PRIVATE IK2_WMMA_DEBUG=1)
+      endif()
+    endif()
     add_executable(strata-ik2 src/ik2/ik2_main.cpp)
     strata_utf8_manifest(strata-ik2)
-    target_link_libraries(strata-ik2 PRIVATE strata_ik2 ${_strata_gpu_runtime_target})
+    # strata_core supplies strata::hip_compat::mem_get_info (the WDDM VRAM-budget shim in device.cu)
+    target_link_libraries(strata-ik2 PRIVATE strata_ik2 strata_core ${_strata_gpu_runtime_target})
     target_link_libraries(strata PRIVATE strata_ik2)
     target_compile_definitions(strata PRIVATE STRATA_HAVE_IK2=1)
 
     if(BUILD_TESTING OR STRATA_TESTS)
       add_executable(ik2_kernels_test tests/cuda/ik2_kernels_test.cu)
       target_include_directories(ik2_kernels_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include src/ik2)
-      target_link_libraries(ik2_kernels_test PRIVATE strata_warnings ${_strata_gpu_runtime_target} strata_ik2)
+      target_link_libraries(ik2_kernels_test PRIVATE strata_warnings ${_strata_gpu_runtime_target} strata_ik2 strata_core)
     endif()
   endif()
 
