@@ -6708,6 +6708,132 @@ __device__ __forceinline__ float4 v_load4_int(const uint8_t* vr, int lane, float
                        (float) kv_int_nib(b1 & 0xFu) * scale, (float) kv_int_nib((b1 >> 4) & 0xFu) * scale);
 }
 
+// IK2_ATTN_WIDELOAD: one uint2 (8 bytes = 16 int4 codes) per lane instead of the old uint16 (4 codes) per lane.
+// Four eight-lane groups share a wave32 warp, so each warp carries four query heads at once: 16 codes/lane and
+// a 3-step butterfly (4,2,1) inside each group replace the old 4 codes/lane plus a 5-step, 32-lane wsum.
+__device__ __forceinline__ float4 wideload_int4_four(uint32_t c, float scale) {
+    return make_float4((float) kv_int_nib(c & 0xFu) * scale, (float) kv_int_nib((c >> 4) & 0xFu) * scale,
+                       (float) kv_int_nib((c >> 8) & 0xFu) * scale, (float) kv_int_nib((c >> 12) & 0xFu) * scale);
+}
+
+__device__ __forceinline__ float wideload_sum8(float v) {
+#pragma unroll
+    for (int o = 4; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o, 8);
+    return v;
+}
+
+// Split-K int4 decode attention with coalesced 16-code loads and zero shared memory / zero barriers.  The layout
+// is the donor k3_flash_swa_gqa's: a wave32 warp owns NQ query heads, an eight-lane group owns one head's D=128
+// row.  Each thread accumulates 16 of the 128 output channels and writes them straight to the split partials,
+// so the existing attn_combine_gate_kernel consumes the same [H,P,130] layout unchanged.  The dequant formula
+// stays code (signed nibble) * h2f(per-(token,KV-head) scale); the scale is never folded into q.
+template <int BITS, int NQ>
+__global__ void attn_wideload_int_kernel(const float* q, const float* r, const uint8_t* kci, const uint8_t* vci,
+                                        const uint16_t* ks, const uint16_t* vs, int kv_cap, int H, int Hkv, int k0,
+                                        int nk, int qpos, float qk_scale, const float* proj, int d_rel, int extent,
+                                        int window, float* part, const int* pos_d) {
+    static_assert(BITS == 4 && NQ == 4, "attn_wideload_int_kernel supports int4, four heads per wave32 warp");
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int qg = lane >> 3, l = lane & 7;
+    if (pos_d) {
+        qpos = *pos_d;
+        k0 = window < (1 << 30) ? max(0, qpos - window + 1) : 0;
+        nk = qpos + 1 - k0;
+    }
+    const int h_want = blockIdx.x * (NQ * 4) + warp + qg * NQ;   // strided heads: four distinct KV heads / wave
+    const bool keep = h_want < H;
+    const int h = keep ? h_want : H - 1;                          // dummy head keeps every warp lane in the shuffles
+    const int g = h / (H / Hkv), p = blockIdx.y, P = gridDim.y;
+    const int cb = 64;                                            // BITS==4: 64 code bytes per head row
+    const size_t rowb = (size_t) Hkv * cb;
+    const size_t sidx_base = (size_t) Hkv;
+    float* pp = part + (((size_t) h * P + p) * 130);
+
+    const float* qh = q + (size_t) h * 128;
+    const float* rh = r + (size_t) h * d_rel;
+    float4 q4[4];
+    const bool q_aligned = (((uintptr_t) qh & 15) == 0);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int d0 = l * 16 + k * 4;
+        q4[k] = q_aligned ? __ldg((const float4*) (qh + d0))
+                          : make_float4(qh[d0], qh[d0 + 1], qh[d0 + 2], qh[d0 + 3]);
+    }
+    float rr[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int d = l * 4 + k;
+        rr[k] = d < d_rel ? __ldg(rh + d) : 0.0f;
+    }
+
+    float m_w = -INFINITY, s_w = 0.0f;
+    float4 o_w[4] = {make_float4(0.0f, 0.0f, 0.0f, 0.0f), make_float4(0.0f, 0.0f, 0.0f, 0.0f),
+                     make_float4(0.0f, 0.0f, 0.0f, 0.0f), make_float4(0.0f, 0.0f, 0.0f, 0.0f)};
+    const int len = (nk + P - 1) / P, j0 = p * len, j1 = min(nk, j0 + len);
+    for (int j = j0; j < j1; ++j) {
+        const int pos = k0 + j;
+        const int dist = qpos - pos;
+        if (dist < 0 || dist >= window) continue;
+        const int slot = kv_cap > 0 ? pos % kv_cap : pos;
+        const size_t head_off = (size_t) slot * rowb + (size_t) g * cb;
+        const size_t sidx = (size_t) slot * sidx_base + g;
+        const float ksc = h2f(ks[sidx]);
+        const uint2 kc = __ldg((const uint2*) (kci + head_off + l * 8));
+        float4 kk[4];
+        kk[0] = wideload_int4_four(kc.x, ksc);
+        kk[1] = wideload_int4_four(kc.x >> 16, ksc);
+        kk[2] = wideload_int4_four(kc.y, ksc);
+        kk[3] = wideload_int4_four(kc.y >> 16, ksc);
+        float a = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+            a += q4[k].x * kk[k].x + q4[k].y * kk[k].y + q4[k].z * kk[k].z + q4[k].w * kk[k].w;
+        float logit = wideload_sum8(a) * qk_scale;
+        if (dist < extent) {
+            const float* pr = proj + (size_t) dist * d_rel;
+            float b = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int d = l * 4 + k;
+                if (d < d_rel) b += rr[k] * __ldg(pr + d);
+            }
+            logit += wideload_sum8(b);
+        }
+        if (logit > -INFINITY) {
+            const float vsc = h2f(vs[sidx]);
+            const uint2 vc = __ldg((const uint2*) (vci + head_off + l * 8));
+            float4 vv[4];
+            vv[0] = wideload_int4_four(vc.x, vsc);
+            vv[1] = wideload_int4_four(vc.x >> 16, vsc);
+            vv[2] = wideload_int4_four(vc.y, vsc);
+            vv[3] = wideload_int4_four(vc.y >> 16, vsc);
+            const float m_new = fmaxf(m_w, logit);
+            const float alpha = (m_w == -INFINITY) ? 0.0f : expf(m_w - m_new);
+            const float beta = expf(logit - m_new);
+            m_w = m_new;
+            s_w = s_w * alpha + beta;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                o_w[k].x = o_w[k].x * alpha + vv[k].x * beta;
+                o_w[k].y = o_w[k].y * alpha + vv[k].y * beta;
+                o_w[k].z = o_w[k].z * alpha + vv[k].z * beta;
+                o_w[k].w = o_w[k].w * alpha + vv[k].w * beta;
+            }
+        }
+    }
+    if (keep) {
+        if (l == 0) pp[0] = m_w, pp[1] = s_w;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int d = 2 + l * 16 + k * 4;
+            pp[d] = o_w[k].x;
+            pp[d + 1] = o_w[k].y;
+            pp[d + 2] = o_w[k].z;
+            pp[d + 3] = o_w[k].w;
+        }
+    }
+}
+
 // attn_flash_range's int counterpart: same online softmax, but each key / value row is dequantized with its
 // own per-(token, head) FP16 scale (ks / vs indexed slot * Hkv + g).  qk_scale is the plain 1/sqrt(D): no
 // unit-scale folding, the per-row scale already carries the magnitude.
@@ -7232,6 +7358,25 @@ void attn_decode_int(int bits, const float* q, const float* r, const float* sink
     else
         attn_decode_int_impl<4>(q, r, sink, kci, vci, ks, vs, kv_cap, H, Hkv, D, k0, nk, qpos, qk_scale, proj,
                                 d_rel, extent, window, scratch, out, s);
+}
+
+void attn_decode_int_wideload(int bits, const float* q, const float* r, const float* sink, const uint8_t* kci,
+                              const uint8_t* vci, const uint16_t* ks, const uint16_t* vs, int kv_cap, int H,
+                              int Hkv, const int* pos, int P, float qk_scale, const float* proj, int d_rel,
+                              int extent, int window, float* scratch, float* out, cudaStream_t s, const float* gate) {
+    kv_int_bits_check(bits, "attn_decode_int_wideload");
+    if (bits != 4 || H <= 0 || Hkv <= 0 || H % Hkv || d_rel > 32) {
+        std::fprintf(stderr, "ik2::k::attn_decode_int_wideload: bits %d, H %d, Hkv %d, d_rel %d\n", bits, H, Hkv,
+                     d_rel);
+        std::abort();
+    }
+    constexpr int NQ = 4;                  // four query heads per wave32 warp, 16 heads per 128-thread block
+    const unsigned gb = (unsigned) ((H + NQ * 4 - 1) / (NQ * 4));
+    attn_wideload_int_kernel<4, NQ><<<dim3(gb, (unsigned) P), 128, 0, s>>>(
+        q, r, kci, vci, ks, vs, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj, d_rel, extent, window, scratch, pos);
+    check("attn_decode_int_wideload (split)");
+    attn_combine_gate_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, 1.0f, gate, out);
+    check("attn_decode_int_wideload (combine)");
 }
 
 void attn_decode_int_at(int bits, const float* q, const float* r, const float* sink, const uint8_t* kci,

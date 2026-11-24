@@ -561,6 +561,13 @@ void attn_decode_int_onepass(int bits, const float* q, const float* r, const flo
                              const uint8_t* vci, const uint16_t* ks, const uint16_t* vs, int kv_cap, int H, int Hkv,
                              const int* pos, float qk_scale, const float* proj, int d_rel, int extent, int window,
                              float* out, cudaStream_t s, const float* gate = nullptr);
+/// IK2_ATTN_WIDELOAD: int4 decode attention with 16-code/lane coalesced loads and a 3-step eight-lane register
+/// reduction.  Only int4 is supported; it writes the same [H,P,130] partials and reuses attn_combine_gate_kernel.
+void attn_decode_int_wideload(int bits, const float* q, const float* r, const float* sink, const uint8_t* kci,
+                              const uint8_t* vci, const uint16_t* ks, const uint16_t* vs, int kv_cap, int H,
+                              int Hkv, const int* pos, int P, float qk_scale, const float* proj, int d_rel,
+                              int extent, int window, float* scratch, float* out, cudaStream_t s,
+                              const float* gate = nullptr);
 void attn_decode_int_at(int bits, const float* q, const float* r, const float* sink, const uint8_t* kci,
                         const uint8_t* vci, const uint16_t* ks, const uint16_t* vs, int kv_cap, int H, int Hkv,
                         const int* pos, int P, float qk_scale, const float* proj, int d_rel, int extent, int window,

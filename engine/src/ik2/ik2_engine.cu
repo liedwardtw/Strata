@@ -2774,6 +2774,8 @@ bool g_graph = true;        // IK2_GRAPH=0: the resident path's launches one by 
 int g_attn_mma = 1;         // a token's attention on the tensor cores (IK2_ATTN_MMA=0: the scalar kernels; 2: the
                             // layers without a window only)
 int g_mma_split = 1;        // its blocks a K / V head (k::attn_decode_mma_blocks: the device filled once)
+int g_decode_pfull = 128;   // IK2_DECODE_PFULL: key splits for full-context decode attention (1..512)
+int g_attn_wideload = 0;    // IK2_ATTN_WIDELOAD=1: int4-only coalesced decode attention (default off)
 struct FastGraph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
@@ -2803,7 +2805,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
     const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f, v_scale = 32.0f;
     // the attention's key splits: fixed, so that the launches are the same at every position
-    int P_sl = std::min(128, std::max(1, (c.window + 63) / 64)), P_full = 128;
+    int P_sl = std::min(128, std::max(1, (c.window + 63) / 64)), P_full = g_decode_pfull;
     if (const char* ps = getenv("IK2_DECODE_P")) { int v = std::atoi(ps); if (v >= 1 && v <= 128) P_sl = v; }
     if (g_prof_fast) pf_fast::setup();
     pf_fast::mark(0, g_s);
@@ -2952,6 +2954,10 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                 k::attn_decode_int_onepass(bits, q_p, r_p, W.sink, Ly.kci, Ly.vci, Ly.ks, Ly.vs, Ly.kv_cap, c.H,
                                            c.KV, W.pos, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.o, g_s,
                                            g_gate_fuse ? gate_p : nullptr);
+            else if (g_attn_wideload && bits == 4)
+                k::attn_decode_int_wideload(bits, q_p, r_p, W.sink, Ly.kci, Ly.vci, Ly.ks, Ly.vs,
+                                            Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P, qk_scale, Ly.rel_proj,
+                                            c.d_rel, extent, window, W.lg, W.o, g_s, g_gate_fuse ? gate_p : nullptr);
             else
                 k::attn_decode_int_at(bits, q_p, r_p, W.sink, Ly.kci, Ly.vci, Ly.ks, Ly.vs,
                                       Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P, qk_scale, Ly.rel_proj,
@@ -4446,6 +4452,8 @@ int run(int argc, char** argv) {
     g_verify_graph = getenv("IK2_VERIFY_GRAPH") && std::atoi(getenv("IK2_VERIFY_GRAPH")) != 0;
     g_moe_group_exp = getenv("IK2_MOE_GROUP_EXPERT") && std::atoi(getenv("IK2_MOE_GROUP_EXPERT")) != 0;
     if (getenv("IK2_INT4_DENSE")) g_int4_dense = std::atoi(getenv("IK2_INT4_DENSE"));
+    if (const char* pf = getenv("IK2_DECODE_PFULL")) { int v = std::atoi(pf); if (v >= 1 && v <= 512) g_decode_pfull = v; }
+    g_attn_wideload = getenv("IK2_ATTN_WIDELOAD") && std::atoi(getenv("IK2_ATTN_WIDELOAD")) != 0;
     g_int4_dense_multi = getenv("IK2_INT4_DENSE_MULTI") && std::atoi(getenv("IK2_INT4_DENSE_MULTI")) != 0;
     g_int4_prefill = getenv("IK2_INT4_PREFILL") && std::atoi(getenv("IK2_INT4_PREFILL")) != 0;
     g_int4_head = getenv("IK2_INT4_HEAD") && std::atoi(getenv("IK2_INT4_HEAD")) != 0;
