@@ -2776,6 +2776,7 @@ int g_attn_mma = 1;         // a token's attention on the tensor cores (IK2_ATTN
 int g_mma_split = 1;        // its blocks a K / V head (k::attn_decode_mma_blocks: the device filled once)
 int g_decode_pfull = 128;   // IK2_DECODE_PFULL: key splits for full-context decode attention (1..512)
 int g_attn_wideload = 0;    // IK2_ATTN_WIDELOAD=1: int4-only coalesced decode attention (default off)
+int g_attn_dpp = 0;         // IK2_ATTN_DPP=1: int4-only bit-exact DPP warp sum, same split grid (default off)
 struct FastGraph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
@@ -2958,6 +2959,10 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                 k::attn_decode_int_wideload(bits, q_p, r_p, W.sink, Ly.kci, Ly.vci, Ly.ks, Ly.vs,
                                             Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P, qk_scale, Ly.rel_proj,
                                             c.d_rel, extent, window, W.lg, W.o, g_s, g_gate_fuse ? gate_p : nullptr);
+            else if (g_attn_dpp && bits == 4)
+                k::attn_decode_int_at_dpp(bits, q_p, r_p, W.sink, Ly.kci, Ly.vci, Ly.ks, Ly.vs,
+                                          Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P, qk_scale, Ly.rel_proj,
+                                          c.d_rel, extent, window, W.lg, W.o, g_s, g_gate_fuse ? gate_p : nullptr);
             else
                 k::attn_decode_int_at(bits, q_p, r_p, W.sink, Ly.kci, Ly.vci, Ly.ks, Ly.vs,
                                       Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P, qk_scale, Ly.rel_proj,
@@ -4454,6 +4459,7 @@ int run(int argc, char** argv) {
     if (getenv("IK2_INT4_DENSE")) g_int4_dense = std::atoi(getenv("IK2_INT4_DENSE"));
     if (const char* pf = getenv("IK2_DECODE_PFULL")) { int v = std::atoi(pf); if (v >= 1 && v <= 512) g_decode_pfull = v; }
     g_attn_wideload = getenv("IK2_ATTN_WIDELOAD") && std::atoi(getenv("IK2_ATTN_WIDELOAD")) != 0;
+    g_attn_dpp = getenv("IK2_ATTN_DPP") && std::atoi(getenv("IK2_ATTN_DPP")) != 0;
     g_int4_dense_multi = getenv("IK2_INT4_DENSE_MULTI") && std::atoi(getenv("IK2_INT4_DENSE_MULTI")) != 0;
     g_int4_prefill = getenv("IK2_INT4_PREFILL") && std::atoi(getenv("IK2_INT4_PREFILL")) != 0;
     g_int4_head = getenv("IK2_INT4_HEAD") && std::atoi(getenv("IK2_INT4_HEAD")) != 0;

@@ -572,6 +572,12 @@ void attn_decode_int_at(int bits, const float* q, const float* r, const float* s
                         const uint8_t* vci, const uint16_t* ks, const uint16_t* vs, int kv_cap, int H, int Hkv,
                         const int* pos, int P, float qk_scale, const float* proj, int d_rel, int extent, int window,
                         float* scratch, float* out, cudaStream_t s, const float* gate = nullptr);
+/// IK2_ATTN_DPP: same split grid / 2-byte per lane loads as attn_decode_int_at; only int4, with the 5-step
+/// shfl_xor warp sum replaced by bit-identical RDNA3 DPP row_xmask + permlanex16 xor exchanges.
+void attn_decode_int_at_dpp(int bits, const float* q, const float* r, const float* sink, const uint8_t* kci,
+                            const uint8_t* vci, const uint16_t* ks, const uint16_t* vs, int kv_cap, int H, int Hkv,
+                            const int* pos, int P, float qk_scale, const float* proj, int d_rel, int extent, int window,
+                            float* scratch, float* out, cudaStream_t s, const float* gate = nullptr);
 
 /// One token's attention on the tensor cores - for long contexts, where the scalar attn_decode is bound by its
 /// arithmetic; this one reads at the memory's speed, an FP8 cache too.  q16 [H][128]: the clipped q in FP16;

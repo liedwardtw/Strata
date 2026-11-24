@@ -249,6 +249,32 @@ __device__ __forceinline__ float wsum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
 }
+// IK2_ATTN_DPP (opt-in): bit-exact wave32 xor-butterfly reduction using RDNA3 register ops.
+// __shfl_xor_sync lowers to ds_bpermute on gfx1100; DPP row_xmask (M=1,2,4,8) and
+// v_permlanex16 (M=16) exchange the SAME lane partner at each step, in the SAME order
+// (16,8,4,2,1), so the float additions happen in exactly the same sequence as wsum().
+// Builtins mirrored from repos/strata-ik2/engine/src/kernels/cuda/qsa_decode_attn.cu:510-528
+// and repos/Strata-rdna3/include/strata/hip_compat/intrinsics.hpp:116-130 (gfx11 dpp_xor32).
+template <int M>
+__device__ __forceinline__ float dpp_xor_exchange(float v) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
+    const int x = __float_as_int(v);
+    if constexpr (M == 16)
+        return __int_as_float(__builtin_amdgcn_permlanex16(0, x, 0x76543210, 0xfedcba98, false, false));
+    else
+        return __int_as_float(__builtin_amdgcn_update_dpp(0, x, 0x160 | M, 0xf, 0xf, false));
+#else
+    return __shfl_xor_sync(0xffffffffu, v, M);
+#endif
+}
+__device__ __forceinline__ float wsum_dpp(float v) {
+    v += dpp_xor_exchange<16>(v);
+    v += dpp_xor_exchange<8>(v);
+    v += dpp_xor_exchange<4>(v);
+    v += dpp_xor_exchange<2>(v);
+    v += dpp_xor_exchange<1>(v);
+    return v;
+}
 __device__ __forceinline__ float wmax(float v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
@@ -6837,7 +6863,7 @@ __global__ void attn_wideload_int_kernel(const float* q, const float* r, const u
 // attn_flash_range's int counterpart: same online softmax, but each key / value row is dequantized with its
 // own per-(token, head) FP16 scale (ks / vs indexed slot * Hkv + g).  qk_scale is the plain 1/sqrt(D): no
 // unit-scale folding, the per-row scale already carries the magnitude.
-template <int BITS>
+template <int BITS, int DPP = 0>
 __device__ __forceinline__ void attn_flash_range_int(const float* qh, const float* rh, const uint8_t* kci,
                                                      const uint8_t* vci, const uint16_t* ks, const uint16_t* vs,
                                                      int Hkv, int g, int kv_cap, int k0, int j0, int j1, int qpos,
@@ -6862,10 +6888,10 @@ __device__ __forceinline__ void attn_flash_range_int(const float* qh, const floa
         const float ksc = h2f(ks[sidx]);
         const float4 k4 = v_load4_int<BITS>(kci + head_off, lane, ksc);
         float a = q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
-        float l = wsum(a) * qk_scale;
+        float l = (DPP ? wsum_dpp(a) : wsum(a)) * qk_scale;
         if (dist < extent) {
             const float b = (lane < d_rel) ? r_lane * __ldg(proj + (size_t) dist * d_rel + lane) : 0.0f;
-            l += wsum(b);
+            l += DPP ? wsum_dpp(b) : wsum(b);
         }
         if (l > -INFINITY) {
             const float vsc = h2f(vs[sidx]);
@@ -6891,7 +6917,7 @@ __device__ __forceinline__ void attn_flash_range_int(const float* qh, const floa
 
 // attn_split_kernel's int counterpart (partials identical, so attn_combine_kernel / _gate_kernel are reused
 // with v_inv_scale = 1.0f: the per-row scale was applied at load).
-template <int BITS>
+template <int BITS, int DPP = 0>
 __global__ void attn_split_int_kernel(const float* q, const float* r, const uint8_t* kci, const uint8_t* vci,
                                       const uint16_t* ks, const uint16_t* vs, int kv_cap, int H, int Hkv, int k0,
                                       int nk, int qpos0, float qk_scale, const float* proj, int d_rel, int extent,
@@ -6908,8 +6934,8 @@ __global__ void attn_split_int_kernel(const float* q, const float* r, const uint
     const int len = (nk + P - 1) / P, j0 = p * len, j1 = min(nk, j0 + len);
     const float* qh = q + ((size_t) qi * H + h) * 128;
     const float* rh = r + ((size_t) qi * H + h) * d_rel;
-    attn_flash_range_int<BITS>(qh, rh, kci, vci, ks, vs, Hkv, g, kv_cap, k0, j0, j1, qpos, qk_scale, proj, d_rel,
-                               extent, window, sm_m, sm_s, sm_o);
+    attn_flash_range_int<BITS, DPP>(qh, rh, kci, vci, ks, vs, Hkv, g, kv_cap, k0, j0, j1, qpos, qk_scale, proj, d_rel,
+                                    extent, window, sm_m, sm_s, sm_o);
     const float M = fmaxf(fmaxf(sm_m[0], sm_m[1]), fmaxf(sm_m[2], sm_m[3]));
     float sum = 0.0f, o = 0.0f;
     if (M > -INFINITY) {
@@ -7393,6 +7419,24 @@ void attn_decode_int_at(int bits, const float* q, const float* r, const float* s
     check("attn_decode_int_at (split)");
     attn_combine_gate_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, 1.0f, gate, out);
     check("attn_decode_int_at (combine)");
+}
+
+// IK2_ATTN_DPP opt-in wrapper: identical grid/CTA count, 2-byte/lane loads and online-softmax order as
+// attn_decode_int_at; only the per-warp wsum becomes RDNA3 DPP/permlane (attn_flash_range_int<4,1>).
+void attn_decode_int_at_dpp(int bits, const float* q, const float* r, const float* sink, const uint8_t* kci,
+                            const uint8_t* vci, const uint16_t* ks, const uint16_t* vs, int kv_cap, int H, int Hkv,
+                            const int* pos, int P, float qk_scale, const float* proj, int d_rel, int extent, int window,
+                            float* scratch, float* out, cudaStream_t s, const float* gate) {
+    kv_int_bits_check(bits, "attn_decode_int_at_dpp");
+    if (bits != 4) {
+        std::fprintf(stderr, "ik2::k::attn_decode_int_at_dpp: bits %d (only 4 supported)\n", bits);
+        std::abort();
+    }
+    attn_split_int_kernel<4, 1><<<dim3(H, P), 128, 0, s>>>(
+        q, r, kci, vci, ks, vs, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj, d_rel, extent, window, scratch, pos);
+    check("attn_decode_int_at_dpp (split)");
+    attn_combine_gate_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, 1.0f, gate, out);
+    check("attn_decode_int_at_dpp (combine)");
 }
 
 void attn_decode_int_onepass(int bits, const float* q, const float* r, const float* sink, const uint8_t* kci,
