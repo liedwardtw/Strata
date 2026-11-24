@@ -578,6 +578,19 @@ void attn_decode_int_at_dpp(int bits, const float* q, const float* r, const floa
                             const uint8_t* vci, const uint16_t* ks, const uint16_t* vs, int kv_cap, int H, int Hkv,
                             const int* pos, int P, float qk_scale, const float* proj, int d_rel, int extent, int window,
                             float* scratch, float* out, cudaStream_t s, const float* gate = nullptr);
+/// IK2_ATTN_GQA: GQA-shared int decode split kernel - grid (Hkv, P, 1) so the R = H/Hkv = 3 query heads of a KV
+/// head share each K/V row.  Writes the same [H,P,130] partials and reuses the same combine kernel; bit-exact
+/// to attn_decode_int_at.  Falls back to the original path unless H % Hkv == 0 and H / Hkv == 3.  dpp selects
+/// the int4-only DPP warp sum, matching IK2_ATTN_DPP.
+void attn_decode_int_at_gqa(int bits, const float* q, const float* r, const float* sink, const uint8_t* kci,
+                            const uint8_t* vci, const uint16_t* ks, const uint16_t* vs, int kv_cap, int H, int Hkv,
+                            const int* pos, int P, float qk_scale, const float* proj, int d_rel, int extent, int window,
+                            float* scratch, float* out, cudaStream_t s, const float* gate = nullptr, int dpp = 0);
+/// Non-graph (host k0 / nk / qpos) counterpart of attn_decode_int_at_gqa.
+void attn_decode_int_gqa(int bits, const float* q, const float* r, const float* sink, const uint8_t* kci,
+                         const uint8_t* vci, const uint16_t* ks, const uint16_t* vs, int kv_cap, int H, int Hkv, int D,
+                         int k0, int nk, int qpos, float qk_scale, const float* proj, int d_rel, int extent, int window,
+                         float* scratch, float* out, cudaStream_t s, int dpp = 0);
 
 /// One token's attention on the tensor cores - for long contexts, where the scalar attn_decode is bound by its
 /// arithmetic; this one reads at the memory's speed, an FP8 cache too.  q16 [H][128]: the clipped q in FP16;

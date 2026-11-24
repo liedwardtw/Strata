@@ -6952,6 +6952,113 @@ __global__ void attn_split_int_kernel(const float* q, const float* r, const uint
     pp[2 + tid] = o;
 }
 
+// IK2_ATTN_GQA (opt-in): GQA-shared counterpart of attn_split_int_kernel.  One CTA of grid (Hkv, P, nq) serves
+// the R query heads h = g*R + r of KV head g, so each K row (and, when needed, V row) is dequantized once and
+// reused by R *independent* online softmaxes.  The key-walk order (j = j0 + warp, stride 4), the four-term
+// lane dot, the rel-bias projection, the wsum_dpp/wsum choice, the fmaxf/expf alpha/beta update and the
+// ascending-w four-warp shared-memory merge are copied verbatim from attn_flash_range_int /
+// attn_split_int_kernel; only the K/V reads are shared.  The partials therefore stay bit-identical and the
+// [H,P,130] layout lets attn_combine_kernel / attn_combine_gate_kernel run unchanged.  R is a compile-time
+// parameter so the per-head q4 / rel / accumulator arrays stay in registers; R = 3 is the target (H=24, Hkv=8).
+template <int BITS, int DPP = 0, int R = 3>
+__global__ void attn_split_int_gqa_kernel(const float* q, const float* r, const uint8_t* kci, const uint8_t* vci,
+                                          const uint16_t* ks, const uint16_t* vs, int kv_cap, int H, int Hkv, int k0,
+                                          int nk, int qpos0, float qk_scale, const float* proj, int d_rel, int extent,
+                                          int window, float* part, const int* pos_d) {
+    if (pos_d) {
+        qpos0 = *pos_d;
+        k0 = window < (1 << 30) ? max(0, qpos0 - window + 1) : 0;
+        nk = qpos0 + (int) gridDim.z - k0;
+    }
+    __shared__ float sm_m[4][R], sm_s[4][R];
+    __shared__ __align__(16) float sm_o[4][R][128];
+    const int g = blockIdx.x, p = blockIdx.y, P = gridDim.y, qi = blockIdx.z, tid = threadIdx.x;
+    const int lane = tid & 31, warp = tid >> 5, o = lane * 4;
+    const int cb = (BITS == 8) ? 128 : 64;        // code bytes per head
+    const size_t rowb = (size_t) Hkv * cb;        // code bytes per token row
+    const int qpos = qpos0 + qi;
+    const int len = (nk + P - 1) / P, j0 = p * len, j1 = min(nk, j0 + len);
+    float4 q4[R];
+    float r_lane[R], m_w[R], s_w[R];
+    float4 o_w[R];
+#pragma unroll
+    for (int rr = 0; rr < R; ++rr) {
+        const int h = g * R + rr;
+        const float* qh = q + ((size_t) qi * H + h) * 128;
+        q4[rr] = (((uintptr_t) qh & 15) == 0) ? __ldg((const float4*) (qh + o))
+                                               : make_float4(qh[o], qh[o + 1], qh[o + 2], qh[o + 3]);
+        const float* rh = r + ((size_t) qi * H + h) * d_rel;   // rel is per Q head, not per KV head
+        r_lane[rr] = (lane < d_rel) ? __ldg(rh + lane) : 0.0f;
+        m_w[rr] = -INFINITY;
+        s_w[rr] = 0.0f;
+        o_w[rr] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    for (int j = j0 + warp; j < j1; j += 4) {
+        const int pos = k0 + j;
+        const int dist = qpos - pos;
+        if (dist < 0 || dist >= window) continue;
+        const int slot = kv_cap > 0 ? pos % kv_cap : pos;
+        const size_t head_off = (size_t) slot * rowb + (size_t) g * cb;
+        const size_t sidx = (size_t) slot * Hkv + g;
+        const float ksc = h2f(ks[sidx]);
+        const float4 k4 = v_load4_int<BITS>(kci + head_off, lane, ksc);   // ONE K load shared by all R heads
+        const bool rel = dist < extent;
+        const float pb = (rel && lane < d_rel) ? __ldg(proj + (size_t) dist * d_rel + lane) : 0.0f;
+        float4 v4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        bool v_ready = false;
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr) {
+            float a = q4[rr].x * k4.x + q4[rr].y * k4.y + q4[rr].z * k4.z + q4[rr].w * k4.w;
+            float l = (DPP ? wsum_dpp(a) : wsum(a)) * qk_scale;
+            if (rel) {
+                const float b = (lane < d_rel) ? r_lane[rr] * pb : 0.0f;
+                l += DPP ? wsum_dpp(b) : wsum(b);
+            }
+            if (l > -INFINITY) {
+                if (!v_ready) {
+                    const float vsc = h2f(vs[sidx]);
+                    v4 = v_load4_int<BITS>(vci + head_off, lane, vsc);    // ONE V load shared by all R heads
+                    v_ready = true;
+                }
+                const float m_new = fmaxf(m_w[rr], l);
+                const float alpha = (m_w[rr] == -INFINITY) ? 0.0f : expf(m_w[rr] - m_new);
+                const float beta = expf(l - m_new);
+                m_w[rr] = m_new;
+                s_w[rr] = s_w[rr] * alpha + beta;
+                o_w[rr].x = o_w[rr].x * alpha + v4.x * beta;
+                o_w[rr].y = o_w[rr].y * alpha + v4.y * beta;
+                o_w[rr].z = o_w[rr].z * alpha + v4.z * beta;
+                o_w[rr].w = o_w[rr].w * alpha + v4.w * beta;
+            }
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr) sm_m[warp][rr] = m_w[rr], sm_s[warp][rr] = s_w[rr];
+    }
+#pragma unroll
+    for (int rr = 0; rr < R; ++rr) *(float4*) (&sm_o[warp][rr][o]) = o_w[rr];
+    __syncthreads();
+#pragma unroll
+    for (int rr = 0; rr < R; ++rr) {
+        const float M = fmaxf(fmaxf(sm_m[0][rr], sm_m[1][rr]), fmaxf(sm_m[2][rr], sm_m[3][rr]));
+        float sum = 0.0f, out = 0.0f;
+        if (M > -INFINITY) {
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                if (sm_m[w][rr] == -INFINITY) continue;
+                const float f = expf(sm_m[w][rr] - M);
+                sum += sm_s[w][rr] * f;
+                out += sm_o[w][rr][tid] * f;
+            }
+        }
+        const int h = g * R + rr;
+        float* pp = part + (((size_t) qi * H + h) * P + p) * 130;
+        if (tid == 0) pp[0] = M, pp[1] = sum;
+        pp[2 + tid] = out;
+    }
+}
+
 // int8 / int4 counterpart of attn_multi_shared_kernel: same one-K-load / one-V-load-per-key sharing, with the
 // per-(slot, kv head) fp16 scales applied at load exactly as in attn_flash_range_int (v_inv_scale = 1 in combine).
 template <int BITS, int NQ>
@@ -7437,6 +7544,66 @@ void attn_decode_int_at_dpp(int bits, const float* q, const float* r, const floa
     check("attn_decode_int_at_dpp (split)");
     attn_combine_gate_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, 1.0f, gate, out);
     check("attn_decode_int_at_dpp (combine)");
+}
+
+// IK2_ATTN_GQA opt-in wrappers: grid (Hkv, P, 1) so R = 3 query heads share one KV head's K/V rows.  Same
+// [H,P,130] partials, hence the same combine kernels as attn_decode_int_at / attn_decode_int.  dpp selects
+// the bit-exact DPP warp sum (int4 only, matching IK2_ATTN_DPP).
+template <int BITS, int DPP>
+static void attn_decode_int_gqa_launch(const float* q, const float* r, const uint8_t* kci, const uint8_t* vci,
+                                       const uint16_t* ks, const uint16_t* vs, int kv_cap, int H, int Hkv, int k0,
+                                       int nk, int qpos, float qk_scale, const float* proj, int d_rel, int extent,
+                                       int window, float* scratch, const int* pos_d, int P, cudaStream_t s) {
+    constexpr int R = 3;
+    attn_split_int_gqa_kernel<BITS, DPP, R><<<dim3(Hkv, (unsigned) P, 1), 128, 0, s>>>(
+        q, r, kci, vci, ks, vs, kv_cap, H, Hkv, k0, nk, qpos, qk_scale, proj, d_rel, extent, window, scratch, pos_d);
+}
+
+void attn_decode_int_at_gqa(int bits, const float* q, const float* r, const float* sink, const uint8_t* kci,
+                            const uint8_t* vci, const uint16_t* ks, const uint16_t* vs, int kv_cap, int H, int Hkv,
+                            const int* pos, int P, float qk_scale, const float* proj, int d_rel, int extent, int window,
+                            float* scratch, float* out, cudaStream_t s, const float* gate, int dpp) {
+    kv_int_bits_check(bits, "attn_decode_int_at_gqa");
+    if (H <= 0 || Hkv <= 0 || H % Hkv || H / Hkv != 3) {
+        std::fprintf(stderr, "ik2::k::attn_decode_int_at_gqa: H %d, Hkv %d (only R = 3)\n", H, Hkv);
+        std::abort();
+    }
+    if (bits == 8)
+        attn_decode_int_gqa_launch<8, 0>(q, r, kci, vci, ks, vs, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj, d_rel,
+                                         extent, window, scratch, pos, P, s);
+    else if (dpp)
+        attn_decode_int_gqa_launch<4, 1>(q, r, kci, vci, ks, vs, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj, d_rel,
+                                         extent, window, scratch, pos, P, s);
+    else
+        attn_decode_int_gqa_launch<4, 0>(q, r, kci, vci, ks, vs, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj, d_rel,
+                                         extent, window, scratch, pos, P, s);
+    check("attn_decode_int_at_gqa (split)");
+    attn_combine_gate_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, 1.0f, gate, out);
+    check("attn_decode_int_at_gqa (combine)");
+}
+
+void attn_decode_int_gqa(int bits, const float* q, const float* r, const float* sink, const uint8_t* kci,
+                         const uint8_t* vci, const uint16_t* ks, const uint16_t* vs, int kv_cap, int H, int Hkv, int D,
+                         int k0, int nk, int qpos, float qk_scale, const float* proj, int d_rel, int extent, int window,
+                         float* scratch, float* out, cudaStream_t s, int dpp) {
+    kv_int_bits_check(bits, "attn_decode_int_gqa");
+    if (D != 128 || H <= 0 || Hkv <= 0 || H % Hkv || H / Hkv != 3) {
+        std::fprintf(stderr, "ik2::k::attn_decode_int_gqa: D %d, H %d, Hkv %d (only R = 3)\n", D, H, Hkv);
+        std::abort();
+    }
+    const int P = std::min(128, std::max(1, (nk + 63) / 64));
+    if (bits == 8)
+        attn_decode_int_gqa_launch<8, 0>(q, r, kci, vci, ks, vs, kv_cap, H, Hkv, k0, nk, qpos, qk_scale, proj, d_rel,
+                                         extent, window, scratch, nullptr, P, s);
+    else if (dpp)
+        attn_decode_int_gqa_launch<4, 1>(q, r, kci, vci, ks, vs, kv_cap, H, Hkv, k0, nk, qpos, qk_scale, proj, d_rel,
+                                         extent, window, scratch, nullptr, P, s);
+    else
+        attn_decode_int_gqa_launch<4, 0>(q, r, kci, vci, ks, vs, kv_cap, H, Hkv, k0, nk, qpos, qk_scale, proj, d_rel,
+                                         extent, window, scratch, nullptr, P, s);
+    check("attn_decode_int_gqa (split)");
+    attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, 1.0f, out);
+    check("attn_decode_int_gqa (combine)");
 }
 
 void attn_decode_int_onepass(int bits, const float* q, const float* r, const float* sink, const uint8_t* kci,

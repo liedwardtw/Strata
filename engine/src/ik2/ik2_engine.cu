@@ -478,6 +478,8 @@ bool g_flash_wmma = true;   // IK2_FLASH_WMMA=0: gfx1100 uses the scalar/cuBLAS 
 bool g_gate_fuse = true;    // IK2_GATE_FUSE=0: the scalar decode's output gate as its own gate_mul launch, not the combine's epilogue
 bool g_rms_fuse = true;     // IK2_RMS_FUSE=0: layer-0 full attention's q/k/v norms as three rms launches, not one rms_multi
 bool g_onepass = false;     // IK2_ATTN_ONEPASS=1: sliding decode attention split+combine as one launch (env-gated experiment)
+int g_attn_dpp = 0;         // IK2_ATTN_DPP=1: int4-only bit-exact DPP warp sum, same split grid (default off)
+bool g_attn_gqa = false;    // IK2_ATTN_GQA=1: int decode K/V shares R=3 Q heads per KV head (default off)
 bool g_loopbank_fuse = false;  // IK2_LOOPBANK_FUSE=1: loop-core pass>0 bank copies as one kernel, not n_bank+1 D2D memcpys
 bool g_int4_experts = true;  // IK2_INT4_EXPERTS=0: NVFP4 experts; default ON: rotated-int4 device-resident experts (l<20), falls back to NVFP4 when int4-bin absent
 int g_int4_layers = 20;      // IK2_INT4_LAYERS: number of low layers served by rotated-int4 sidecars (24 = also convert the Q8_0 l>=20 experts, ~2 GiB smaller for 1M context)
@@ -2073,8 +2075,13 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     if (vp_attn_idx >= 0) cudaEventRecord(vpK[vp_attn_idx], g_s);
     if (T == 1) {
         if (kv_is_int()) {
-            k::attn_decode_int(kv_int_bits(), q_p, r_p, sink_p, Ly.kci, Ly.vci, Ly.ks, Ly.vs, attn_kv_cap, c.H, c.KV,
-                               c.D, k0, nk, pos0, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+            if (g_attn_gqa && c.H % c.KV == 0 && c.H / c.KV == 3)
+                k::attn_decode_int_gqa(kv_int_bits(), q_p, r_p, sink_p, Ly.kci, Ly.vci, Ly.ks, Ly.vs, attn_kv_cap,
+                                       c.H, c.KV, c.D, k0, nk, pos0, qk_scale, Ly.rel_proj, c.d_rel, extent, window,
+                                       W.lg, W.o, g_s, g_attn_dpp ? 1 : 0);
+            else
+                k::attn_decode_int(kv_int_bits(), q_p, r_p, sink_p, Ly.kci, Ly.vci, Ly.ks, Ly.vs, attn_kv_cap, c.H, c.KV,
+                                   c.D, k0, nk, pos0, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         } else if (g_kv_fp8) {
             k::attn_decode_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0,
                                qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
@@ -2776,7 +2783,6 @@ int g_attn_mma = 1;         // a token's attention on the tensor cores (IK2_ATTN
 int g_mma_split = 1;        // its blocks a K / V head (k::attn_decode_mma_blocks: the device filled once)
 int g_decode_pfull = 128;   // IK2_DECODE_PFULL: key splits for full-context decode attention (1..512)
 int g_attn_wideload = 0;    // IK2_ATTN_WIDELOAD=1: int4-only coalesced decode attention (default off)
-int g_attn_dpp = 0;         // IK2_ATTN_DPP=1: int4-only bit-exact DPP warp sum, same split grid (default off)
 struct FastGraph {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
@@ -2955,6 +2961,11 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
                 k::attn_decode_int_onepass(bits, q_p, r_p, W.sink, Ly.kci, Ly.vci, Ly.ks, Ly.vs, Ly.kv_cap, c.H,
                                            c.KV, W.pos, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.o, g_s,
                                            g_gate_fuse ? gate_p : nullptr);
+            else if (g_attn_gqa && c.H % c.KV == 0 && c.H / c.KV == 3)
+                k::attn_decode_int_at_gqa(bits, q_p, r_p, W.sink, Ly.kci, Ly.vci, Ly.ks, Ly.vs,
+                                          Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P, qk_scale, Ly.rel_proj,
+                                          c.d_rel, extent, window, W.lg, W.o, g_s, g_gate_fuse ? gate_p : nullptr,
+                                          g_attn_dpp ? 1 : 0);
             else if (g_attn_wideload && bits == 4)
                 k::attn_decode_int_wideload(bits, q_p, r_p, W.sink, Ly.kci, Ly.vci, Ly.ks, Ly.vs,
                                             Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P, qk_scale, Ly.rel_proj,
@@ -4460,6 +4471,7 @@ int run(int argc, char** argv) {
     if (const char* pf = getenv("IK2_DECODE_PFULL")) { int v = std::atoi(pf); if (v >= 1 && v <= 512) g_decode_pfull = v; }
     g_attn_wideload = getenv("IK2_ATTN_WIDELOAD") && std::atoi(getenv("IK2_ATTN_WIDELOAD")) != 0;
     g_attn_dpp = getenv("IK2_ATTN_DPP") && std::atoi(getenv("IK2_ATTN_DPP")) != 0;
+    g_attn_gqa = getenv("IK2_ATTN_GQA") && std::atoi(getenv("IK2_ATTN_GQA")) != 0;
     g_int4_dense_multi = getenv("IK2_INT4_DENSE_MULTI") && std::atoi(getenv("IK2_INT4_DENSE_MULTI")) != 0;
     g_int4_prefill = getenv("IK2_INT4_PREFILL") && std::atoi(getenv("IK2_INT4_PREFILL")) != 0;
     g_int4_head = getenv("IK2_INT4_HEAD") && std::atoi(getenv("IK2_INT4_HEAD")) != 0;
