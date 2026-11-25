@@ -490,6 +490,8 @@ bool g_verify_fast = false;   // IK2_VERIFY_FAST=1: device-only INT4 verify MoE 
                               // sequence at S=T*K slots, no route D2H / stream sync (graph-capturable). Default OFF.
 bool g_verify_graph = false;  // IK2_VERIFY_GRAPH=1: capture the T=8 verify forward once and replay it. Needs
                               // IK2_VERIFY_FAST=1 and the single-GPU resident path. Default OFF.
+bool g_serve_dspec = false;  // IK2_SERVE_DSPEC=1: --serve greedy (temp<=0) uses DSpark spec when a drafter is
+                             // loaded and ctx has room; temp>0/short ctx fall back to byte-identical AR. Default OFF.
 bool g_moe_group_exp = false; // IK2_MOE_GROUP_EXPERT=1: verify-fast MoE grouped BY EXPERT -- each expert's
                               // weights read once for all its slots (bit-exact vs k_mv_grouped). Needs
                               // IK2_VERIFY_FAST=1. Default OFF.
@@ -4385,6 +4387,157 @@ void embed_row(Model& M, int t, float* raw, float* out) {
     k::rms(raw, M.embd_norm, 1, C, M.c.eps, out, g_s);
 }
 
+// DSpark speculative window loop, shared by --tokens and --serve (greedy). Emit returns true when
+// generation must stop (stop token / cancel / max_new); it is called for the initial anchor too.
+// Commit records one token whose state the verify left committed in the KV cache. Both are called
+// in output order; the last emitted token is NEVER committed (it is the pending next anchor), so
+// the caller's committed history stays equal to the visible tokens minus that last one -- the same
+// invariant the AR path has. Everything is byte-identical to the former inline CLI loop when
+// cli_diag=true and no stop/cancel interrupts it.
+struct SpecStats {
+    int steps = 0;
+    double t_draft = 0, t_verify = 0;
+    std::vector<int> acc;   // [kBlock]
+};
+
+template <class Emit, class Commit>
+static SpecStats generate_speculative(Model& M, Config& c, ik2::draft::Drafter* drafter,
+        int anchor, int P, int ctx_n, int B,
+        Emit emit, Commit commit, bool cli_diag, int verify_check, bool margin_check, double& t_exp) {
+    static float* raw = nullptr;
+    static float* anchor_h = nullptr;
+    if (!raw) { raw = dalloc<float>(c.C); anchor_h = dalloc<float>(c.C); }
+    SpecStats st;
+    st.acc.assign(ik2::draft::kBlock, 0);
+    use_dev(0);
+    const auto argmax_row = [&](const float* r) { return (int) (std::max_element(r, r + c.n_vocab) - r); };
+    if (emit(anchor)) return st;   // e.g. max_new=1, or the anchor itself is a stop token
+    while (P + B <= ctx_n) {
+        use_dev(0);
+        const double t0 = now();
+        embed_row(M, anchor, raw, anchor_h);
+        int dr[ik2::draft::kBlock - 1];
+        ik2::draft::propose(drafter, anchor, anchor_h, P, M.out_w.f16, c.n_rows, c.n_vocab, dr, B - 1);
+        const double t1 = now();
+        int tk[ik2::draft::kBlock];
+        tk[0] = anchor;
+        for (int j = 1; j < B; ++j) tk[j] = dr[j - 1];
+        g_rec = true;
+        std::vector<float> logits;
+        std::vector<int> ag;
+        const bool need_logits = cli_diag && (st.steps < verify_check || margin_check);
+        const double t_exp_before = t_exp;
+        forward(M, tk, B, P, true, need_logits ? OutMode::kLogits : OutMode::kArgmax, std::string(), logits, &ag, t_exp);
+        const double vexp_ms = (t_exp - t_exp_before) * 1e3;
+        if (cli_diag && st.steps < verify_check) {
+            const bool ge = g_group_exp, ga = g_group_attn;
+            const int modes[3][2] = {{0, 0}, {1, 0}, {0, 1}};
+            const char* names[3] = {"neither grouped", "experts grouped only", "attention grouped only"};
+            for (int m = 0; m < 3; ++m) {
+                rollback(M, 0);
+                g_group_exp = modes[m][0], g_group_attn = modes[m][1];
+                std::vector<float> lb;
+                forward(M, tk, B, P, true, OutMode::kLogits, std::string(), lb, nullptr, t_exp);
+                double mx = 0;
+                int dis = 0;
+                for (int j = 0; j < B; ++j) {
+                    const float* a = logits.data() + (size_t) j * c.n_vocab;
+                    const float* b = lb.data() + (size_t) j * c.n_vocab;
+                    for (int v = 0; v < c.n_vocab; ++v) mx = std::max(mx, (double) std::fabs(a[v] - b[v]));
+                    dis += argmax_row(a) != argmax_row(b);
+                }
+                std::printf("verify check, step %d, grouped vs %s: max |dlogit| %.4f, argmax differs in %d of %d rows\n",
+                            st.steps, names[m], mx, dis, B);
+            }
+            g_group_exp = ge, g_group_attn = ga;
+            rollback(M, 0);
+            logits.clear();
+            forward(M, tk, B, P, true, OutMode::kLogits, std::string(), logits, nullptr, t_exp);
+        }
+        g_rec = false;
+        int g[ik2::draft::kBlock];
+        if (need_logits) {
+            for (int j = 0; j < B; ++j) g[j] = argmax_row(logits.data() + (size_t) j * c.n_vocab);
+        } else {
+            for (int j = 0; j < B; ++j) g[j] = ag[j];
+        }
+        if (cli_diag && margin_check) {
+            for (int j = 0; j < B; ++j) {
+                const float* r = logits.data() + (size_t) j * c.n_vocab;
+                float b1 = -1e30f, b2 = -1e30f;
+                int i1 = -1, i2 = -1;
+                for (int v = 0; v < c.n_vocab; ++v) {
+                    if (r[v] > b1) b2 = b1, i2 = i1, b1 = r[v], i1 = v;
+                    else if (r[v] > b2) b2 = r[v], i2 = v;
+                }
+                if (b1 - b2 < 0.05f)
+                    std::printf("near tie at position %d: %d %.4f, %d %.4f\n", P + j, i1, b1, i2, b2);
+            }
+        }
+        int n = 0;
+        while (n < B - 1 && dr[n] == g[n]) ++n;
+        if (cli_diag && getenv("IK2_DEBUG_DRAFT")) {
+            std::printf("step %d pos %d anchor %d: dr=[", st.steps, P, anchor);
+            for (int j = 0; j < B - 1; ++j) std::printf("%d%s", dr[j], j + 2 < B ? " " : "");
+            std::printf("] g=[");
+            for (int j = 0; j < B; ++j) std::printf("%d%s", g[j], j + 1 < B ? " " : "");
+            std::printf("] match=%d\n", n);
+        }
+        const double tv2 = now();
+        // Emit the accepted drafts then the target's token at the first disagreement. `e` counts how
+        // many were emitted this step; a stop/cancel/max_new mid-window stops early, and the keep_local
+        // partial commit below commits only the e tokens whose state the window actually verified.
+        int e = 0;
+        bool stop = false;
+        for (int j = 0; j < n && !stop; ++j) { stop = emit(dr[j]); ++e; }
+        if (!stop) { stop = emit(g[n]); ++e; }
+        if (e < B) rollback(M, e);
+        use_dev(0);
+        commit(anchor);   // the pending token from the previous step is now committed
+        for (int j = 0; j + 1 < e; ++j) commit(j < n ? dr[j] : g[n]);
+        use_dev(0);
+        ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, e, P);
+        ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, e - 1);
+        const double tv4 = now();
+        if (cli_diag && getenv("IK2_VPROF")) {
+            static double sv_fwd = 0, sv_rb = 0, sv_wc = 0, sv_exp = 0; static int sv_n = 0;
+            sv_fwd += (t1 - t0) * 1e3; sv_rb += (tv2 - t1) * 1e3; sv_wc += (tv4 - tv2) * 1e3; sv_exp += vexp_ms; ++sv_n;
+            if (sv_n % 8 == 0) std::printf("vprof: fwd %.1f (exp %.1f) rb %.1f wc %.1f ms/step (n=%d)\n",
+                                           sv_fwd / sv_n, sv_exp / sv_n, sv_rb / sv_n, sv_wc / sv_n, sv_n);
+        }
+        if (cli_diag && getenv("IK2_VPROF2")) {
+            static double sv_attn = 0, sv_moe = 0; static int sv_n2 = 0;
+            for (int q = 0; q + 1 < vp_n; ++q) { float a = 0, b = 0;
+                cudaEventElapsedTime(&a, vpA[q], vpB[q]); cudaEventElapsedTime(&b, vpB[q], vpA[q + 1]);
+                sv_attn += a; sv_moe += b; }
+            ++sv_n2;
+            if (sv_n2 % 8 == 0) std::printf("vprof2: attn %.1f moe+rest %.1f ms/step over %d visits (n=%d)\n",
+                                            sv_attn / sv_n2, sv_moe / sv_n2, vp_n - 1, sv_n2);
+        }
+        if (cli_diag && (getenv("IK2_VPROF3") || getenv("IK2_VPROF4"))) {
+            static double s_res = 0, s_rms = 0, s_mm = 0, s_prep = 0, s_attn = 0, s_wo = 0; static int sv_n3 = 0;
+            for (int q = 0; q + 1 < vp_n; ++q) { float a = 0;
+                cudaEventElapsedTime(&a, vpA[q], vpR[q]); s_res += a;
+                cudaEventElapsedTime(&a, vpR[q], vpS[q]); s_rms += a;
+                cudaEventElapsedTime(&a, vpS[q], vpP[q]); s_mm += a;
+                cudaEventElapsedTime(&a, vpP[q], vpK[q]); s_prep += a;
+                cudaEventElapsedTime(&a, vpK[q], vpF[q]); s_attn += a;
+                cudaEventElapsedTime(&a, vpF[q], vpB[q]); s_wo += a; }
+            ++sv_n3;
+            if (sv_n3 % 8 == 0) std::printf("vprof3: res %.1f rms %.1f mm %.1f prep %.1f attn %.1f wo %.1f ms/step (n=%d)\n",
+                                            s_res / sv_n3, s_rms / sv_n3, s_mm / sv_n3, s_prep / sv_n3, s_attn / sv_n3, s_wo / sv_n3, sv_n3);
+        }
+        anchor = g[n];
+        P += e;
+        ++st.steps;
+        ++st.acc[n];
+        st.t_draft += t1 - t0;
+        st.t_verify += now() - t1;
+        if (stop) break;
+    }
+    return st;
+}
+
 }  // namespace
 
 namespace ik2 {
@@ -4466,6 +4619,7 @@ int run(int argc, char** argv) {
     g_int4_pf_off = getenv("IK2_INT4_PF") && !std::atoi(getenv("IK2_INT4_PF"));
     g_verify_fast = getenv("IK2_VERIFY_FAST") && std::atoi(getenv("IK2_VERIFY_FAST")) != 0;
     g_verify_graph = getenv("IK2_VERIFY_GRAPH") && std::atoi(getenv("IK2_VERIFY_GRAPH")) != 0;
+    g_serve_dspec = getenv("IK2_SERVE_DSPEC") && std::atoi(getenv("IK2_SERVE_DSPEC")) != 0;
     g_moe_group_exp = getenv("IK2_MOE_GROUP_EXPERT") && std::atoi(getenv("IK2_MOE_GROUP_EXPERT")) != 0;
     if (getenv("IK2_INT4_DENSE")) g_int4_dense = std::atoi(getenv("IK2_INT4_DENSE"));
     if (const char* pf = getenv("IK2_DECODE_PFULL")) { int v = std::atoi(pf); if (v >= 1 && v <= 512) g_decode_pfull = v; }
@@ -6050,6 +6204,16 @@ int run(int argc, char** argv) {
             busy = true;
             if (seed >= 0) rng.seed((uint64_t) seed);
             g_cancel = 0;
+            // IK2_SERVE_DSPEC (default OFF): greedy (temp<=0) spec decoding needs a drafter and ctx room
+            // for one verify window. temp>0 or a too-short ctx keep the AR path byte-identical. When a
+            // prefix is reused the drafter's ring context is not in Snap, but the target verifies every
+            // draft so the emitted stream stays bit-exact regardless of the drafter's cached state.
+            int spec_B = ik2::draft::kBlock;
+            if (getenv("IK2_SPEC_N")) spec_B = std::atoi(getenv("IK2_SPEC_N"));
+            if (spec_B < 2) spec_B = 2;
+            if (spec_B > ik2::draft::kBlock) spec_B = ik2::draft::kBlock;
+            const bool spec_active = serve_strata && g_serve_dspec && drafter && temp <= 0 &&
+                                     (int) ids.size() + spec_B <= ctx;
             size_t L = 0;   // (a picture's position is the same only with the same rows: its hash beside its token)
             auto hsig = [&](size_t i) { return i < hist_sig.size() ? hist_sig[i] : (uint64_t) 0; };
             while (L < hist.size() && L < ids.size() && hist[L] == ids[L] && hsig(L) == sig[L]) ++L;
@@ -6198,7 +6362,29 @@ int run(int argc, char** argv) {
             const char* reason = "length";
             int n_out = 0;
             int greedy_tok = temp <= 0 && !last.empty() ? pick(last.data()) : -1;
-            for (int i = 0; i < max_new; ++i) {
+            // IK2_SERVE_DSPEC (default OFF): greedy requests take the shared DSpark speculative loop,
+            // which emits only the target's own argmax (accepted drafts equal it), so the stream is
+            // bit-identical to the AR greedy path. The commit callback keeps `hist` aligned with the
+            // tokens actually emitted (the last emitted token stays pending as the next anchor), so
+            // prefix-cache reuse and the snapshot history never run ahead of the visible stream.
+            if (spec_active && greedy_tok >= 0) {
+                if (g_taps) {   // seed the drafter's KV/RNN from the prefill taps (best effort; the target verifies)
+                    const int ntap = (int) hist.size();
+                    ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, ntap, 0);
+                    ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, ntap - 1);
+                }
+                auto emit = [&](int t) -> bool {
+                    std::printf("T %d\n", t);
+                    std::fflush(stdout);
+                    ++n_out;
+                    if (g_cancel) { reason = "cancelled"; return true; }
+                    if (std::find(stops.begin(), stops.end(), t) != stops.end()) { reason = "stop"; return true; }
+                    return n_out >= max_new;   // reason stays "length"
+                };
+                auto commit = [&](int t) { hist.push_back(t); };
+                generate_speculative(M, c, drafter, greedy_tok, (int) hist.size(), ctx, spec_B,
+                                     emit, commit, /*cli_diag=*/false, /*verify_check=*/0, /*margin_check=*/false, t_exp);
+            } else for (int i = 0; i < max_new; ++i) {
                 if (g_cancel) {
                     reason = "cancelled";
                     break;
@@ -6355,10 +6541,7 @@ int run(int argc, char** argv) {
     if (drafter) {
         use_dev(0);
         // draft 7 after the anchor, verify the 8 in one call, keep the agreeing prefix and the target's next token
-        float *raw = dalloc<float>(c.C), *anchor_h = dalloc<float>(c.C);
-        auto argmax_row = [&](const float* r) { return (int) (std::max_element(r, r + c.n_vocab) - r); };
         int anchor = first_best, P = (int) prompt.size();
-        out.push_back(anchor);
         // IK2_SPEC_N (default 8): verify window B = N tokens (anchor + N-1 drafts), 2..8. Smaller B trades
         // accept-per-step against verify cost (fewer tokens, fewer experts touched); the drafter still computes
         // all kBlock-1 Markov steps, only the host copy / verify window is truncated. B=8 is the trained block.
@@ -6367,129 +6550,14 @@ int run(int argc, char** argv) {
         if (B < 2) B = 2;
         if (B > ik2::draft::kBlock) B = ik2::draft::kBlock;
         const bool margin_check = getenv("IK2_MARGIN") != nullptr;
-        while ((int) out.size() < gen && P + B <= ctx) {
-            use_dev(0);
-            const double t0 = now();
-            embed_row(M, anchor, raw, anchor_h);
-            int dr[ik2::draft::kBlock - 1];
-            ik2::draft::propose(drafter, anchor, anchor_h, P, M.out_w.f16, c.n_rows, c.n_vocab, dr, B - 1);
-            const double t1 = now();
-            int tk[ik2::draft::kBlock];
-            tk[0] = anchor;
-            for (int j = 1; j < B; ++j) tk[j] = dr[j - 1];
-            g_rec = true;
-            logits.clear();
-            std::vector<int> ag;
-            const bool need_logits = n_steps < verify_check || margin_check;
-            const double tv0 = now();
-            const double t_exp_before = t_exp;
-            forward(M, tk, B, P, true, need_logits ? OutMode::kLogits : OutMode::kArgmax, std::string(), logits, &ag,
-                    t_exp);
-            const double tv1 = now();
-            const double vexp_ms = (t_exp - t_exp_before) * 1e3;
-            if (n_steps < verify_check) {
-                // the same window again through each other path (the convs' history taken back first): the
-                // logits' largest difference and the argmax disagreements against the grouped run
-                const bool ge = g_group_exp, ga = g_group_attn;
-                const int modes[3][2] = {{0, 0}, {1, 0}, {0, 1}};
-                const char* names[3] = {"neither grouped", "experts grouped only", "attention grouped only"};
-                for (int m = 0; m < 3; ++m) {
-                    rollback(M, 0);
-                    g_group_exp = modes[m][0], g_group_attn = modes[m][1];
-                    std::vector<float> lb;
-                    forward(M, tk, B, P, true, OutMode::kLogits, std::string(), lb, nullptr, t_exp);
-                    double mx = 0;
-                    int dis = 0;
-                    for (int j = 0; j < B; ++j) {
-                        const float* a = logits.data() + (size_t) j * c.n_vocab;
-                        const float* b = lb.data() + (size_t) j * c.n_vocab;
-                        for (int v = 0; v < c.n_vocab; ++v) mx = std::max(mx, (double) std::fabs(a[v] - b[v]));
-                        dis += argmax_row(a) != argmax_row(b);
-                    }
-                    std::printf("verify check, step %d, grouped vs %s: max |dlogit| %.4f, argmax differs in %d of %d rows\n",
-                                n_steps, names[m], mx, dis, B);
-                }
-                g_group_exp = ge, g_group_attn = ga;
-                rollback(M, 0);
-                logits.clear();
-                forward(M, tk, B, P, true, OutMode::kLogits, std::string(), logits, nullptr, t_exp);
-            }
-            g_rec = false;
-            int g[ik2::draft::kBlock];
-            if (need_logits) {
-                for (int j = 0; j < B; ++j) g[j] = argmax_row(logits.data() + (size_t) j * c.n_vocab);
-            } else {
-                for (int j = 0; j < B; ++j) g[j] = ag[j];
-            }
-            if (margin_check) {   // the target's top-2 margin at each verified position (near ties flip)
-                for (int j = 0; j < B; ++j) {
-                    const float* r = logits.data() + (size_t) j * c.n_vocab;
-                    float b1 = -1e30f, b2 = -1e30f;
-                    int i1 = -1, i2 = -1;
-                    for (int v = 0; v < c.n_vocab; ++v) {
-                        if (r[v] > b1) b2 = b1, i2 = i1, b1 = r[v], i1 = v;
-                        else if (r[v] > b2) b2 = r[v], i2 = v;
-                    }
-                    if (b1 - b2 < 0.05f)
-                        std::printf("near tie at position %d: %d %.4f, %d %.4f\n", P + j, i1, b1, i2, b2);
-                }
-            }
-            int n = 0;
-            while (n < B - 1 && dr[n] == g[n]) ++n;
-            if (getenv("IK2_DEBUG_DRAFT")) {
-                std::printf("step %d pos %d anchor %d: dr=[", n_steps, P, anchor);
-                for (int j = 0; j < B - 1; ++j) std::printf("%d%s", dr[j], j + 2 < B ? " " : "");
-                std::printf("] g=[");
-                for (int j = 0; j < B; ++j) std::printf("%d%s", g[j], j + 1 < B ? " " : "");
-                std::printf("] match=%d\n", n);
-            }
-            const double tv2 = now();
-            if (n + 1 < B) rollback(M, n + 1);
-            use_dev(0);
-            const double tv3 = now();
-            ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n + 1, P);
-            ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n);
-            const double tv4 = now();
-            if (getenv("IK2_VPROF")) {
-                static double sv_fwd = 0, sv_rb = 0, sv_wc = 0, sv_exp = 0; static int sv_n = 0;
-                sv_fwd += (tv1 - tv0) * 1e3; sv_rb += (tv3 - tv2) * 1e3; sv_wc += (tv4 - tv3) * 1e3; sv_exp += vexp_ms; ++sv_n;
-                if (sv_n % 8 == 0) std::printf("vprof: fwd %.1f (exp %.1f) rb %.1f wc %.1f ms/step (n=%d)\n",
-                                               sv_fwd / sv_n, sv_exp / sv_n, sv_rb / sv_n, sv_wc / sv_n, sv_n);
-            }
-            if (getenv("IK2_VPROF2")) {
-                // vpA[vis]..vpB[vis] = attention (proj+attn) of visit vis; vpB[vis]..vpA[vis+1] = MoE+rest.
-                static double sv_attn = 0, sv_moe = 0; static int sv_n2 = 0;
-                for (int q = 0; q + 1 < vp_n; ++q) { float a = 0, b = 0;
-                    cudaEventElapsedTime(&a, vpA[q], vpB[q]); cudaEventElapsedTime(&b, vpB[q], vpA[q + 1]);
-                    sv_attn += a; sv_moe += b; }
-                ++sv_n2;
-                if (sv_n2 % 8 == 0) std::printf("vprof2: attn %.1f moe+rest %.1f ms/step over %d visits (n=%d)\n",
-                                                sv_attn / sv_n2, sv_moe / sv_n2, vp_n - 1, sv_n2);
-            }
-            if (getenv("IK2_VPROF3") || getenv("IK2_VPROF4")) {
-                // vpA..vpR = attn_res+loop_gates+rms; vpR..vpS = rms/gate tail; vpS..vpP = proj matmul;
-                // vpP..vpK = prep+conv; vpK..vpF = attn kernel; vpF..vpB = gate+wo+resnorm.
-                static double s_res = 0, s_rms = 0, s_mm = 0, s_prep = 0, s_attn = 0, s_wo = 0; static int sv_n3 = 0;
-                for (int q = 0; q + 1 < vp_n; ++q) { float a = 0;
-                    cudaEventElapsedTime(&a, vpA[q], vpR[q]); s_res += a;
-                    cudaEventElapsedTime(&a, vpR[q], vpS[q]); s_rms += a;
-                    cudaEventElapsedTime(&a, vpS[q], vpP[q]); s_mm += a;
-                    cudaEventElapsedTime(&a, vpP[q], vpK[q]); s_prep += a;
-                    cudaEventElapsedTime(&a, vpK[q], vpF[q]); s_attn += a;
-                    cudaEventElapsedTime(&a, vpF[q], vpB[q]); s_wo += a; }
-                ++sv_n3;
-                if (sv_n3 % 8 == 0) std::printf("vprof3: res %.1f rms %.1f mm %.1f prep %.1f attn %.1f wo %.1f ms/step (n=%d)\n",
-                                                s_res / sv_n3, s_rms / sv_n3, s_mm / sv_n3, s_prep / sv_n3, s_attn / sv_n3, s_wo / sv_n3, sv_n3);
-            }
-            for (int j = 0; j < n && (int) out.size() < gen; ++j) out.push_back(dr[j]);
-            if ((int) out.size() < gen) out.push_back(g[n]);
-            anchor = g[n];
-            P += n + 1;
-            ++n_steps;
-            ++acc_hist[n];
-            t_draft += t1 - t0;
-            t_verify += now() - t1;
-        }
+        SpecStats st = generate_speculative(M, c, drafter, anchor, P, ctx, B,
+            [&](int t) { out.push_back(t); return (int) out.size() >= gen; },  // emit: append; stop at gen
+            [](int) {},                                        // commit: CLI has no incremental history
+            /*cli_diag=*/true, verify_check, margin_check, t_exp);
+        n_steps = st.steps;
+        t_draft = st.t_draft;
+        t_verify = st.t_verify;
+        acc_hist = std::move(st.acc);
         for (size_t j = 0; j < out.size(); ++j) std::printf("%d%s", out[j], j + 1 < out.size() ? "," : "\n");
     }
     const double gen_s = now() - tg;
