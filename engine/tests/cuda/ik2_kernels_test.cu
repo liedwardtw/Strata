@@ -99,6 +99,27 @@ void expect_true(const char* what, bool ok) {
     std::printf("%s %s\n", ok ? "ok  " : "FAIL", what);
 }
 
+// Byte-for-byte equality (values are finite in these tests): T may be float, uint8_t or uint16_t.
+template <class T>
+void expect_exact(const char* what, const std::vector<T>& got, const std::vector<T>& want) {
+    size_t bad = got.size() == want.size() ? 0 : want.size() + 1;
+    size_t at = 0;
+    if (!bad) {
+        for (size_t i = 0; i < want.size(); ++i) {
+            if (!(got[i] == want[i])) {
+                if (!bad) at = i;
+                ++bad;
+            }
+        }
+    }
+    if (bad) {
+        ++g_fail;
+        std::printf("FAIL %-42s %zu of %zu off (first at %zu)\n", what, bad, want.size(), at);
+    } else {
+        std::printf("ok   %-42s %zu values, worst 0\n", what, want.size());
+    }
+}
+
 float h2f_host(uint16_t h) {
     const uint32_t sign = (uint32_t) (h >> 15) << 31, e = (h >> 10) & 31, m = h & 1023;
     if (e == 0) return (sign ? -1.0f : 1.0f) * std::ldexp((float) m, -24);
@@ -2760,9 +2781,60 @@ void test_int4_real() {
     expect("int4_real down (converter->device)", host(doutd, (size_t) N * Md), wantd, 5e-2, 0.25);
     cudaFree(dWpd); cudaFree(dWhd); cudaFree(dWSd); cudaFree(dXd); cudaFree(dx4d); cudaFree(dxmd); cudaFree(dxrd); cudaFree(doutd);
 }
+// IK2_BATCH_MOE_DEVICE: the masked per-expert GEMM must be bit-identical to N=1 int4_gemm8 calls
+// with the expert selected by each row. Same packed row, same weights, same accumulator order.
+void test_int4_gemm8_grouped_exact() {
+    const int K = 256, M = 256, N = 8, E = 4, gw = 4, sh = k::kInt4Sh8;
+    const size_t wp_e = (size_t) M * K / 2, wh_e = (size_t) (M / 16) * (K / 256) * 64;
+    std::vector<uint8_t> Wp((size_t) E * wp_e), Wh((size_t) E * wh_e);
+    std::vector<float> WS((size_t) E * M);
+    std::vector<float> X((size_t) N * K);
+    std::mt19937 grng(20261125);
+    for (auto& v : Wp) v = (uint8_t) (grng() & 0xFF);
+    for (auto& v : Wh) v = (uint8_t) (grng() & 0xFF);
+    for (auto& v : WS) v = std::uniform_real_distribution<float>(-2.f, 2.f)(grng);
+    for (auto& v : X) v = frand(2.f);
+    uint8_t *dWp = dev(Wp), *dWh = dev(Wh);
+    float *dWS = dev(WS), *dX = dev(X);
+    const int Npad = ((N + 255) / 256) * 256;
+    const size_t plane = (size_t) Npad * K / 2;
+    uint8_t* dx4 = dev_n<uint8_t>(2 * plane);
+    uint8_t* dxm = dev_n<uint8_t>((size_t) (Npad / 16) * (K / 256) * 16);
+    float* dxr = dev_n<float>(Npad);
+    float* dG = dev_n<float>((size_t) N * M);
+    k::int4_rot_pack8(dX, N, K, dx4, dxm, dxr, 0);
+    const int eid[N] = {0, 1, 2, 3, 0, 1, 2, 3};
+    int* dRowE = dev(std::vector<int>(eid, eid + N));
+    k::int4_gemm8_moe_masked(dWp, dWh, dWS, wp_e, wh_e, M, E, dRowE, M, K,
+                             dx4, dxm, dxr, N, gw, 8, dG, nullptr, sh, 0);
+    std::vector<float> got = host(dG, (size_t) N * M), want((size_t) N * M);
+    // Reference: pack each row as N=1, exactly like run_prefill_moe's per-expert
+    // gather+pack+GEMM. Offsetting into the shared N=8 packed buffer is NOT
+    // equivalent: k_rot_pack8 interleaves token rows as tt=n>>4, tl=n&15.
+    float* dOne = dev_n<float>(M);
+    float* dXrow = dev_n<float>(K);
+    uint8_t* dx4row = dev_n<uint8_t>(2 * plane);
+    uint8_t* dxmrow = dev_n<uint8_t>((size_t) (Npad / 16) * (K / 256) * 16);
+    float* dxrrow = dev_n<float>(Npad);
+    for (int r = 0; r < N; ++r) {
+        std::vector<float> xrow(X.begin() + (size_t) r * K, X.begin() + (size_t) (r + 1) * K);
+        CU(cudaMemcpy(dXrow, xrow.data(), K * sizeof(float), cudaMemcpyHostToDevice));
+        k::int4_rot_pack8(dXrow, 1, K, dx4row, dxmrow, dxrrow, 0);
+        k::int4_gemm8(dWp + (size_t) eid[r] * wp_e, dWh + (size_t) eid[r] * wh_e,
+                      dWS + (size_t) eid[r] * M, M, K, dx4row,
+                      dxmrow, dxrrow, 1, gw, 8, dOne, nullptr, sh, 0);
+        std::vector<float> one = host(dOne, M);
+        std::copy(one.begin(), one.end(), want.begin() + (size_t) r * M);
+    }
+    expect_exact("int4_gemm8_moe_masked vs N=1 per expert", got, want);
+    for (float* p : {dX, dWS, dG, dOne, dxr, dXrow, dxrrow}) cudaFree(p);
+    for (uint8_t* p : {dWp, dWh, dx4, dxm, dx4row, dxmrow}) cudaFree(p);
+    cudaFree(dRowE);
+}
 #else
 void test_int4() { std::printf("skip int4 (no WMMA)\n"); }
 void test_int4_real() { std::printf("skip int4_real (no WMMA)\n"); }
+void test_int4_gemm8_grouped_exact() { std::printf("skip int4_gemm8_grouped_exact (no WMMA)\n"); }
 #endif
 
 #if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
@@ -2879,6 +2951,255 @@ void bench_int4() {
 }
 #endif
 
+// True batched decode attention: n_rows queries on different KV caches in one launch must match
+// attn_decode_int_at run one row at a time (bit-identical: same attn_flash_range_int math, same combine).
+void test_batch_rows() {
+    const int H = 24, KV = 8, D = 128, d_rel = 16;
+    const int BITS = 4, cb = D / 2, ctx = 600;
+    const int n_rows = 4;
+    const float scale = 1.0f / std::sqrt((float) D);
+    const int P = 32;
+    auto q = fvec((size_t) n_rows * H * D, 3.0f), r = fvec((size_t) n_rows * H * d_rel, 2.0f),
+         sink = fvec((size_t) n_rows * H, 3.0f), proj = fvec((size_t) 1024 * d_rel);
+    float *dq = dev(q), *dr = dev(r), *ds = dev(sink), *dp = dev(proj);
+    std::vector<int> pos_h;
+    for (int i = 0; i < n_rows; ++i) pos_h.push_back(200 + i * 37);
+    int* dpos = dev(pos_h);
+    // Each row has its own K/V cache (a distinct slot).
+    std::vector<uint8_t> hkc((size_t) n_rows * ctx * KV * cb), hvc((size_t) n_rows * ctx * KV * cb);
+    std::vector<uint16_t> hks((size_t) n_rows * ctx * KV), hvs((size_t) n_rows * ctx * KV);
+    for (size_t i = 0; i < hkc.size(); ++i) hkc[i] = (uint8_t) (rng() & 0xFFu);
+    for (size_t i = 0; i < hvc.size(); ++i) hvc[i] = (uint8_t) (rng() & 0xFFu);
+    for (size_t i = 0; i < hks.size(); ++i) {
+        hks[i] = f2h_host(frand(0.5f));
+        hvs[i] = f2h_host(frand(0.5f));
+    }
+    uint8_t *dkc = dev(hkc), *dvc = dev(hvc);
+    uint16_t *dks = dev(hks), *dvs = dev(hvs);
+    // Pointer tables: row i -> its own slot's K/V/scale buffers.
+    std::vector<const uint8_t*> tkc(n_rows), tvc(n_rows);
+    std::vector<const uint16_t*> tks(n_rows), tvs(n_rows);
+    for (int i = 0; i < n_rows; ++i) {
+        const size_t off = (size_t) i * ctx * KV * cb;
+        tkc[i] = dkc + off; tvc[i] = dvc + off;
+        const size_t soff = (size_t) i * ctx * KV;
+        tks[i] = dks + soff; tvs[i] = dvs + soff;
+    }
+    const uint8_t** dtkc = dev(tkc); const uint8_t** dtvc = dev(tvc);
+    const uint16_t** dtks = dev(tks); const uint16_t** dtvs = dev(tvs);
+    float* scratch = dev_n<float>((size_t) n_rows * H * P * 130);
+    float* out_batch = dev_n<float>((size_t) n_rows * H * D);
+    k::attn_decode_int_rows(BITS, dq, dr, ds, dtkc, dtvc, dtks, dtvs, ctx, H, KV, dpos, P, scale, dp, d_rel,
+                            1024, 1 << 30, n_rows, scratch, out_batch, 0, nullptr, 0);
+    std::vector<double> want((size_t) n_rows * H * D);
+    float* one = dev_n<float>((size_t) H * D);
+    float* scratch1 = dev_n<float>((size_t) H * P * 130);
+    for (int i = 0; i < n_rows; ++i) {
+        k::attn_decode_int_at(BITS, dq + (size_t) i * H * D, dr + (size_t) i * H * d_rel, ds + (size_t) i * H,
+                              tkc[i], tvc[i], tks[i], tvs[i], ctx, H, KV, dpos + i, P, scale, dp, d_rel, 1024,
+                              1 << 30, scratch1, one, 0, nullptr);
+        const auto o1 = host(one, (size_t) H * D);
+        for (size_t j = 0; j < o1.size(); ++j) want[(size_t) i * H * D + j] = o1[j];
+    }
+    expect("attn_decode_int_rows (4 slots vs serial)", host(out_batch, want.size()), want, 1e-6, 0.0);
+    for (float* p : {dq, dr, ds, dp, scratch, out_batch, one, scratch1}) cudaFree(p);
+    for (uint8_t* p : {dkc, dvc}) cudaFree(p);
+    for (uint16_t* p : {dks, dvs}) cudaFree(p);
+    cudaFree(dtkc); cudaFree(dtvc); cudaFree(dtks); cudaFree(dtvs); cudaFree(dpos);
+}
+
+void test_batch_rows_gqa() {
+    const int H = 24, KV = 8, D = 128, d_rel = 16;   // H / KV = 3 (R = 3)
+    const int BITS = 4, cb = D / 2, ctx = 600;
+    const int n_rows = 4;
+    const float scale = 1.0f / std::sqrt((float) D);
+    const int P = 32;
+    auto q = fvec((size_t) n_rows * H * D, 3.0f), r = fvec((size_t) n_rows * H * d_rel, 2.0f),
+         sink = fvec((size_t) n_rows * H, 3.0f), proj = fvec((size_t) 1024 * d_rel);
+    float *dq = dev(q), *dr = dev(r), *ds = dev(sink), *dp = dev(proj);
+    std::vector<int> pos_h;
+    for (int i = 0; i < n_rows; ++i) pos_h.push_back(200 + i * 37);
+    int* dpos = dev(pos_h);
+    std::vector<uint8_t> hkc((size_t) n_rows * ctx * KV * cb), hvc((size_t) n_rows * ctx * KV * cb);
+    std::vector<uint16_t> hks((size_t) n_rows * ctx * KV), hvs((size_t) n_rows * ctx * KV);
+    for (size_t i = 0; i < hkc.size(); ++i) hkc[i] = (uint8_t) (rng() & 0xFFu);
+    for (size_t i = 0; i < hvc.size(); ++i) hvc[i] = (uint8_t) (rng() & 0xFFu);
+    for (size_t i = 0; i < hks.size(); ++i) { hks[i] = f2h_host(frand(0.5f)); hvs[i] = f2h_host(frand(0.5f)); }
+    uint8_t *dkc = dev(hkc), *dvc = dev(hvc);
+    uint16_t *dks = dev(hks), *dvs = dev(hvs);
+    std::vector<const uint8_t*> tkc(n_rows), tvc(n_rows);
+    std::vector<const uint16_t*> tks(n_rows), tvs(n_rows);
+    for (int i = 0; i < n_rows; ++i) {
+        const size_t off = (size_t) i * ctx * KV * cb;
+        tkc[i] = dkc + off; tvc[i] = dvc + off;
+        const size_t soff = (size_t) i * ctx * KV;
+        tks[i] = dks + soff; tvs[i] = dvs + soff;
+    }
+    const uint8_t** dtkc = dev(tkc); const uint8_t** dtvc = dev(tvc);
+    const uint16_t** dtks = dev(tks); const uint16_t** dtvs = dev(tvs);
+    float* scratch = dev_n<float>((size_t) n_rows * H * P * 130);
+    float* out_batch = dev_n<float>((size_t) n_rows * H * D);
+    k::attn_decode_int_rows_gqa(BITS, dq, dr, ds, dtkc, dtvc, dtks, dtvs, ctx, H, KV, dpos, P, scale, dp, d_rel,
+                                1024, 1 << 30, n_rows, scratch, out_batch, 0, nullptr, 0);
+    std::vector<double> want((size_t) n_rows * H * D);
+    float* one = dev_n<float>((size_t) H * D);
+    float* scratch1 = dev_n<float>((size_t) H * P * 130);
+    for (int i = 0; i < n_rows; ++i) {
+        k::attn_decode_int_at_gqa(BITS, dq + (size_t) i * H * D, dr + (size_t) i * H * d_rel, ds + (size_t) i * H,
+                                  tkc[i], tvc[i], tks[i], tvs[i], ctx, H, KV, dpos + i, P, scale, dp, d_rel, 1024,
+                                  1 << 30, scratch1, one, 0, nullptr, 0);
+        const auto o1 = host(one, (size_t) H * D);
+        for (size_t j = 0; j < o1.size(); ++j) want[(size_t) i * H * D + j] = o1[j];
+    }
+    expect("attn_decode_int_rows_gqa (4 slots vs serial gqa)", host(out_batch, want.size()), want, 1e-6, 0.0);
+    for (float* p : {dq, dr, ds, dp, scratch, out_batch, one, scratch1}) cudaFree(p);
+    for (uint8_t* p : {dkc, dvc}) cudaFree(p);
+    for (uint16_t* p : {dks, dvs}) cudaFree(p);
+    cudaFree(dtkc); cudaFree(dtvc); cudaFree(dtks); cudaFree(dtvs); cudaFree(dpos);
+}
+
+// True batched write path: four rows on four distinct INT4 K/V caches must match four scalar
+// k::prep_qkv_r_int calls (one row each, pos0 == that row's device pos), byte for byte.
+void test_batch_prep_rows() {
+    const int BITS = 4, T = 4, H = 4, KV = 2, D = 128, d_rel = 16, kv_cap = 64;
+    const int cb = D / 2, n_rows = T;
+    const float qk_clip = 1.5f, rel_clip = 1.25f, eps = 1e-6f, alpha = 0.15f, n_floor = 8.0f;
+    auto qh = fvec((size_t) T * H * D, 2.0f), kh = fvec((size_t) T * KV * D, 1.5f),
+         vh = fvec((size_t) T * KV * D, 1.5f), rh = fvec((size_t) T * H * d_rel, 1.0f);
+    auto qclip_h = fvec((size_t) H * D, 1.0f), rclip_h = fvec((size_t) H * d_rel, 1.0f);
+    std::vector<int> pos_h;
+    for (int i = 0; i < n_rows; ++i) pos_h.push_back((int) ((3u + (unsigned) i * 17u + (rng() & 7u)) % kv_cap));
+    int* dpos = dev(pos_h);
+
+    const size_t row_bytes = (size_t) kv_cap * KV * cb, row_scales = (size_t) kv_cap * KV;
+    std::vector<uint8_t> kc0((size_t) n_rows * row_bytes), vc0((size_t) n_rows * row_bytes);
+    std::vector<uint16_t> ks0((size_t) n_rows * row_scales), vs0((size_t) n_rows * row_scales);
+    for (size_t i = 0; i < kc0.size(); ++i) kc0[i] = vc0[i] = (uint8_t) (rng() & 0xFFu);
+    for (size_t i = 0; i < ks0.size(); ++i) ks0[i] = vs0[i] = (uint16_t) (0x3C00u | (rng() & 0x3FFu));
+    std::vector<uint8_t> kc_b = kc0, vc_b = vc0, kc_s = kc0, vc_s = vc0;
+    std::vector<uint16_t> ks_b = ks0, vs_b = vs0, ks_s = ks0, vs_s = vs0;
+    uint8_t *dkc_b = dev(kc_b), *dvc_b = dev(vc_b), *dkc_s = dev(kc_s), *dvc_s = dev(vc_s);
+    uint16_t *dks_b = dev(ks_b), *dvs_b = dev(vs_b), *dks_s = dev(ks_s), *dvs_s = dev(vs_s);
+    std::vector<uint8_t*> tkc_b(n_rows), tvc_b(n_rows), tkc_s(n_rows), tvc_s(n_rows);
+    std::vector<uint16_t*> tks_b(n_rows), tvs_b(n_rows), tks_s(n_rows), tvs_s(n_rows);
+    for (int i = 0; i < n_rows; ++i) {
+        tkc_b[i] = dkc_b + (size_t) i * row_bytes;
+        tvc_b[i] = dvc_b + (size_t) i * row_bytes;
+        tks_b[i] = dks_b + (size_t) i * row_scales;
+        tvs_b[i] = dvs_b + (size_t) i * row_scales;
+        tkc_s[i] = dkc_s + (size_t) i * row_bytes;
+        tvc_s[i] = dvc_s + (size_t) i * row_bytes;
+        tks_s[i] = dks_s + (size_t) i * row_scales;
+        tvs_s[i] = dvs_s + (size_t) i * row_scales;
+    }
+    uint8_t **dtkc_b = dev(tkc_b), **dtvc_b = dev(tvc_b), **dtkc_s = dev(tkc_s), **dtvc_s = dev(tvc_s);
+    uint16_t **dtks_b = dev(tks_b), **dtvs_b = dev(tvs_b), **dtks_s = dev(tks_s), **dtvs_s = dev(tvs_s);
+
+    float *dq_b = dev(qh), *dk_b = dev(kh), *dv_b = dev(vh), *dr_b = dev(rh);
+    float *dq_s = dev(qh), *dk_s = dev(kh), *dv_s = dev(vh), *dr_s = dev(rh);
+    float *dqclip = dev(qclip_h), *drclip = dev(rclip_h);
+    k::prep_qkv_r_int_rows(BITS, dq_b, dqclip, dk_b, dtkc_b, dtks_b, dv_b, dtvc_b, dtvs_b, dr_b, drclip, T, H, KV,
+                           D, d_rel, qk_clip, rel_clip, eps, dpos, alpha, n_floor, kv_cap, nullptr, nullptr,
+                           nullptr, 0, nullptr, 0, dpos);
+    for (int i = 0; i < n_rows; ++i) {
+        const size_t qoff = (size_t) i * H * D, roff = (size_t) i * H * d_rel, kvoff = (size_t) i * KV * D;
+        k::prep_qkv_r_int(BITS, dq_s + qoff, dqclip, dk_s + kvoff, tkc_s[i], tks_s[i], dv_s + kvoff, tvc_s[i],
+                          tvs_s[i], dr_s + roff, drclip, 1, H, KV, D, d_rel, qk_clip, rel_clip, eps, dpos + i,
+                          alpha, n_floor, pos_h[i], kv_cap, 0);
+    }
+    expect_exact("prep_qkv_r_int_rows K codes", host(dkc_b, kc_b.size()), host(dkc_s, kc_s.size()));
+    expect_exact("prep_qkv_r_int_rows K scales", host(dks_b, ks_b.size()), host(dks_s, ks_s.size()));
+    expect_exact("prep_qkv_r_int_rows V codes", host(dvc_b, vc_b.size()), host(dvc_s, vc_s.size()));
+    expect_exact("prep_qkv_r_int_rows V scales", host(dvs_b, vs_b.size()), host(dvs_s, vs_s.size()));
+    expect_exact("prep_qkv_r_int_rows q", host(dq_b, qh.size()), host(dq_s, qh.size()));
+    expect_exact("prep_qkv_r_int_rows r", host(dr_b, rh.size()), host(dr_s, rh.size()));
+
+    // Sliding-layer variant: KV slots still come from dpos, while tau_pos=null gives tau=1 and must match the
+    // scalar kernel called with a null tau pos.
+    auto reset_prep = [&]() {
+        CU(cudaMemcpy(dkc_b, kc_b.data(), kc_b.size(), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dvc_b, vc_b.data(), vc_b.size(), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dks_b, ks_b.data(), ks_b.size(), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dvs_b, vs_b.data(), vs_b.size(), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dkc_s, kc_b.data(), kc_b.size(), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dvc_s, vc_b.data(), vc_b.size(), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dks_s, ks_b.data(), ks_b.size(), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dvs_s, vs_b.data(), vs_b.size(), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dq_b, qh.data(), qh.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dr_b, rh.data(), rh.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dq_s, qh.data(), qh.size() * sizeof(float), cudaMemcpyHostToDevice));
+        CU(cudaMemcpy(dr_s, rh.data(), rh.size() * sizeof(float), cudaMemcpyHostToDevice));
+    };
+    reset_prep();
+    k::prep_qkv_r_int_rows(BITS, dq_b, dqclip, dk_b, dtkc_b, dtks_b, dv_b, dtvc_b, dtvs_b, dr_b, drclip, T, H, KV,
+                           D, d_rel, qk_clip, rel_clip, eps, dpos, alpha, n_floor, kv_cap, nullptr, nullptr,
+                           nullptr, 0, nullptr, nullptr);
+    for (int i = 0; i < n_rows; ++i) {
+        const size_t qoff = (size_t) i * H * D, roff = (size_t) i * H * d_rel, kvoff = (size_t) i * KV * D;
+        k::prep_qkv_r_int(BITS, dq_s + qoff, dqclip, dk_s + kvoff, tkc_s[i], tks_s[i], dv_s + kvoff, tvc_s[i],
+                          tvs_s[i], dr_s + roff, drclip, 1, H, KV, D, d_rel, qk_clip, rel_clip, eps, nullptr,
+                          alpha, n_floor, pos_h[i], kv_cap, 0);
+    }
+    expect_exact("prep_qkv_r_int_rows null-tau K codes", host(dkc_b, kc_b.size()), host(dkc_s, kc_s.size()));
+    expect_exact("prep_qkv_r_int_rows null-tau K scales", host(dks_b, ks_b.size()), host(dks_s, ks_s.size()));
+    expect_exact("prep_qkv_r_int_rows null-tau V codes", host(dvc_b, vc_b.size()), host(dvc_s, vc_s.size()));
+    expect_exact("prep_qkv_r_int_rows null-tau V scales", host(dvs_b, vs_b.size()), host(dvs_s, vs_s.size()));
+    expect_exact("prep_qkv_r_int_rows null-tau q", host(dq_b, qh.size()), host(dq_s, qh.size()));
+    expect_exact("prep_qkv_r_int_rows null-tau r", host(dr_b, rh.size()), host(dr_s, rh.size()));
+
+    for (float* p : {dq_b, dk_b, dv_b, dr_b, dq_s, dk_s, dv_s, dr_s, dqclip, drclip}) cudaFree(p);
+    for (uint8_t* p : {dkc_b, dvc_b, dkc_s, dvc_s}) cudaFree(p);
+    for (uint16_t* p : {dks_b, dvs_b, dks_s, dvs_s}) cudaFree(p);
+    for (auto* p : {dtkc_b, dtvc_b, dtkc_s, dtvc_s}) cudaFree(p);
+    for (auto* p : {dtks_b, dtvs_b, dtks_s, dtvs_s}) cudaFree(p);
+    cudaFree(dpos);
+}
+
+// Batched conv: every row has its own 3-tap history.  Both the short fused path and the long tiled+fixup path
+// must match one scalar k::conv4_res call per row (with and without dynamic taps), bit for bit.
+void test_batch_conv_rows() {
+    const int n_rows = 4, heads = 8, C = 256;
+    for (int with_dyn = 0; with_dyn < 2; ++with_dyn) {
+        for (int T : {8, 40}) {
+            auto xh = fvec((size_t) n_rows * T * C, 1.0f), resh = fvec((size_t) n_rows * T * C, 0.5f);
+            auto wh = fvec((size_t) C * 4, 0.2f), dynh = fvec((size_t) T * heads * 4, 0.1f);
+            std::vector<float> hist0((size_t) 3 * C);
+            for (auto& v : hist0) v = frand(0.5f);
+            float *dx_b = dev(xh), *dres_b = dev(resh), *dy_b = dev_n<float>(xh.size());
+            float *dx_s = dev(xh), *dres_s = dev(resh), *dy_s = dev_n<float>(xh.size());
+            float *dw = dev(wh), *dd = dev(dynh);
+            const float* dyn_ptr = with_dyn ? dd : nullptr;
+            std::vector<float*> hist_tab(n_rows), hist_s(n_rows);
+            for (int i = 0; i < n_rows; ++i) {
+                hist_tab[i] = dev(hist0);
+                hist_s[i] = dev(hist0);
+            }
+            float** dhist_tab = dev(hist_tab);
+            k::conv4_res_rows(dx_b, dhist_tab, dw, dyn_ptr, heads, T, C, dres_b, dy_b, n_rows, 0);
+            for (int i = 0; i < n_rows; ++i) {
+                const size_t off = (size_t) i * T * C;
+                k::conv4_res(dx_s + off, hist_s[i], dw, dyn_ptr, heads, T, C, dres_s + off, dy_s + off, 0);
+            }
+            char name[80];
+            std::snprintf(name, sizeof name, "conv4_res_rows y T=%d dyn=%d", T, with_dyn);
+            expect_exact(name, host(dy_b, xh.size()), host(dy_s, xh.size()));
+            std::vector<float> hb, hs;
+            for (int i = 0; i < n_rows; ++i) {
+                const auto h1 = host(hist_tab[i], (size_t) 3 * C), h2 = host(hist_s[i], (size_t) 3 * C);
+                hb.insert(hb.end(), h1.begin(), h1.end());
+                hs.insert(hs.end(), h2.begin(), h2.end());
+            }
+            std::snprintf(name, sizeof name, "conv4_res_rows hist T=%d dyn=%d", T, with_dyn);
+            expect_exact(name, hb, hs);
+
+            for (float* p : {dx_b, dres_b, dy_b, dx_s, dres_s, dy_s, dw, dd}) cudaFree(p);
+            for (float* p : hist_tab) cudaFree(p);
+            for (float* p : hist_s) cudaFree(p);
+            cudaFree(dhist_tab);
+        }
+    }
+}
+
 int main() {
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
@@ -2911,6 +3232,11 @@ int main() {
     test_experts_mma();
     test_int4();
     test_int4_real();
+    test_int4_gemm8_grouped_exact();
+    test_batch_rows();
+    test_batch_rows_gqa();
+    test_batch_prep_rows();
+    test_batch_conv_rows();
 #if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
     bench_int4();
 #endif

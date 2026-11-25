@@ -558,6 +558,99 @@ __global__ void conv4_hist_kernel(const float* x, float* hist, int T, int C) {
     }
 }
 
+// True batched conv: grid.z is the row.  hist_tab[row] is that row's own [3][C] history (oldest first), x / y /
+// residual are [n_rows][T][C], and dyn (when given) is shared [T][heads * 4].  The per-thread loop is copied from
+// conv4_fused_kernel / conv4_tiled_kernel, so each row is bit-identical to one scalar conv4_res call.
+__global__ void conv4_fused_rows_kernel(const float* x, float* const* hist_tab, const float* w, const float* dyn,
+                                        int heads, int T, int C, const float* residual, float* y) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const int row = blockIdx.z;
+    const size_t row_off = (size_t) row * T * C;
+    const float* xr = x + row_off;
+    float* yr = y + row_off;
+    const float* resr = residual ? residual + row_off : nullptr;
+    float* hist = hist_tab[row];
+    float h0 = hist[c], h1 = hist[(size_t) C + c], h2 = hist[(size_t) 2 * C + c];
+    const float* wc = w + (size_t) c * 4;
+    const float w0 = wc[0], w1 = wc[1], w2 = wc[2], w3 = wc[3];
+    const float* dc_base = nullptr;
+    int d_stride = 0;
+    if (dyn) {
+        const int head = c / (C / heads);
+        dc_base = dyn + (size_t) head * 4;
+        d_stride = heads * 4;
+    }
+    for (int t = 0; t < T; ++t) {
+        const size_t tc = (size_t) t * C + c;
+        const float x_new = xr[tc];
+        float a = w0 * h0 + w1 * h1 + w2 * h2 + w3 * x_new;
+        if (dc_base) {
+            const float* dc = dc_base + (size_t) t * d_stride;
+            a += dc[0] * x_new + dc[1] * h2 + dc[2] * h1 + dc[3] * h0;
+        }
+        if (resr) a += resr[tc];
+        yr[tc] = a;
+        h0 = h1;
+        h1 = h2;
+        h2 = x_new;
+    }
+    hist[c] = h0;
+    hist[(size_t) C + c] = h1;
+    hist[(size_t) 2 * C + c] = h2;
+}
+
+__global__ void conv4_tiled_rows_kernel(const float* x, float* const* hist_tab, const float* w, const float* dyn,
+                                        int heads, int T, int C, const float* residual, float* y) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const int row = blockIdx.z;
+    const size_t row_off = (size_t) row * T * C;
+    const float* xr = x + row_off;
+    float* yr = y + row_off;
+    const float* resr = residual ? residual + row_off : nullptr;
+    float* hist = hist_tab[row];
+    const int t0 = blockIdx.y * kConvTileT;
+    const int t1 = min(T, t0 + kConvTileT);
+    auto xp_at = [&](int r) -> float { return r < 3 ? hist[(size_t) r * C + c] : xr[(size_t) (r - 3) * C + c]; };
+    float h0 = xp_at(t0), h1 = xp_at(t0 + 1), h2 = xp_at(t0 + 2);
+    const float* wc = w + (size_t) c * 4;
+    const float w0 = wc[0], w1 = wc[1], w2 = wc[2], w3 = wc[3];
+    const float* dc_base = nullptr;
+    int d_stride = 0;
+    if (dyn) {
+        const int head = c / (C / heads);
+        dc_base = dyn + (size_t) head * 4;
+        d_stride = heads * 4;
+    }
+    for (int t = t0; t < t1; ++t) {
+        const size_t tc = (size_t) t * C + c;
+        const float x_new = xr[tc];
+        float a = w0 * h0 + w1 * h1 + w2 * h2 + w3 * x_new;
+        if (dc_base) {
+            const float* dc = dc_base + (size_t) t * d_stride;
+            a += dc[0] * x_new + dc[1] * h2 + dc[2] * h1 + dc[3] * h0;
+        }
+        if (resr) a += resr[tc];
+        yr[tc] = a;
+        h0 = h1;
+        h1 = h2;
+        h2 = x_new;
+    }
+}
+
+__global__ void conv4_hist_rows_kernel(const float* x, float* const* hist_tab, int T, int C) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const int row = blockIdx.z;
+    const float* xr = x + (size_t) row * T * C;
+    float* hist = hist_tab[row];
+    for (int j = 0; j < 3; ++j) {   // (row T + j of xp; in place: it reads rows past the ones written)
+        const int r = T + j;
+        hist[(size_t) j * C + c] = r < 3 ? hist[(size_t) r * C + c] : xr[(size_t) (r - 3) * C + c];
+    }
+}
+
 template <int NUM_WARPS>
 __device__ __forceinline__ void attn_res_warp0_softmax(float sh_red[][kResMax * 4], float sc[3][kResMax], int n, int nq,
                                                        int C, float res_eps, int lane) {
@@ -5055,6 +5148,30 @@ void conv4(const float* x, float* hist, const float* w, const float* dyn, int he
     conv4_res(x, hist, w, dyn, heads, T, C, nullptr, y, s);
 }
 
+// Batched hosts: one launch per T regime (two for T > kConvFusedMaxT, where the scalar path also needs the
+// separate history-fixup launch).  hist_tab is a DEVICE array of n_rows history pointers, each [3][C] floats.
+void conv4_res_rows(const float* x, float* const* hist_tab, const float* w, const float* dyn, int heads, int T,
+                    int C, const float* residual, float* y, int n_rows, cudaStream_t s) {
+    if (T <= 0 || n_rows <= 0) return;
+    if (T <= kConvFusedMaxT) {
+        const dim3 g((unsigned) ((C + 127) / 128), 1, (unsigned) n_rows);
+        conv4_fused_rows_kernel<<<g, 128, 0, s>>>(x, hist_tab, w, dyn, heads, T, C, residual, y);
+        check("conv4_res_rows");
+        return;
+    }
+    const dim3 g((unsigned) ((C + 127) / 128), (unsigned) ((T + kConvTileT - 1) / kConvTileT), (unsigned) n_rows);
+    conv4_tiled_rows_kernel<<<g, 128, 0, s>>>(x, hist_tab, w, dyn, heads, T, C, residual, y);
+    check("conv4_res_rows");
+    const dim3 gh(grid(C), 1, (unsigned) n_rows);
+    conv4_hist_rows_kernel<<<gh, kBlk, 0, s>>>(x, hist_tab, T, C);
+    check("conv4_hist_rows");
+}
+
+void conv4_rows(const float* x, float* const* hist_tab, const float* w, const float* dyn, int heads, int T, int C,
+                float* y, int n_rows, cudaStream_t s) {
+    conv4_res_rows(x, hist_tab, w, dyn, heads, T, C, nullptr, y, n_rows, s);
+}
+
 template <bool FUSED_RMS>
 void launch_attn_res(const ResStates& states, int n, const float* q, int nq, int T, int C, float res_eps, float rms_eps,
                      float* out, const RmsOuts& outs, cudaStream_t s, int jobs = 1) {
@@ -6710,6 +6827,61 @@ __global__ void prep_qkv_r_int_kernel(float* q, const float* q_clip, const float
     }
 }
 
+// True batched write counterpart: the t-th row writes its K/V into the t-th cache through the device pointer
+// tables, at slot pos[t] (mod kv_cap when given).  q / r / the sink tail keep prep_qkv_r_int_kernel's math, so
+// a batch of one row with pos[0] == pos0 is bit-identical to the scalar kernel.  K/V caches are mutable through
+// the table, hence the const_cast on the table's const pointee type.
+template <int BITS>
+__global__ void prep_qkv_r_int_rows_kernel(float* q, const float* q_clip, const float* k_in,
+                                           const uint8_t* const* kci_tab, const uint16_t* const* ks_tab,
+                                           const float* v_in, const uint8_t* const* vci_tab,
+                                           const uint16_t* const* vs_tab, float* r, const float* r_clip, int T,
+                                           int H, int KVh, int D, int d_rel, float qk_clip, float rel_clip, float eps,
+                                           const int* pos, float alpha, float n_floor, int kv_cap, uint16_t* q16,
+                                           const uint16_t* sink_w, const float* sink_x, int sink_k, float* sink_y,
+                                           const int* tau_pos) {
+    const int gid = blockIdx.x;
+    const int per_tok = 2 * H + 2 * KVh;
+    if (gid >= T * per_tok) {
+        const int h = gid - T * per_tok, lane = threadIdx.x;
+        if (!sink_w || h >= H) return;
+        const uint16_t* w = sink_w + (size_t) h * sink_k;
+        float a = 0.0f;
+        for (int i = lane; i < sink_k; i += 32) a += h2f(w[i]) * sink_x[i];
+        a = wsum(a);
+        if (lane == 0) sink_y[h] = a;
+        return;
+    }
+    const int t = gid / per_tok, rem = gid % per_tok;
+    const int pt = pos[t];
+    const float tau = tau_pos ? (1.0f + alpha * logf(fmaxf(1.0f, ((float) tau_pos[t] + 1.0f) / n_floor))) : 1.0f;
+    const int cb = (BITS == 8) ? D : D / 2;
+    if (rem < H) {
+        const int h = rem;
+        float* qp = q + ((size_t) t * H + h) * D;
+        l2clip_warp(qp, q_clip ? q_clip + (size_t) h * D : nullptr, qp,
+                    q16 ? q16 + ((size_t) t * H + h) * D : nullptr, D, qk_clip, tau);
+    } else if (rem < H + KVh) {
+        const int kv = rem - H;
+        const int slot = kv_cap > 0 ? pt % kv_cap : pt;
+        uint8_t* kci = const_cast<uint8_t*>(kci_tab[t]);
+        uint16_t* ks = const_cast<uint16_t*>(ks_tab[t]);
+        const float* kp = k_in + ((size_t) t * KVh + kv) * D;
+        store_k_int_warp<BITS>(kp, kci + ((size_t) slot * KVh + kv) * cb, ks + (size_t) slot * KVh + kv, D, qk_clip);
+    } else if (rem < H + 2 * KVh) {
+        const int kv = rem - H - KVh;
+        const int slot = kv_cap > 0 ? pt % kv_cap : pt;
+        uint8_t* vci = const_cast<uint8_t*>(vci_tab[t]);
+        uint16_t* vs = const_cast<uint16_t*>(vs_tab[t]);
+        const float* vp = v_in + ((size_t) t * KVh + kv) * D;
+        store_v_int_warp<BITS>(vp, vci + ((size_t) slot * KVh + kv) * cb, vs + (size_t) slot * KVh + kv, D, eps);
+    } else {
+        const int h = rem - H - 2 * KVh;
+        float* rp = r + ((size_t) t * H + h) * d_rel;
+        l2clip_warp(rp, r_clip ? r_clip + (size_t) h * d_rel : nullptr, rp, nullptr, d_rel, rel_clip, tau);
+    }
+}
+
 // int dequant load: lane's 4 codes * the row's FP16 scale -> float4 (the int counterpart of v_load4).
 template <int BITS>
 __device__ __forceinline__ float4 v_load4_int(const uint8_t* vr, int lane, float scale) {
@@ -6952,7 +7124,109 @@ __global__ void attn_split_int_kernel(const float* q, const float* r, const uint
     pp[2 + tid] = o;
 }
 
-// IK2_ATTN_GQA (opt-in): GQA-shared counterpart of attn_split_int_kernel.  One CTA of grid (Hkv, P, nq) serves
+// ---- True batched (vLLM-style) decode attention.  One kernel advances n_rows queries that may belong to
+// DIFFERENT slots; each row qi reads its own K/V cache through a device pointer table (kci_tab[qi] etc.) and
+// its own position pos[qi].  The math inside attn_flash_range_int is byte-for-byte the single-token path, so a
+// batch of one row is bit-identical to attn_split_int_kernel.  Partials use the same [qi,H,P,130] layout, so
+// attn_combine_gate_kernel is reused unchanged (grid.y = n_rows).  Gated by IK2_BATCH_ATTN, default off.
+template <int BITS, int DPP = 0>
+__global__ void attn_split_int_rows_kernel(const float* q, const float* r, const uint8_t* const* kci_tab,
+                                           const uint8_t* const* vci_tab, const uint16_t* const* ks_tab,
+                                           const uint16_t* const* vs_tab, int kv_cap, int H, int Hkv,
+                                           float qk_scale, const float* proj, int d_rel, int extent, int window,
+                                           float* part, const int* pos) {
+    __shared__ float sm_m[4], sm_s[4];
+    __shared__ __align__(16) float sm_o[4][128];
+    const int h = blockIdx.x, p = blockIdx.y, P = gridDim.y, qi = blockIdx.z, g = h / (H / Hkv), tid = threadIdx.x;
+    const int qpos = pos[qi];
+    const int k0 = window < (1 << 30) ? max(0, qpos - window + 1) : 0;
+    const int nk = qpos + 1 - k0;                 // one next-token query per row
+    const int len = (nk + P - 1) / P, j0 = p * len, j1 = min(nk, j0 + len);
+    const float* qh = q + ((size_t) qi * H + h) * 128;
+    const float* rh = r + ((size_t) qi * H + h) * d_rel;
+    attn_flash_range_int<BITS, DPP>(qh, rh, kci_tab[qi], vci_tab[qi], ks_tab[qi], vs_tab[qi], Hkv, g, kv_cap, k0,
+                                    j0, j1, qpos, qk_scale, proj, d_rel, extent, window, sm_m, sm_s, sm_o);
+    const float M = fmaxf(fmaxf(sm_m[0], sm_m[1]), fmaxf(sm_m[2], sm_m[3]));
+    float sum = 0.0f, o = 0.0f;
+    if (M > -INFINITY) {
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            if (sm_m[w] == -INFINITY) continue;
+            const float f = expf(sm_m[w] - M);
+            sum += sm_s[w] * f;
+            o += sm_o[w][tid] * f;
+        }
+    }
+    float* pp = part + (((size_t) qi * H + h) * P + p) * 130;
+    if (tid == 0) pp[0] = M, pp[1] = sum;
+    pp[2 + tid] = o;
+}
+
+// Host launcher for the batched rows kernel.  kci_tab/vci_tab/ks_tab/vs_tab are DEVICE arrays of n_rows pointers
+// (each pointing at that row's slot KV buffer); pos is a DEVICE int array of n_rows positions.  out/gate/scratch
+// are [n_rows,H,*].  When n_rows == 1 this is bit-identical to attn_decode_int_at.
+void attn_decode_int_rows(int bits, const float* q, const float* r, const float* sink,
+                          const uint8_t* const* kci_tab, const uint8_t* const* vci_tab,
+                          const uint16_t* const* ks_tab, const uint16_t* const* vs_tab,
+                          int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, const float* proj,
+                          int d_rel, int extent, int window, int n_rows, float* scratch, float* out,
+                          cudaStream_t s, const float* gate, int dpp) {
+    if (bits != 8 && bits != 4) {
+        std::fprintf(stderr, "ik2::k::attn_decode_int_rows: bits %d (4 or 8)\n", bits);
+        std::abort();
+    }
+    if (H <= 0 || Hkv <= 0 || H % Hkv || n_rows <= 0) {
+        std::fprintf(stderr, "ik2::k::attn_decode_int_rows: H %d Hkv %d n_rows %d\n", H, Hkv, n_rows);
+        std::abort();
+    }
+    if (bits == 8)
+        attn_split_int_rows_kernel<8, 0><<<dim3(H, (unsigned) P, (unsigned) n_rows), 128, 0, s>>>(
+            q, r, kci_tab, vci_tab, ks_tab, vs_tab, kv_cap, H, Hkv, qk_scale, proj, d_rel, extent, window, scratch, pos);
+    else if (dpp)
+        attn_split_int_rows_kernel<4, 1><<<dim3(H, (unsigned) P, (unsigned) n_rows), 128, 0, s>>>(
+            q, r, kci_tab, vci_tab, ks_tab, vs_tab, kv_cap, H, Hkv, qk_scale, proj, d_rel, extent, window, scratch, pos);
+    else
+        attn_split_int_rows_kernel<4, 0><<<dim3(H, (unsigned) P, (unsigned) n_rows), 128, 0, s>>>(
+            q, r, kci_tab, vci_tab, ks_tab, vs_tab, kv_cap, H, Hkv, qk_scale, proj, d_rel, extent, window, scratch, pos);
+    check("attn_decode_int_rows (split)");
+    attn_combine_gate_kernel<<<dim3(H, (unsigned) n_rows), 128, 0, s>>>(sink, scratch, H, P, 1.0f, gate, out);
+    check("attn_decode_int_rows (combine)");
+}
+
+// Forward decl: the GQA rows kernel is defined just below the plain rows launcher.
+template <int BITS, int DPP, int R>
+__global__ void attn_split_int_rows_gqa_kernel(const float* q, const float* r, const uint8_t* const* kci_tab,
+                                               const uint8_t* const* vci_tab, const uint16_t* const* ks_tab,
+                                               const uint16_t* const* vs_tab, int kv_cap, int H, int Hkv,
+                                               float qk_scale, const float* proj, int d_rel, int extent, int window,
+                                               float* part, const int* pos);
+
+// GQA-shared batched launcher: grid (Hkv, P, n_rows); only H/Hkv == 3 is supported (R = 3).
+void attn_decode_int_rows_gqa(int bits, const float* q, const float* r, const float* sink,
+                              const uint8_t* const* kci_tab, const uint8_t* const* vci_tab,
+                              const uint16_t* const* ks_tab, const uint16_t* const* vs_tab,
+                              int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, const float* proj,
+                              int d_rel, int extent, int window, int n_rows, float* scratch, float* out,
+                              cudaStream_t s, const float* gate, int dpp) {
+    if (bits != 8 && bits != 4) std::abort();
+    if (H <= 0 || Hkv <= 0 || H % Hkv || H / Hkv != 3 || n_rows <= 0) {
+        std::fprintf(stderr, "ik2::k::attn_decode_int_rows_gqa: H %d Hkv %d n_rows %d\n", H, Hkv, n_rows);
+        std::abort();
+    }
+    if (bits == 8)
+        attn_split_int_rows_gqa_kernel<8, 0, 3><<<dim3(Hkv, (unsigned) P, (unsigned) n_rows), 128, 0, s>>>(
+            q, r, kci_tab, vci_tab, ks_tab, vs_tab, kv_cap, H, Hkv, qk_scale, proj, d_rel, extent, window, scratch, pos);
+    else if (dpp)
+        attn_split_int_rows_gqa_kernel<4, 1, 3><<<dim3(Hkv, (unsigned) P, (unsigned) n_rows), 128, 0, s>>>(
+            q, r, kci_tab, vci_tab, ks_tab, vs_tab, kv_cap, H, Hkv, qk_scale, proj, d_rel, extent, window, scratch, pos);
+    else
+        attn_split_int_rows_gqa_kernel<4, 0, 3><<<dim3(Hkv, (unsigned) P, (unsigned) n_rows), 128, 0, s>>>(
+            q, r, kci_tab, vci_tab, ks_tab, vs_tab, kv_cap, H, Hkv, qk_scale, proj, d_rel, extent, window, scratch, pos);
+    check("attn_decode_int_rows_gqa (split)");
+    attn_combine_gate_kernel<<<dim3(H, (unsigned) n_rows), 128, 0, s>>>(sink, scratch, H, P, 1.0f, gate, out);
+    check("attn_decode_int_rows_gqa (combine)");
+}
+
 // the R query heads h = g*R + r of KV head g, so each K row (and, when needed, V row) is dequantized once and
 // reused by R *independent* online softmaxes.  The key-walk order (j = j0 + warp, stride 4), the four-term
 // lane dot, the rel-bias projection, the wsum_dpp/wsum choice, the fmaxf/expf alpha/beta update and the
@@ -7050,6 +7324,94 @@ __global__ void attn_split_int_gqa_kernel(const float* q, const float* r, const 
                 const float f = expf(sm_m[w][rr] - M);
                 sum += sm_s[w][rr] * f;
                 out += sm_o[w][rr][tid] * f;
+            }
+        }
+        const int h = g * R + rr;
+        float* pp = part + (((size_t) qi * H + h) * P + p) * 130;
+        if (tid == 0) pp[0] = M, pp[1] = sum;
+        pp[2 + tid] = out;
+    }
+}
+
+// True-batched GQA rows: like attn_split_int_rows_kernel but grid.x is the KV head (Hkv) and R=3 query heads
+// share each K/V row.  kci_tab/vci_tab/ks_tab/vs_tab are DEVICE arrays of n_rows slot pointers; pos is DEVICE
+// int[n_rows].  Partials stay [qi,H,P,130], so the combine is unchanged.  Bit-exact to attn_decode_int_at_gqa.
+template <int BITS, int DPP = 0, int R = 3>
+__global__ void attn_split_int_rows_gqa_kernel(const float* q, const float* r,
+                                               const uint8_t* const* kci_tab, const uint8_t* const* vci_tab,
+                                               const uint16_t* const* ks_tab, const uint16_t* const* vs_tab,
+                                               int kv_cap, int H, int Hkv, float qk_scale, const float* proj,
+                                               int d_rel, int extent, int window, float* part, const int* pos) {
+    const uint8_t* kci = kci_tab[blockIdx.z];
+    const uint8_t* vci = vci_tab[blockIdx.z];
+    const uint16_t* ks = ks_tab[blockIdx.z];
+    const uint16_t* vs = vs_tab[blockIdx.z];
+    __shared__ float sm_m[4][R], sm_s[4][R];
+    __shared__ __align__(16) float sm_o[4][R][128];
+    const int g = blockIdx.x, p = blockIdx.y, P = gridDim.y, qi = blockIdx.z, tid = threadIdx.x;
+    const int lane = tid & 31, warp = tid >> 5, o = lane * 4;
+    const int cb = (BITS == 8) ? 128 : 64;
+    const size_t rowb = (size_t) Hkv * cb;
+    const int qpos = pos[qi];
+    const int k0 = window < (1 << 30) ? max(0, qpos - window + 1) : 0;
+    const int nk = qpos + 1 - k0;
+    const int len = (nk + P - 1) / P, j0 = p * len, j1 = min(nk, j0 + len);
+    float4 q4[R]; float r_lane[R], m_w[R], s_w[R]; float4 o_w[R];
+#pragma unroll
+    for (int rr = 0; rr < R; ++rr) {
+        const int h = g * R + rr;
+        const float* qh = q + ((size_t) qi * H + h) * 128;
+        q4[rr] = (((uintptr_t) qh & 15) == 0) ? __ldg((const float4*) (qh + o))
+                                              : make_float4(qh[o], qh[o + 1], qh[o + 2], qh[o + 3]);
+        const float* rh = r + ((size_t) qi * H + h) * d_rel;
+        r_lane[rr] = (lane < d_rel) ? __ldg(rh + lane) : 0.0f;
+        m_w[rr] = -INFINITY; s_w[rr] = 0.0f; o_w[rr] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    for (int j = j0 + warp; j < j1; j += 4) {
+        const int pos_j = k0 + j;
+        const int dist = qpos - pos_j;
+        if (dist < 0 || dist >= window) continue;
+        const int slot = kv_cap > 0 ? pos_j % kv_cap : pos_j;
+        const size_t head_off = (size_t) slot * rowb + (size_t) g * cb;
+        const size_t sidx = (size_t) slot * Hkv + g;
+        const float ksc = h2f(ks[sidx]);
+        const float4 k4 = v_load4_int<BITS>(kci + head_off, lane, ksc);
+        const bool rel = dist < extent;
+        const float pb = (rel && lane < d_rel) ? __ldg(proj + (size_t) dist * d_rel + lane) : 0.0f;
+        float4 v4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        bool v_ready = false;
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr) {
+            float a = q4[rr].x * k4.x + q4[rr].y * k4.y + q4[rr].z * k4.z + q4[rr].w * k4.w;
+            float l = (DPP ? wsum_dpp(a) : wsum(a)) * qk_scale;
+            if (rel) { const float b = (lane < d_rel) ? r_lane[rr] * pb : 0.0f; l += DPP ? wsum_dpp(b) : wsum(b); }
+            if (l > -INFINITY) {
+                if (!v_ready) { const float vsc = h2f(vs[sidx]); v4 = v_load4_int<BITS>(vci + head_off, lane, vsc); v_ready = true; }
+                const float m_new = fmaxf(m_w[rr], l), alpha = (m_w[rr] == -INFINITY) ? 0.0f : expf(m_w[rr] - m_new),
+                            beta = expf(l - m_new);
+                m_w[rr] = m_new; s_w[rr] = s_w[rr] * alpha + beta;
+                o_w[rr].x = o_w[rr].x * alpha + v4.x * beta; o_w[rr].y = o_w[rr].y * alpha + v4.y * beta;
+                o_w[rr].z = o_w[rr].z * alpha + v4.z * beta; o_w[rr].w = o_w[rr].w * alpha + v4.w * beta;
+            }
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr) sm_m[warp][rr] = m_w[rr], sm_s[warp][rr] = s_w[rr];
+    }
+#pragma unroll
+    for (int rr = 0; rr < R; ++rr) *(float4*) (&sm_o[warp][rr][o]) = o_w[rr];
+    __syncthreads();
+#pragma unroll
+    for (int rr = 0; rr < R; ++rr) {
+        const float M = fmaxf(fmaxf(sm_m[0][rr], sm_m[1][rr]), fmaxf(sm_m[2][rr], sm_m[3][rr]));
+        float sum = 0.0f, out = 0.0f;
+        if (M > -INFINITY) {
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                if (sm_m[w][rr] == -INFINITY) continue;
+                const float f = expf(sm_m[w][rr] - M);
+                sum += sm_s[w][rr] * f; out += sm_o[w][rr][tid] * f;
             }
         }
         const int h = g * R + rr;
@@ -7379,6 +7741,41 @@ void prep_qkv_r_int_g(int bits, float* q, const float* q_clip, const float* k_in
         prep_qkv_r_int_launch<4>(q, q_clip, k_in, kci, ks, v_in, vci, vs, r, r_clip, T, H, KV, D, d_rel, qk_clip,
                                  rel_clip, eps, pos, alpha, n_floor, 0, kv_cap, pos0_d, nullptr, nullptr, nullptr,
                                  0, nullptr, s);
+}
+
+// True batched write counterpart of prep_qkv_r_int: every row t writes its K/V through its own cache pointers
+// (kci_tab[t] etc.) into slot pos[t] (mod kv_cap when given) and uses pos[t] for q/r's tau.  The tables are DEVICE
+// arrays of n_rows pointers; pos is a DEVICE int array used for KV slots, and optional tau_pos is a DEVICE int
+// array used for q/r tau (null -> tau 1, matching prep_qkv_r_int with a null pos). The K/V stores, q/r clips and
+// sink tail are the scalar kernel's calls unchanged, so one row is bit-identical to prep_qkv_r_int with
+// pos0 == pos[t] and tau pos == tau_pos[t].
+void prep_qkv_r_int_rows(int bits, float* q, const float* q_clip, const float* k_in, uint8_t* const* kci_tab,
+                         uint16_t* const* ks_tab, const float* v_in, uint8_t* const* vci_tab,
+                         uint16_t* const* vs_tab, float* r, const float* r_clip, int T, int H, int KVh, int D,
+                         int d_rel, float qk_clip, float rel_clip, float eps, const int* pos, float alpha,
+                         float n_floor, int kv_cap, uint16_t* q16, const uint16_t* sink_w, const float* sink_x,
+                         int sink_k, float* sink_y, cudaStream_t s, const int* tau_pos) {
+    kv_int_bits_check(bits, "prep_qkv_r_int_rows");
+    if (T <= 0) return;
+    if (H <= 0 || KVh <= 0 || D <= 0 || d_rel <= 0 || !pos) {
+        std::fprintf(stderr, "ik2::k::prep_qkv_r_int_rows: H %d KVh %d D %d d_rel %d pos %p\n", H, KVh, D, d_rel,
+                     (const void*) pos);
+        std::abort();
+    }
+    if (bits == 4 && (D & 1)) {
+        std::fprintf(stderr, "ik2::k::prep_qkv_r_int_rows: int4 needs even D, got %d\n", D);
+        std::abort();
+    }
+    const int total = T * (2 * H + 2 * KVh) + (sink_w ? H : 0);
+    if (bits == 8)
+        prep_qkv_r_int_rows_kernel<8><<<(unsigned) total, 32, 0, s>>>(
+            q, q_clip, k_in, kci_tab, ks_tab, v_in, vci_tab, vs_tab, r, r_clip, T, H, KVh, D, d_rel, qk_clip,
+            rel_clip, eps, pos, alpha, n_floor, kv_cap, q16, sink_w, sink_x, sink_k, sink_y, tau_pos);
+    else
+        prep_qkv_r_int_rows_kernel<4><<<(unsigned) total, 32, 0, s>>>(
+            q, q_clip, k_in, kci_tab, ks_tab, v_in, vci_tab, vs_tab, r, r_clip, T, H, KVh, D, d_rel, qk_clip,
+            rel_clip, eps, pos, alpha, n_floor, kv_cap, q16, sink_w, sink_x, sink_k, sink_y, tau_pos);
+    check("prep_qkv_r_int_rows");
 }
 
 template <int BITS>
@@ -7980,6 +8377,148 @@ __global__ __launch_bounds__(WN * 32) void k_gemm8w(const uint8_t * __restrict__
             for (int i = 0; i < 8; i++) {
                 const int tok = (tt0 + nj) * 16 + 2 * i + h;
                 if (tok < N) { const size_t oi = (size_t) tok * ldy + feat; out[oi] = tot[mi][nj][i] * (sf * dr[i]) + (res ? res[oi] : 0.f); }
+            }
+        }
+    }
+}
+
+// IK2_BATCH_MOE_DEVICE: k_gemm8w's exact arithmetic, but the expert is a BLOCK dimension and rows
+// belonging to other experts are masked.  This lets one device launch replace the host's per-expert
+// loop without a D2H sync: blockIdx.z selects the expert, row_expert[] masks each token row.  For
+// every written row the packed activation, lane mapping and accumulator order are identical to
+// calling int4_gemm8(W_e, ..., N=cnt[e]) from the general MoE path.
+template <int GW, int WN>
+__global__ __launch_bounds__(WN * 32) void k_gemm8w_moe_masked(const uint8_t* __restrict__ Wp,
+        const uint8_t* __restrict__ Wh, const float* __restrict__ WS,
+        size_t wp_stride, size_t wh_stride, int ws_stride, int E, const int* __restrict__ row_expert,
+        const uint8_t* __restrict__ Xhp, const uint8_t* __restrict__ Xlp, const uint8_t* __restrict__ XMp,
+        const float* __restrict__ XRp, float* __restrict__ out, int M, int N, int K, const float* res,
+        int sh, int ldy) {
+    const int lane = threadIdx.x & 31;
+    const int wn = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
+    const int h = lane >> 4, lc = lane & 15;
+    const int nsb = K / 256;
+    const int ft0 = blockIdx.x * MI;
+    const int tt0 = (blockIdx.y * WN + wn) * NJ;
+    const int e = blockIdx.z;
+    const uint8_t* Wp_e = Wp + (size_t) e * wp_stride;
+    const uint8_t* Wh_e = Wh + (size_t) e * wh_stride;
+    const float* WS_e = WS + (size_t) e * ws_stride;
+    const __amdgpu_buffer_rsrc_t rWp = I4_RSRC(Wp_e), rXh = I4_RSRC(Xhp), rXl = I4_RSRC(Xlp), rXM = I4_RSRC(XMp);
+    bool active[NJ];
+#pragma unroll
+    for (int nj = 0; nj < NJ; ++nj) {
+        bool any = false;
+        for (int t = 0; t < 16; ++t) {
+            const int tok = (tt0 + nj) * 16 + t;
+            if (tok < N && row_expert[tok] == e) any = true;
+        }
+        active[nj] = any;
+    }
+    if (!active[0] && !active[1]) return;
+    float tot[MI][NJ][8];
+#pragma unroll
+    for (int a = 0; a < MI; a++)
+#pragma unroll
+        for (int b = 0; b < NJ; b++)
+#pragma unroll
+            for (int i = 0; i < 8; i++) tot[a][b][i] = 0.f;
+    for (int sb = 0; sb < nsb; sb++) {
+        uint32_t scw[MI][NJ];
+#pragma unroll
+        for (int nj = 0; nj < NJ; nj++)
+#pragma unroll
+            for (int mi = 0; mi < MI; mi++) scw[mi][nj] = *(const uint32_t*) (Wh_e + (((ft0 + mi) * nsb + sb) * 16 + lc) * 4);
+        int2v mmw[NJ];
+#pragma unroll
+        for (int nj = 0; nj < NJ; nj++) mmw[nj] = bl64(rXM, h * 8, ((tt0 + nj) * nsb + sb) * 16);
+        int isum[MI][NJ][8];
+        for (int u0 = 0; u0 < 8; u0 += GW) {
+            int8v ci[MI][NJ];
+            const int8v z = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+            for (int pass = 0; pass < 2; pass++) {
+                const __amdgpu_buffer_rsrc_t rX = pass ? rXl : rXh;
+                int4v wc[MI][NJ], xc[NJ], wn_[MI][NJ], xn[NJ];
+#pragma unroll
+                for (int nj = 0; nj < NJ; nj++) {
+#pragma unroll
+                    for (int mi = 0; mi < MI; mi++) wc[mi][nj] = bl128(rWp, lc * 16, (((ft0 + mi) * nsb + sb) * 8 + u0) * 256);
+                    xc[nj] = bl128(rX, lc * 16, (((tt0 + nj) * nsb + sb) * 8 + u0) * 256);
+                }
+#pragma unroll
+                for (int q = 0; q < GW; q++) {
+                    if (q + 1 < GW) {
+#pragma unroll
+                        for (int nj = 0; nj < NJ; nj++) {
+#pragma unroll
+                            for (int mi = 0; mi < MI; mi++) wn_[mi][nj] = bl128(rWp, lc * 16, (((ft0 + mi) * nsb + sb) * 8 + u0 + q + 1) * 256);
+                            xn[nj] = bl128(rX, lc * 16, (((tt0 + nj) * nsb + sb) * 8 + u0 + q + 1) * 256);
+                        }
+                    }
+                    __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+                    for (int sl = 0; sl < 2; sl++)
+#pragma unroll
+                        for (int nj = 0; nj < NJ; nj++)
+#pragma unroll
+                            for (int mi = 0; mi < MI; mi++) {
+                                const int2v xa = sl ? I4_HI(xc[nj]) : I4_LO(xc[nj]), wb = sl ? I4_HI(wc[mi][nj]) : I4_LO(wc[mi][nj]);
+                                const int8v cin = (q == 0 && sl == 0 && pass == 0) ? z : ci[mi][nj];
+                                if (pass == 0) ci[mi][nj] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, xa, true, wb, cin, false);
+                                else           ci[mi][nj] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, xa, true, wb, cin, false);
+                            }
+                    if (q + 1 < GW) {
+#pragma unroll
+                        for (int nj = 0; nj < NJ; nj++) {
+#pragma unroll
+                            for (int mi = 0; mi < MI; mi++) wc[mi][nj] = wn_[mi][nj];
+                            xc[nj] = xn[nj];
+                        }
+                    }
+                }
+                if (pass == 0) {
+#pragma unroll
+                    for (int mi = 0; mi < MI; mi++)
+#pragma unroll
+                        for (int nj = 0; nj < NJ; nj++) ci[mi][nj] = ci[mi][nj] << 4;
+                }
+            }
+            __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+            for (int mi = 0; mi < MI; mi++) {
+                const int scg = (int) ((scw[mi][0] >> (4 * u0)) & 0xF);
+#pragma unroll
+                for (int nj = 0; nj < NJ; nj++)
+#pragma unroll
+                    for (int i = 0; i < 8; i++) { if (u0 == 0) mul24a(isum[mi][nj][i], scg, ci[mi][nj][i]); else mad24(isum[mi][nj][i], scg, ci[mi][nj][i]); }
+            }
+        }
+#pragma unroll
+        for (int nj = 0; nj < NJ; nj++) {
+            float mv[8];
+#pragma unroll
+            for (int i = 0; i < 8; i++) mv[i] = (float) (int) (((uint32_t) mmw[nj][i >> 2] >> (8 * (i & 3))) & 0xFF);
+#pragma unroll
+            for (int mi = 0; mi < MI; mi++)
+#pragma unroll
+                for (int i = 0; i < 8; i++) tot[mi][nj][i] = fmaf((float) isum[mi][nj][i], mv[i], tot[mi][nj][i]);
+        }
+    }
+    const float inv = 1.f / (float) ((1 << sh) * 16);
+#pragma unroll
+    for (int nj = 0; nj < NJ; nj++) {
+        float dr[8];
+        { const float4 a = *(const float4*) (XRp + (size_t) (tt0 + nj) * 16 + h * 8), b = *(const float4*) (XRp + (size_t) (tt0 + nj) * 16 + h * 8 + 4);
+          dr[0] = a.x; dr[1] = a.y; dr[2] = a.z; dr[3] = a.w; dr[4] = b.x; dr[5] = b.y; dr[6] = b.z; dr[7] = b.w; }
+#pragma unroll
+        for (int mi = 0; mi < MI; mi++) {
+            const int feat = (ft0 + mi) * 16 + lc;
+            const float sf = WS_e[feat] * inv;
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const int tok = (tt0 + nj) * 16 + 2 * i + h;
+                if (tok < N && row_expert[tok] == e) { const size_t oi = (size_t) tok * ldy + feat; out[oi] = tot[mi][nj][i] * (sf * dr[i]) + (res ? res[oi] : 0.f); }
             }
         }
     }
@@ -8779,6 +9318,23 @@ void int4_gemm8(const uint8_t* Wp, const uint8_t* Wh, const float* WS, int M, in
     else { if (gw == 1) I4_G8(1, 8); else if (gw == 2) I4_G8(2, 8); else I4_G8(4, 8); }
 #undef I4_G8
     check("int4_gemm8");
+}
+void int4_gemm8_moe_masked(const uint8_t* Wp, const uint8_t* Wh, const float* WS,
+                           size_t wp_stride, size_t wh_stride, int ws_stride, int E,
+                           const int* row_expert, int M, int K, const uint8_t* x4,
+                           const uint8_t* xm, const float* xr, int N, int gw, int wn_,
+                           float* out, const float* res, int sh, cudaStream_t s, int ldy) {
+    if (N <= 0 || M % int4w::TILE_M != 0 || K % 256 != 0) return;
+    const int ld = ldy > 0 ? ldy : M;
+    const int Npad = ((N + int4w::TILE_N - 1) / int4w::TILE_N) * int4w::TILE_N;
+    const size_t plane = (size_t) Npad * K / 2;
+    const uint8_t* xh = x4; const uint8_t* xl = x4 + plane;
+    const dim3 grid(M / int4w::TILE_M, Npad / (wn_ * int4w::NJ * 16), E);
+#define I4_G8M(GW, WN) int4w::k_gemm8w_moe_masked<GW, WN><<<grid, WN * 32, 0, s>>>(Wp, Wh, WS, wp_stride, wh_stride, ws_stride, E, row_expert, xh, xl, xm, xr, out, M, N, K, res, sh, ld)
+    if (wn_ == 4) { if (gw == 1) I4_G8M(1, 4); else if (gw == 2) I4_G8M(2, 4); else I4_G8M(4, 4); }
+    else { if (gw == 1) I4_G8M(1, 8); else if (gw == 2) I4_G8M(2, 8); else I4_G8M(4, 8); }
+#undef I4_G8M
+    check("int4_gemm8_moe_masked");
 }
 void int4_rot_q8x(const float* X, int N, int K, int8_t* Xq, float2* Xd, cudaStream_t s) {
     if (N <= 0 || K % 256 != 0) return;

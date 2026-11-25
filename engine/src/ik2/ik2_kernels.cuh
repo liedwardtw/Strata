@@ -45,6 +45,13 @@ void conv4(const float* x, float* hist, const float* w, const float* dyn, int he
 /// Residual-fused short conv: same as conv4, plus residual[t][c] added to y[t][c] when residual != nullptr.
 void conv4_res(const float* x, float* hist, const float* w, const float* dyn, int heads, int T, int C,
                const float* residual, float* y, cudaStream_t s);
+/// True batched conv4: one launch over n_rows rows, each with its own 3-tap history.  hist_tab is a DEVICE array
+/// of n_rows pointers, each to [3][C] floats (oldest first, updated in place); x / y / residual are [n_rows][T][C]
+/// and dyn, when non-null, is the shared [T][heads * 4] taps.  Bit-identical to one scalar call per row.
+void conv4_rows(const float* x, float* const* hist_tab, const float* w, const float* dyn, int heads, int T, int C,
+                float* y, int n_rows, cudaStream_t s);
+void conv4_res_rows(const float* x, float* const* hist_tab, const float* w, const float* dyn, int heads, int T,
+                    int C, const float* res, float* y, int n_rows, cudaStream_t s);
 
 /// The attention residual: the n states st[i] ([T][C] each, n <= kResMax; the block states then the stream) each
 /// RMS-normed without a weight (eps), p = softmax_i(q . s_i / sqrt(C)) for each of the nq queries (q [nq][C]),
@@ -142,6 +149,14 @@ void int4_rot_pack8(const float* X, int N, int K, uint8_t* x4, uint8_t* xm, floa
 void int4_gemm8(const uint8_t* Wp, const uint8_t* Wh, const float* WS, int M, int K,
                 const uint8_t* x4, const uint8_t* xm, const float* xr, int N, int gw, int wn,
                 float* out, const float* res, int sh, cudaStream_t s, int ldy = 0);
+/// IK2_BATCH_MOE_DEVICE: bit-exact int4_gemm8 variant for the device-only batched MoE.  blockIdx.z
+/// selects the expert; row_expert[row] masks the rows that the host would have passed to that
+/// expert's N=cnt[e] call.  Written rows use the identical pack8+gemm8 arithmetic and order.
+void int4_gemm8_moe_masked(const uint8_t* Wp, const uint8_t* Wh, const float* WS,
+                           size_t wp_stride, size_t wh_stride, int ws_stride, int E,
+                           const int* row_expert, int M, int K, const uint8_t* x4,
+                           const uint8_t* xm, const float* xr, int N, int gw, int wn,
+                           float* out, const float* res, int sh, cudaStream_t s, int ldy = 0);
 /// Rotate + 8-bit quantize X [N][K] into int8 codes Xq [N][K] + per-32-group (d, d*sum) Xd [N][K/32]
 /// for the decode matvec. smem = K*2 + (K/256)*4.
 void int4_rot_q8x(const float* X, int N, int K, int8_t* Xq, float2* Xd, cudaStream_t s);
@@ -553,6 +568,18 @@ void prep_qkv_r_int_g(int bits, float* q, const float* q_clip, const float* k_in
                       const float* v_in, uint8_t* vci, uint16_t* vs, float* r, const float* r_clip, int T, int H,
                       int KV, int D, int d_rel, float qk_clip, float rel_clip, float eps, const int* pos,
                       float alpha, float n_floor, const int* pos0_d, int kv_cap, cudaStream_t s);
+/// True batched write counterpart of prep_qkv_r_int: row t writes K/V through kci_tab[t] / ks_tab[t] /
+/// vci_tab[t] / vs_tab[t] at slot pos[t] (mod kv_cap when given); pos is DEVICE int[T] and the four tables are
+/// DEVICE arrays of T pointers.  pos stays the KV-slot source; optional tau_pos is a DEVICE int[T] used for q/r
+/// tau (null -> tau 1, the scalar kernel's behavior when its pos is null).  q / r / sink clipping is unchanged,
+/// sink_y is [H], one row == the scalar prep with pos0 == pos[t] and tau pos == tau_pos[t].  bits = 8 or 4;
+/// q16 / sink_* mirror prep_qkv_r_int_at (null except when used).
+void prep_qkv_r_int_rows(int bits, float* q, const float* q_clip, const float* k_in, uint8_t* const* kci_tab,
+                         uint16_t* const* ks_tab, const float* v_in, uint8_t* const* vci_tab,
+                         uint16_t* const* vs_tab, float* r, const float* r_clip, int T, int H, int KVh, int D,
+                         int d_rel, float qk_clip, float rel_clip, float eps, const int* pos, float alpha,
+                         float n_floor, int kv_cap, uint16_t* q16, const uint16_t* sink_w, const float* sink_x,
+                         int sink_k, float* sink_y, cudaStream_t s, const int* tau_pos = nullptr);
 void attn_multi_int_g(int bits, const float* q, const float* r, const float* sink, const uint8_t* kci,
                       const uint8_t* vci, const uint16_t* ks, const uint16_t* vs, int kv_cap, int nq, int H,
                       int Hkv, const int* pos_d, int P, float qk_scale, const float* proj, int d_rel, int extent,
@@ -591,6 +618,23 @@ void attn_decode_int_gqa(int bits, const float* q, const float* r, const float* 
                          const uint8_t* vci, const uint16_t* ks, const uint16_t* vs, int kv_cap, int H, int Hkv, int D,
                          int k0, int nk, int qpos, float qk_scale, const float* proj, int d_rel, int extent, int window,
                          float* scratch, float* out, cudaStream_t s, int dpp = 0);
+
+/// True batched decode attention: n_rows queries on different slots in one launch.  kci_tab/vci_tab/ks_tab/vs_tab
+/// are DEVICE arrays of n_rows K/V pointers; pos is a DEVICE int[n_rows].  Partials [n_rows,H,P,130] reuse the
+/// same combine; n_rows==1 is bit-identical to attn_decode_int_at.  IK2_BATCH_ATTN gate at the engine level.
+void attn_decode_int_rows(int bits, const float* q, const float* r, const float* sink,
+                          const uint8_t* const* kci_tab, const uint8_t* const* vci_tab,
+                          const uint16_t* const* ks_tab, const uint16_t* const* vs_tab,
+                          int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, const float* proj,
+                          int d_rel, int extent, int window, int n_rows, float* scratch, float* out,
+                          cudaStream_t s, const float* gate = nullptr, int dpp = 0);
+/// GQA-shared batched rows (grid Hkv,P,n_rows, R=H/Hkv must be 3), bit-exact to attn_decode_int_at_gqa.
+void attn_decode_int_rows_gqa(int bits, const float* q, const float* r, const float* sink,
+                              const uint8_t* const* kci_tab, const uint8_t* const* vci_tab,
+                              const uint16_t* const* ks_tab, const uint16_t* const* vs_tab,
+                              int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, const float* proj,
+                              int d_rel, int extent, int window, int n_rows, float* scratch, float* out,
+                              cudaStream_t s, const float* gate = nullptr, int dpp = 0);
 
 /// One token's attention on the tensor cores - for long contexts, where the scalar attn_decode is bound by its
 /// arithmetic; this one reads at the memory's speed, an FP8 cache too.  q16 [H][128]: the clipped q in FP16;

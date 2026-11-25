@@ -331,6 +331,25 @@ struct Visit {
     float *rec_old[4] = {}, *rec_x[4] = {};
 };
 
+// IK2_BATCH_ATTN: one independent KV/conv state per (batch slot, visit).  The pointers are VRAM-resident and
+// immutable; a batch forwards n_rows slots at once by copying the selected slots' pointers into Work's stable
+// device pointer tables.  This is real extra VRAM: 2 slots * n_visit * (2 * kv_cap * KD * bits/8 + 2 * kv_cap *
+// KV * 2 + 4 * 3 * max(KD,C) * 4) bytes.
+struct BatchSlots {
+    static constexpr int kMaxRows = 8;
+    int n_slot = 0, n_visit = 0;
+    size_t bytes = 0;
+    std::vector<uint8_t*> kci, vci;
+    std::vector<uint16_t*> ks, vs;
+    std::vector<float*> h_k, h_v, h_attn, h_mlp;
+    inline size_t idx(int slot, int vis) const { return (size_t) slot * n_visit + vis; }
+};
+BatchSlots g_batch_slots;
+static bool g_batch_active = false;
+static const int* g_batch_pos = nullptr;
+static const int* g_batch_slot_ids = nullptr;
+static int g_batch_rows = 0;
+
 struct Model {
     Config c;
     std::vector<Layer> L;
@@ -478,6 +497,7 @@ bool g_flash_wmma = true;   // IK2_FLASH_WMMA=0: gfx1100 uses the scalar/cuBLAS 
 bool g_gate_fuse = true;    // IK2_GATE_FUSE=0: the scalar decode's output gate as its own gate_mul launch, not the combine's epilogue
 bool g_rms_fuse = true;     // IK2_RMS_FUSE=0: layer-0 full attention's q/k/v norms as three rms launches, not one rms_multi
 bool g_onepass = false;     // IK2_ATTN_ONEPASS=1: sliding decode attention split+combine as one launch (env-gated experiment)
+int g_parallel = 1;         // IK2_PARALLEL=1..8: serve batch slots (1 = legacy single stream, byte-identical)
 int g_attn_dpp = 0;         // IK2_ATTN_DPP=1: int4-only bit-exact DPP warp sum, same split grid (default off)
 bool g_attn_gqa = false;    // IK2_ATTN_GQA=1: int decode K/V shares R=3 Q heads per KV head (default off)
 bool g_loopbank_fuse = false;  // IK2_LOOPBANK_FUSE=1: loop-core pass>0 bank copies as one kernel, not n_bank+1 D2D memcpys
@@ -490,6 +510,12 @@ bool g_verify_fast = false;   // IK2_VERIFY_FAST=1: device-only INT4 verify MoE 
                               // sequence at S=T*K slots, no route D2H / stream sync (graph-capturable). Default OFF.
 bool g_verify_graph = false;  // IK2_VERIFY_GRAPH=1: capture the T=8 verify forward once and replay it. Needs
                               // IK2_VERIFY_FAST=1 and the single-GPU resident path. Default OFF.
+bool g_batch_decode = false;  // IK2_BATCH_ATTN=1: true multi-slot batched decode (one row per slot) through the
+                              // 48 visits. Reuses the verify-fast T=2..8 path with per-row KV/conv pointer tables.
+                              // Default OFF; IK2_PARALLEL=1 stays byte-identical.
+bool g_batch_moe_device = false;  // IK2_BATCH_MOE_DEVICE=1 (default OFF): device-only INT4 MoE for the true batched
+                                  // decode. Reproduces run_prefill_moe's rot_pack8 + gemm8 + expert-major scatter
+                                  // numerics without the per-visit route D2H/sync. Applies only when W.batch.
 bool g_serve_dspec = false;  // IK2_SERVE_DSPEC=1: --serve greedy (temp<=0) uses DSpark spec when a drafter is
                              // loaded and ctx has room; temp>0/short ctx fall back to byte-identical AR. Default OFF.
 bool g_moe_group_exp = false; // IK2_MOE_GROUP_EXPERT=1: verify-fast MoE grouped BY EXPERT -- each expert's
@@ -1538,6 +1564,22 @@ struct Work {
     uint16_t* lg16 = nullptr;   // the prefill attention's probabilities (FP16, lg_cap of them; aliases gu32)
     size_t gu32_bytes = 0;   // (gu32's size: a lent scratch only replaces it when it needs more)
     int T_host = 0;          // tokens the pinned host staging (pos_h, route_h, gidx_h, ..) holds
+    // IK2_BATCH_ATTN: stable device pointer tables of CURRENT visit's selected rows.  Only the pointees change
+    // between visits/batches, so a CUDA graph could capture these addresses later. n_rows <= 8.
+    bool batch = false;
+    int batch_rows = 0;
+    uint8_t **bkci_d = nullptr, **bvci_d = nullptr;
+    uint16_t **bks_d = nullptr, **bvs_d = nullptr;
+    uint8_t **bkci_h = nullptr, **bvci_h = nullptr;
+    uint16_t **bks_h = nullptr, **bvs_h = nullptr;
+    float **bh_k_d = nullptr, **bh_v_d = nullptr, **bh_attn_d = nullptr, **bh_mlp_d = nullptr;
+    float **bh_k_h = nullptr, **bh_v_h = nullptr, **bh_attn_h = nullptr, **bh_mlp_h = nullptr;
+    // IK2_BATCH_MOE_DEVICE removes the general path's per-layer D2H sync, so the pinned host staging arrays above
+    // must not be overwritten before their H2D copy has executed. Ring-buffer them and gate reuse on an event.
+    static constexpr int kBatchStageSlots = 16;
+    cudaEvent_t batch_stage_ev[kBatchStageSlots] = {};
+    bool batch_stage_ev_ok[kBatchStageSlots] = {};
+    int batch_stage_next = 0;
     std::vector<int> cnt, start, fill, hit_exps, miss_exps;
     std::vector<uint8_t*> slot_ptrs;
     std::vector<uint32_t> seen_stamp, gi_stamp;
@@ -1561,6 +1603,63 @@ struct Work {
     size_t rg_bytes = 0;
 };
 
+// IK2_BATCH_ATTN helpers.  load_batch_slot()/reset_batch_slot() are used by P1 (prefill runs one request at a
+// time through M.V); stage_batch_tables() publishes the selected slots of one visit into Work's stable device
+// pointer tables.  Only the table CONTENTS change, never their addresses.  Defined after Work/g_s/g_batch_decode.
+inline void load_batch_slot(Model& M, int slot) {
+    if (!g_batch_decode || slot < 0 || slot >= g_batch_slots.n_slot) return;
+    const BatchSlots& B = g_batch_slots;
+    for (int v = 0; v < B.n_visit; ++v) {
+        const size_t i = B.idx(slot, v);
+        Visit& Vi = M.V[v];
+        Vi.kci = B.kci[i]; Vi.vci = B.vci[i]; Vi.ks = B.ks[i]; Vi.vs = B.vs[i];
+        Vi.h_k = B.h_k[i]; Vi.h_v = B.h_v[i]; Vi.h_attn = B.h_attn[i]; Vi.h_mlp = B.h_mlp[i];
+    }
+}
+inline void reset_batch_slot(int slot, int kd, int Cc) {
+    if (!g_batch_decode || slot < 0 || slot >= g_batch_slots.n_slot) return;
+    const BatchSlots& B = g_batch_slots;
+    for (int v = 0; v < B.n_visit; ++v) {
+        const size_t i = B.idx(slot, v);
+        CU(cudaMemsetAsync(B.h_k[i], 0, (size_t) 3 * kd * 4, g_s));
+        CU(cudaMemsetAsync(B.h_v[i], 0, (size_t) 3 * kd * 4, g_s));
+        CU(cudaMemsetAsync(B.h_attn[i], 0, (size_t) 3 * Cc * 4, g_s));
+        CU(cudaMemsetAsync(B.h_mlp[i], 0, (size_t) 3 * Cc * 4, g_s));
+    }
+}
+inline void stage_batch_tables(Work& W, int vis, int n_rows, const int* slot_ids) {
+    const BatchSlots& B = g_batch_slots;
+    int si = 0;
+    if (g_batch_moe_device) {
+        si = W.batch_stage_next++ % Work::kBatchStageSlots;
+        if (W.batch_stage_ev_ok[si]) {
+            const cudaError_t q = cudaEventQuery(W.batch_stage_ev[si]);
+            if (q == cudaErrorNotReady) CU(cudaEventSynchronize(W.batch_stage_ev[si]));
+            else CU(q);
+        }
+    }
+    const int off = si * BatchSlots::kMaxRows;
+    for (int i = 0; i < n_rows; ++i) {
+        const size_t j = B.idx(slot_ids[i], vis);
+        W.bkci_h[off + i] = B.kci[j]; W.bvci_h[off + i] = B.vci[j];
+        W.bks_h[off + i] = B.ks[j];  W.bvs_h[off + i] = B.vs[j];
+        W.bh_k_h[off + i] = B.h_k[j]; W.bh_v_h[off + i] = B.h_v[j];
+        W.bh_attn_h[off + i] = B.h_attn[j]; W.bh_mlp_h[off + i] = B.h_mlp[j];
+    }
+    CU(cudaMemcpyAsync(W.bkci_d, W.bkci_h + off, n_rows * sizeof(uint8_t*), cudaMemcpyHostToDevice, g_s));
+    CU(cudaMemcpyAsync(W.bvci_d, W.bvci_h + off, n_rows * sizeof(uint8_t*), cudaMemcpyHostToDevice, g_s));
+    CU(cudaMemcpyAsync(W.bks_d, W.bks_h + off, n_rows * sizeof(uint16_t*), cudaMemcpyHostToDevice, g_s));
+    CU(cudaMemcpyAsync(W.bvs_d, W.bvs_h + off, n_rows * sizeof(uint16_t*), cudaMemcpyHostToDevice, g_s));
+    CU(cudaMemcpyAsync(W.bh_k_d, W.bh_k_h + off, n_rows * sizeof(float*), cudaMemcpyHostToDevice, g_s));
+    CU(cudaMemcpyAsync(W.bh_v_d, W.bh_v_h + off, n_rows * sizeof(float*), cudaMemcpyHostToDevice, g_s));
+    CU(cudaMemcpyAsync(W.bh_attn_d, W.bh_attn_h + off, n_rows * sizeof(float*), cudaMemcpyHostToDevice, g_s));
+    CU(cudaMemcpyAsync(W.bh_mlp_d, W.bh_mlp_h + off, n_rows * sizeof(float*), cudaMemcpyHostToDevice, g_s));
+    if (g_batch_moe_device) {
+        CU(cudaEventRecord(W.batch_stage_ev[si], g_s));
+        W.batch_stage_ev_ok[si] = true;
+    }
+}
+
 // --serve: SIGUSR1 asks the request running to stop (its client went away) at its next token or prompt chunk
 volatile std::sig_atomic_t g_cancel = 0;
 // IK2_STATS=1: per request, how many tokens the prefill's experts each ran ([0] 1, [1] 2, [2] 3-7, [3] 8+)
@@ -1581,6 +1680,42 @@ void conv_rec(Layer& Ly, int which, const float* x, const float* hist, int T, in
     if (!g_rec) return;
     CU(cudaMemcpyAsync(Ly.rec_old[which], hist, (size_t) 3 * Cc * 4, cudaMemcpyDeviceToDevice, g_s));
     CU(cudaMemcpyAsync(Ly.rec_x[which], x, (size_t) T * Cc * 4, cudaMemcpyDeviceToDevice, g_s));
+}
+
+// IK2_BATCH_ATTN conv wrappers.  When W.batch is false these call the original scalar functions with identical
+// arguments, so the default path is unchanged.  In batch mode T is the number of SLOTS (= rows), each row has one
+// token, and the history pointers come from Work's per-row tables.  conv_rec is intentionally skipped: batched
+// decode is a plain one-token-per-step path and does not use speculation rollback.
+inline float** batch_hist_tab(Work& W, int which) {
+    return which == 0 ? W.bh_k_d : which == 1 ? W.bh_v_d : which == 2 ? W.bh_attn_d : W.bh_mlp_d;
+}
+inline void conv_rec_w(Layer& Ly, Work& W, int which, const float* x, int T, int Cc) {
+    if (!W.batch) conv_rec(Ly, which, x, which == 0 ? Ly.h_k : which == 1 ? Ly.h_v :
+                           which == 2 ? Ly.h_attn : Ly.h_mlp, T, Cc);
+}
+inline void conv4_w(Layer& Ly, Work& W, const float* x, const float* w, const float* dyn, int heads, int T, int C,
+                    float* y) {
+    if (!W.batch) { k::conv4(x, Ly.h_k, w, dyn, heads, T, C, y, g_s); return; }
+    k::conv4_rows(x, W.bh_k_d, w, dyn, heads, 1, C, y, W.batch_rows, g_s);
+}
+inline void conv4_v_w(Layer& Ly, Work& W, const float* x, const float* w, const float* dyn, int heads, int T, int C,
+                      float* y) {
+    if (!W.batch) { k::conv4(x, Ly.h_v, w, dyn, heads, T, C, y, g_s); return; }
+    k::conv4_rows(x, W.bh_v_d, w, dyn, heads, 1, C, y, W.batch_rows, g_s);
+}
+inline void conv4_attn_w(Layer& Ly, Work& W, bool block_start, const float* x, const float* res, float* y, int T,
+                         int C) {
+    if (!W.batch) {
+        if (block_start) k::conv4(x, Ly.h_attn, Ly.sc_attn, nullptr, 0, T, C, y, g_s);
+        else k::conv4_res(x, Ly.h_attn, Ly.sc_attn, nullptr, 0, T, C, res, y, g_s);
+    } else {
+        if (block_start) k::conv4_rows(x, W.bh_attn_d, Ly.sc_attn, nullptr, 0, 1, C, y, W.batch_rows, g_s);
+        else k::conv4_res_rows(x, W.bh_attn_d, Ly.sc_attn, nullptr, 0, 1, C, res, y, W.batch_rows, g_s);
+    }
+}
+inline void conv4_mlp_w(Layer& Ly, Work& W, const float* x, const float* res, float* y, int T, int C) {
+    if (!W.batch) k::conv4_res(x, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, res, y, g_s);
+    else k::conv4_res_rows(x, W.bh_mlp_d, Ly.sc_mlp, nullptr, 0, 1, C, res, y, W.batch_rows, g_s);
 }
 
 // The pictures of the request running (GENI): the image encoder's rows (strata-vision's SVE1 records, [n][C] F32), each
@@ -1777,6 +1912,74 @@ __global__ void scatter_add_rows_kernel(const float* __restrict__ y, const int* 
     }
 }
 
+// IK2_BATCH_MOE_DEVICE: the exact expert-major scatter, without a host D2H.  One block per token
+// walks the expert-major rows in order, so each token's float additions happen in exactly the same
+// order as run_prefill_moe's per-expert scatter_add_rows_kernel launches (and no two blocks race).
+__global__ void moe_batch_scatter_kernel(const float* __restrict__ y, const int* __restrict__ tok,
+                                         const float* __restrict__ wr, int S, int C,
+                                         float* __restrict__ out, int ld) {
+    const int t = blockIdx.x;
+    for (int row = 0; row < S; ++row) {
+        if (tok[row] != t) continue;
+        const float w = wr[row];
+        const float4* src = (const float4*) (y + (size_t) row * C);
+        float4* dst = (float4*) (out + (size_t) t * ld);
+        for (int i = threadIdx.x; i < (C >> 2); i += blockDim.x) {
+            const float4 a = src[i];
+            float4 b = dst[i];
+            b.x += w * a.x, b.y += w * a.y, b.z += w * a.z, b.w += w * a.w;
+            dst[i] = b;
+        }
+    }
+}
+
+// IK2_BATCH_MOE_DEVICE: build the general MoE path's expert-major row order entirely on the device.
+// Row r of the returned tables is the r-th row of the host grouping run_prefill_moe would build:
+// experts in ascending order, slots in ascending order within each expert (rank = # earlier slots
+// with the same expert). One launch, no D2H; S <= 64. Dynamic shared memory = 2 * E ints.
+#if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
+__global__ void moe_batch_perm_kernel(const int* __restrict__ top, const float* __restrict__ w,
+                                      const uint8_t* const* __restrict__ tabWp0,
+                                      const uint8_t* const* __restrict__ tabWh0,
+                                      const float* const* __restrict__ tabWS0,
+                                      const uint8_t* const* __restrict__ tabWp2,
+                                      const uint8_t* const* __restrict__ tabWh2,
+                                      const float* const* __restrict__ tabWS2,
+                                      int E, int K, int S, int* __restrict__ slots, int* __restrict__ tok,
+                                      float* __restrict__ wt, float* __restrict__ sg, float* __restrict__ su,
+                                      const uint8_t** __restrict__ Wp0, const uint8_t** __restrict__ Wh0,
+                                      const float** __restrict__ WS0, const uint8_t** __restrict__ Wp2,
+                                      const uint8_t** __restrict__ Wh2, const float** __restrict__ WS2,
+                                       int* __restrict__ rexp) {
+    extern __shared__ int sh[];
+    int* cnt = sh;
+    int* start = sh + E;
+    const int tid = threadIdx.x;
+    if (tid < E) cnt[tid] = 0;
+    __syncthreads();
+    if (tid < S) atomicAdd(&cnt[top[tid]], 1);
+    __syncthreads();
+    if (tid == 0) {
+        int sum = 0;
+        for (int e = 0; e < E; ++e) { start[e] = sum; sum += cnt[e]; }
+    }
+    __syncthreads();
+    if (tid < S) {
+        const int e = top[tid];
+        int rank = 0;
+        for (int j = 0; j < tid; ++j) if (top[j] == e) ++rank;   // stable, same as host fill[e]++
+        const int row = start[e] + rank;
+        slots[row] = tid;
+        tok[row] = tid / K;
+        wt[row] = w[tid];       // i4_pf folds Ly.scale into WS: wtr is route weight only
+        sg[row] = su[row] = 1.0f;
+        rexp[row] = e;          // row_expert[] for int4_gemm8_moe_masked
+        Wp0[row] = tabWp0[e]; Wh0[row] = tabWh0[e]; WS0[row] = tabWS0[e];
+        Wp2[row] = tabWp2[e]; Wh2[row] = tabWh2[e]; WS2[row] = tabWS2[e];
+    }
+}
+#endif
+
 // Y [T] rows (ldy) = rows [r0, r0 + n) of a dense matrix over X: a fused projection's part that takes its own input
 Mat mat_rows(const Mat& m, int r0, int n) {   // the rows [r0, r0 + n) of a matrix
     Mat p = m;
@@ -1967,10 +2170,10 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             matmul(Ly.wgate, in_q, W.x16, T, gate_p, HD);
             gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
         }
-        conv_rec(Ly, 0, k_p, Ly.h_k, T, KD);
-        conv_rec(Ly, 1, v_p, Ly.h_v, T, KD);
-        k::conv4(k_p, Ly.h_k, Ly.sc_k, nullptr, 0, T, KD, W.kconv, g_s);
-        k::conv4(v_p, Ly.h_v, Ly.sc_v, nullptr, 0, T, KD, W.vconv, g_s);
+        conv_rec_w(Ly, W, 0, k_p, T, KD);
+        conv_rec_w(Ly, W, 1, v_p, T, KD);
+        conv4_w(Ly, W, k_p, Ly.sc_k, nullptr, 0, T, KD, W.kconv);
+        conv4_v_w(Ly, W, v_p, Ly.sc_v, nullptr, 0, T, KD, W.vconv);
     } else {
         if (Ly.wqrg.N > 0) {
             matmul(Ly.wqrg, in_q, W.x16, T, W.qkv, Ly.wqrg.N);
@@ -2003,8 +2206,8 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             } else {
                 unpack_segments(W.qkv + off_k, T, {{W.kk, KD}, {W.dyn, c.KV * 4}}, g_s);
             }
-            conv_rec(Ly, 0, k_p, Ly.h_k, T, KD);
-            k::conv4(k_p, Ly.h_k, Ly.sc_k, kd_p, c.KV, T, KD, W.kconv, g_s);
+            conv_rec_w(Ly, W, 0, k_p, T, KD);
+            conv4_w(Ly, W, k_p, Ly.sc_k, kd_p, c.KV, T, KD, W.kconv);
 
             matmul(Ly.wv_dyn, in_v, xv16, T, W.qkv + off_v, Ly.wv_dyn.N);
             if (T == 1) {
@@ -2013,18 +2216,18 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             } else {
                 unpack_segments(W.qkv + off_v, T, {{W.vv, KD}, {W.dyn, c.KV * 4}}, g_s);
             }
-            conv_rec(Ly, 1, v_p, Ly.h_v, T, KD);
-            k::conv4(v_p, Ly.h_v, Ly.sc_v, vd_p, c.KV, T, KD, W.vconv, g_s);
+            conv_rec_w(Ly, W, 1, v_p, T, KD);
+            conv4_v_w(Ly, W, v_p, Ly.sc_v, vd_p, c.KV, T, KD, W.vconv);
         } else {
             matmul(Ly.wk, in_k, xk16, T, k_p, KD);
             gemm16(Ly.sc_k_dyn16, c.KV * 4, C, xk16, T, kd_p, c.KV * 4);
-            conv_rec(Ly, 0, k_p, Ly.h_k, T, KD);
-            k::conv4(k_p, Ly.h_k, Ly.sc_k, kd_p, c.KV, T, KD, W.kconv, g_s);
+            conv_rec_w(Ly, W, 0, k_p, T, KD);
+            conv4_w(Ly, W, k_p, Ly.sc_k, kd_p, c.KV, T, KD, W.kconv);
 
             matmul(Ly.wv, in_v, xv16, T, v_p, KD);
             gemm16(Ly.sc_v_dyn16, c.KV * 4, C, xv16, T, vd_p, c.KV * 4);
-            conv_rec(Ly, 1, v_p, Ly.h_v, T, KD);
-            k::conv4(v_p, Ly.h_v, Ly.sc_v, vd_p, c.KV, T, KD, W.vconv, g_s);
+            conv_rec_w(Ly, W, 1, v_p, T, KD);
+            conv4_v_w(Ly, W, v_p, Ly.sc_v, vd_p, c.KV, T, KD, W.vconv);
         }
     }
     const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f;
@@ -2035,7 +2238,12 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     if (apr) { cudaStreamSynchronize(g_s); ap1 = now(); g_pf.a_proj += ap1 - ap0; }
     if (kv_is_int()) {
         const int bits = kv_int_bits();
-        if (g_vg_stage != VG_NORMAL) {
+        if (W.batch && T > 1 && T <= BatchSlots::kMaxRows) {
+            k::prep_qkv_r_int_rows(bits, q_p, Ly.q_clip, W.kconv, W.bkci_d, W.bks_d, W.vconv, W.bvci_d, W.bvs_d,
+                                   r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps,
+                                   pos_p, c.alpha, c.n_floor, Ly.kv_cap, nullptr, nullptr,
+                                   nullptr, 0, nullptr, g_s, Ly.sliding ? nullptr : pos_p);
+        } else if (g_vg_stage != VG_NORMAL) {
             k::prep_qkv_r_int_g(bits, q_p, Ly.q_clip, W.kconv, Ly.kci, Ly.ks, W.vconv, Ly.vci, Ly.vs, r_p, Ly.r_clip,
                                 T, c.H, c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps,
                                 Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos_p, Ly.kv_cap, g_s);
@@ -2091,6 +2299,19 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             k::attn_decode_f16(q_p, r_p, sink_p, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0, qk_scale,
                                Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         }
+    } else if (W.batch && T > 1 && T <= BatchSlots::kMaxRows && kv_is_int()) {
+        const uint8_t* const* kci_tab = (const uint8_t* const*) W.bkci_d;
+        const uint8_t* const* vci_tab = (const uint8_t* const*) W.bvci_d;
+        const uint16_t* const* ks_tab = (const uint16_t* const*) W.bks_d;
+        const uint16_t* const* vs_tab = (const uint16_t* const*) W.bvs_d;
+        if (g_attn_gqa && c.H % c.KV == 0 && c.H / c.KV == 3)
+            k::attn_decode_int_rows_gqa(kv_int_bits(), q_p, r_p, sink_p, kci_tab, vci_tab, ks_tab, vs_tab,
+                                        attn_kv_cap, c.H, c.KV, pos_p, 128, qk_scale, Ly.rel_proj, c.d_rel, extent,
+                                        window, T, W.lg, W.o, g_s, nullptr, g_attn_dpp ? 1 : 0);
+        else
+            k::attn_decode_int_rows(kv_int_bits(), q_p, r_p, sink_p, kci_tab, vci_tab, ks_tab, vs_tab, attn_kv_cap,
+                                    c.H, c.KV, pos_p, 128, qk_scale, Ly.rel_proj, c.d_rel, extent, window, T, W.lg,
+                                    W.o, g_s, nullptr, g_attn_dpp ? 1 : 0);
     } else if (T <= 8 && g_group && g_group_attn) {
         if (g_vg_stage != VG_NORMAL) {
             // P fixed at capture; W.lg is already sized for 8 queries x 128 splits.
@@ -2308,12 +2529,12 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     if (vp_attn_idx >= 0) cudaEventRecord(vpF[vp_attn_idx], g_s);
     k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && (T == 1 || g_int4_dense_multi || g_int4_msg || g_int4_prefill), g_s);
     matmul(Ly.wo, W.o, W.x16, T, W.tmp, C);
-    conv_rec(Ly, 2, W.tmp, Ly.h_attn, T, C);
+    conv_rec_w(Ly, W, 2, W.tmp, T, C);
     if (l % c.block == 0) {
         CU(cudaMemcpyAsync(blk(nb), h_in, TC * 4, cudaMemcpyDeviceToDevice, g_s));
-        k::conv4(W.tmp, Ly.h_attn, Ly.sc_attn, nullptr, 0, T, C, r_out, g_s);
+        conv4_attn_w(Ly, W, true, W.tmp, h_in, r_out, T, C);
     } else {
-        k::conv4_res(W.tmp, Ly.h_attn, Ly.sc_attn, nullptr, 0, T, C, h_in, r_out, g_s);
+        conv4_attn_w(Ly, W, false, W.tmp, h_in, r_out, T, C);
     }
 }
 
@@ -2709,8 +2930,8 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
     }
     g_pf.lap(g_pf.experts);
     t_exp += now() - te0;
-    conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-    k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, r_in, h_out, g_s);
+    conv_rec_w(Ly, W, 3, W.tmp, T, C);
+    conv4_mlp_w(Ly, W, W.tmp, r_in, h_out, T, C);
 }
 
 void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, const float* h_in, Work& W,
@@ -3289,7 +3510,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                         out_mode == OutMode::kArgmax && argmax_out && !g_vgraph.disabled && !g_prof && !g_prof_fast &&
                         dump.empty() && !g_trace && g_pop.empty() && !dual() && !g_ep_fast && !g_ep && g_fast &&
                         g_group && g_group_attn && g_int4_experts && !g_int4_pf_off && !g_img.n &&
-                        !g_exp_prefill_wmma && g_dev.size() == 1 && vg_shape_ok && vg_layers_ok;
+                        !g_exp_prefill_wmma && g_dev.size() == 1 && vg_shape_ok && vg_layers_ok && !g_batch_active;
     if (vg_try && g_vgraph.built && g_vgraph.exec) {
         // One replay.  The token rows and positions are staged into the same pinned buffers the graph was captured
         // with; the prep / attention kernels read the base position from W.pos on the device.  The head's eight
@@ -3335,11 +3556,11 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         const size_t rb = (size_t) C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
         for (int t = 0; t < T; ++t)
             k::decode_host(M.embd_type, M.embd + (size_t) tok[t] * rb, C, W.emb_h + (size_t) t * C);
-        for (int t = 0; t < T; ++t) W.pos_h[t] = pos0 + t;
+        for (int t = 0; t < T; ++t) W.pos_h[t] = g_batch_active ? g_batch_pos[t] : pos0 + t;
     }
     CU(cudaMemcpyAsync(W.tmp, W.emb_h, (size_t) T * C * 4, cudaMemcpyHostToDevice, g_s));
     k::rms(W.tmp, M.embd_norm, T, C, c.eps, W.h, g_s);
-    place_pictures(W.h, T, pos0, C, g_s);
+    if (!g_batch_active) place_pictures(W.h, T, pos0, C, g_s);
     CU(cudaMemcpyAsync(W.pos, W.pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, g_s));
     int nb = 0;
     const size_t TC = (size_t) T * C;
@@ -3358,6 +3579,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
     for (int vis = 0; vis < c.n_visit; ++vis) {
         const int l = M.V[vis].l;   // (the layer: its weights, its experts in the cache; the state is the visit's)
         Layer& Ly = bind_visit(M, vis);
+        if (g_batch_active) stage_batch_tables(W, vis, g_batch_rows, g_batch_slot_ids);
         if (Ly.dev != g_cur) {   // the next GPU's layers: the stream and the block states go along
             const int from = g_cur;
             Work& F = dev_work(from);
@@ -3456,7 +3678,21 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         // and no stream sync. The resident T=1 sequence (above) at S=T*K slots; the slots' f32 input is gathered
         // from W.x16 (the same f16 rows run_prefill_moe gathers, so the numerics of the activation stay those
         // of the old verify path). Layers 20+ and g_rec=false keep the old general path.
-        if (g_verify_fast && g_rec && T > 1 && T <= 8 && S <= 64 && g_int4_experts && Ly.i4_loaded && l < g_int4_layers &&
+        // IK2_BATCH_ATTN: the device-only q8x+matvec MoE below is bit-exact ONLY against the resident T=1
+        // verify path (which uses the same family).  The general BATCH MoE path uses rot_pack8+gemm8 with a
+        // different quantizer/reduction order, so enabling q8x+matvec for W.batch diverges.  Keep g_rec-only;
+        // the batch device-only path must reproduce pack8+gemm8 numerics (IK2_BATCH_MOE_DEVICE work).
+        // IK2_BATCH_MOE_DEVICE: W.batch's bit-exact device MoE (pack8+gemm8, expert-major scatter).
+        // Only true batched decode (W.batch); the non-batch g_rec verify path keeps fast_moe_ok verbatim.
+        const bool batch_moe_ok = g_batch_moe_device && W.batch && T > 1 && T <= 8 && S <= 64 &&
+            g_int4_experts && Ly.i4_loaded && l < g_int4_layers && !g_int4_pf_off && !dual() &&
+            !g_ep_fast && !g_prof && dump.empty() && !g_trace && g_pop.empty() && C % 256 == 0 &&
+            (2 * c.F) % 32 == 0 && W.i4_Kpad_f % 256 == 0 && W.i4_pf_cap >= S &&
+            W.i4_pf_Kmax >= C && W.i4_pf_x4 && W.i4_pf_xm && W.i4_pf_xr && Ly.tab_blob &&
+            Ly.i4_tab_Wp[0] && Ly.i4_tab_Wh[0] && Ly.i4_tab_WS[0] && Ly.i4_tab_Wp[2] &&
+            Ly.i4_tab_Wh[2] && Ly.i4_tab_WS[2] && T <= W.Tm;
+        const bool fast_moe_ok = g_verify_fast && g_rec && !batch_moe_ok;
+        if (fast_moe_ok && T > 1 && T <= 8 && S <= 64 && g_int4_experts && Ly.i4_loaded && l < g_int4_layers &&
             !g_int4_pf_off && !dual() && !g_ep_fast && !g_prof && dump.empty() && !g_trace && g_pop.empty() &&
             C % 256 == 0 && (2 * c.F) % 16 == 0 && W.i4_Kpad_f % 256 == 0 && Ly.tab_blob && T <= W.Tm &&
             S <= W.i4_pf_cap) {
@@ -3501,9 +3737,43 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             }
             k::moe_combine_f32(W.y32, W.inv, W.wt, T, c.K, C, W.tmp, false, g_s);
             t_exp += now() - te0;
-            conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            conv_rec_w(Ly, W, 3, W.tmp, T, C);
+            conv4_mlp_w(Ly, W, W.tmp, W.r, W.h, T, C);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);  // no-op: dump.empty() in the guard
+            continue;
+        }
+        // IK2_BATCH_MOE_DEVICE: device-only but BIT-EXACT vs the general MoE path. build the exact
+        // expert-major row permutation on device, then run the SAME rot_pack8 + gemm8(kInt4Sh8) +
+        // scatter_add_rows sequence as run_prefill_moe, instead of q8x/matvec/combine (which diverges).
+        if (batch_moe_ok) {
+            const double te0 = now();
+            const int F = c.F, Kp = W.i4_Kpad_f;
+            moe_batch_perm_kernel<<<1, 256, (size_t) c.E * 2 * sizeof(int), g_s>>>(
+                rtop, rw, Ly.i4_tab_Wp[0], Ly.i4_tab_Wh[0], Ly.i4_tab_WS[0],
+                Ly.i4_tab_Wp[2], Ly.i4_tab_Wh[2], Ly.i4_tab_WS[2], c.E, c.K, S,
+                W.gidx, W.tok, W.wtr, W.sg, W.su,
+                W.i4_Wp_s, W.i4_Wh_s, W.i4_WS_s, W.i4_Wp_dn, W.i4_Wh_dn, W.i4_WS_dn, W.inv);
+            // W.tok[expert-major row] = its slot's token; this is the same row order run_prefill_moe
+            // builds with fill[e]++, so each token receives the expert contributions in expert order.
+            gather_f32_16_kernel<<<S, 256, 0, g_s>>>(W.x16, W.tok, S, C, W.i4_pf_x);
+            k::int4_rot_pack8(W.i4_pf_x, S, C, W.i4_pf_x4, W.i4_pf_xm, W.i4_pf_xr, g_s);
+            k::int4_gemm8_moe_masked(Ly.i4_Wp[0], Ly.i4_Wh[0], Ly.i4_WS[0],
+                                     Ly.i4_wp_stride[0], Ly.i4_wh_stride[0], 2 * F, c.E, W.inv,
+                                     2 * F, C, W.i4_pf_x4, W.i4_pf_xm, W.i4_pf_xr, S, 4, 8,
+                                     W.gu32, nullptr, k::kInt4Sh8, g_s, 2 * F);
+            k::swiglu_cap_f32(W.gu32, S, F, W.sg, W.su, c.gate_cap, c.up_cap, W.h16, g_s);
+            i4_pad_h_kernel<<<S, 256, 0, g_s>>>(W.h16, S, F, Kp, W.i4_pf_x);
+            k::int4_rot_pack8(W.i4_pf_x, S, Kp, W.i4_pf_x4, W.i4_pf_xm, W.i4_pf_xr, g_s);
+            CU(cudaMemsetAsync(W.tmp, 0, (size_t) T * C * sizeof(float), g_s));
+            k::int4_gemm8_moe_masked(Ly.i4_Wp[2], Ly.i4_Wh[2], Ly.i4_WS[2],
+                                     Ly.i4_wp_stride[2], Ly.i4_wh_stride[2], C, c.E, W.inv,
+                                     C, Kp, W.i4_pf_x4, W.i4_pf_xm, W.i4_pf_xr, S, 4, 8,
+                                     W.y32, nullptr, k::kInt4Sh8, g_s, C);
+            moe_batch_scatter_kernel<<<T, 256, 0, g_s>>>(W.y32, W.tok, W.wtr, S, C, W.tmp, C);
+            g_pf.lap(g_pf.experts);
+            t_exp += now() - te0;
+            conv_rec_w(Ly, W, 3, W.tmp, T, C);
+            conv4_mlp_w(Ly, W, W.tmp, W.r, W.h, T, C);
             continue;
         }
 #endif
@@ -3519,8 +3789,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                                       c.gate_cap, c.up_cap, W.h16, g_s);
             k::experts_down(W.blob, S, Ly.ty[2], Ly.eb[0] + Ly.eb[1], W.h16, C, c.F, W.y32, g_s);
             k::moe_combine_f32(W.y32, W.inv, W.wt, T, c.K, C, W.tmp, false, g_s);
-            conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            conv_rec_w(Ly, W, 3, W.tmp, T, C);
+            conv4_mlp_w(Ly, W, W.tmp, W.r, W.h, T, C);
             continue;
         }
         const bool cpu_lane = g_pool && g_overlap && !g_prof && T <= 8 && Ly.ty[0] == k::kNVFP4 &&
@@ -3648,8 +3918,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                                    c.K, Cd, W.tmp + Cd, false, g_s);
             }
             t_exp += now() - te0;
-            conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            conv_rec_w(Ly, W, 3, W.tmp, T, C);
+            conv4_mlp_w(Ly, W, W.tmp, W.r, W.h, T, C);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
@@ -3724,8 +3994,9 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                     k::ep_combine_block(dev_work(0).y32, y_peer, dev_work(0).blob, dev_work(0).wt,
                                         T, c.K, C, dev_work(0).tmp, g_s);
                 }
-                conv_rec(Ly, 3, dev_work(0).tmp, Ly.h_mlp, T, C);
-                k::conv4_res(dev_work(0).tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, dev_work(0).r, dev_work(0).h, g_s);
+                Work& W0 = dev_work(0);
+                conv_rec_w(Ly, W0, 3, W0.tmp, T, C);
+                conv4_mlp_w(Ly, W0, W0.tmp, W0.r, W0.h, T, C);
             }
             dump_f("blk." + std::to_string(vis) + ".out", dev_work(0).h, TC);
             continue;
@@ -3815,8 +4086,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                                    false, g_s);
             }
             t_exp += now() - te0;
-            conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            conv_rec_w(Ly, W, 3, W.tmp, T, C);
+            conv4_mlp_w(Ly, W, W.tmp, W.r, W.h, T, C);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
         }
@@ -3870,8 +4141,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                                false, g_s);
             g_pf.lap(g_pf.experts);
             t_exp += now() - te0;
-            conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            conv_rec_w(Ly, W, 3, W.tmp, T, C);
+            conv4_mlp_w(Ly, W, W.tmp, W.r, W.h, T, C);
             g_pf.lap(g_pf.rest);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
@@ -4069,8 +4340,8 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             k::moe_combine_f32(W.y32, pid, pwt, T, c.K, C, W.tmp, false, g_s);
             g_pf.lap(g_pf.experts);
             t_exp += now() - te0;
-            conv_rec(Ly, 3, W.tmp, Ly.h_mlp, T, C);
-            k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, W.r, W.h, g_s);
+            conv_rec_w(Ly, W, 3, W.tmp, T, C);
+            conv4_mlp_w(Ly, W, W.tmp, W.r, W.h, T, C);
             g_pf.lap(g_pf.rest);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
             continue;
@@ -4113,6 +4384,51 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
     }
 #undef W
 #undef EC
+}
+
+// IK2_BATCH_ATTN: one forward of n_rows independent greedy slots.  Each row has its own token, absolute position
+// and KV/conv state; the 48 visits, grouped INT4 MoE and head all run as the existing T=2..8 verify window, with
+// rows -> slots instead of rows -> consecutive draft positions.  Non-graph first; a graph can be added later by
+// capturing this exact call shape.  Eligibility failures fall back to serial forward() calls, so correctness never
+// depends on the new path being enabled.
+void forward_batch(Model& M, const int* tok, int n_rows, const int* pos, const int* slot_ids, OutMode out_mode,
+                   std::vector<int>* argmax_out, double& t_exp) {
+    if (n_rows <= 0 || !tok || !pos || !slot_ids) return;
+    if (argmax_out) argmax_out->clear();
+    auto serial = [&]() {
+        std::vector<float> lo;
+        for (int i = 0; i < n_rows; ++i) {
+            std::vector<int> one;
+            if (g_batch_decode) load_batch_slot(M, slot_ids[i]);
+            forward(M, tok + i, 1, pos[i], false, out_mode, std::string(), lo, &one, t_exp);
+            if (argmax_out && !one.empty()) argmax_out->push_back(one[0]);
+        }
+    };
+    bool ok = g_batch_decode && g_batch_slots.n_slot > 0 && n_rows > 1 &&
+              n_rows <= BatchSlots::kMaxRows && out_mode == OutMode::kArgmax && argmax_out &&
+              kv_is_int() && !g_kv_host && g_dev.size() == 1 && !dual() && !g_ep && !g_tp &&
+              g_group && g_group_attn && !g_prof &&
+              !g_prof_fast && !g_trace && g_pop.empty() && g_img.n == 0 && !g_cancel &&
+              (size_t) n_rows * M.c.K <= 64 && n_rows <= dev_work(0).Tm;
+    for (int i = 0; i < n_rows && ok; ++i) ok &= slot_ids[i] >= 0 && slot_ids[i] < g_batch_slots.n_slot;
+    if (!ok) { serial(); return; }
+    Work& W = dev_work(0);
+    use_dev(0);
+    bool got = false;
+    {
+        W.batch = true; W.batch_rows = n_rows;
+        g_batch_active = true; g_batch_pos = pos; g_batch_slot_ids = slot_ids; g_batch_rows = n_rows;
+        struct BatchGuard {
+            Work& W;
+            ~BatchGuard() { g_batch_active = false; g_batch_pos = nullptr; g_batch_slot_ids = nullptr; W.batch = false; W.batch_rows = 0; }
+        } guard{W};
+        std::vector<float> lo;
+        std::vector<int> ag;
+        forward(M, tok, n_rows, 0, true, OutMode::kArgmax, std::string(), lo, &ag, t_exp);
+        got = (int) ag.size() == n_rows;
+        if (got) *argmax_out = std::move(ag);
+    }
+    if (!got) serial();
 }
 
 // Layer-major super-chunk prefill (single GPU, no dump, no drafter):
@@ -4619,7 +4935,10 @@ int run(int argc, char** argv) {
     g_int4_pf_off = getenv("IK2_INT4_PF") && !std::atoi(getenv("IK2_INT4_PF"));
     g_verify_fast = getenv("IK2_VERIFY_FAST") && std::atoi(getenv("IK2_VERIFY_FAST")) != 0;
     g_verify_graph = getenv("IK2_VERIFY_GRAPH") && std::atoi(getenv("IK2_VERIFY_GRAPH")) != 0;
+    g_batch_decode = getenv("IK2_BATCH_ATTN") && std::atoi(getenv("IK2_BATCH_ATTN")) != 0;
+    g_batch_moe_device = getenv("IK2_BATCH_MOE_DEVICE") && std::atoi(getenv("IK2_BATCH_MOE_DEVICE")) != 0;
     g_serve_dspec = getenv("IK2_SERVE_DSPEC") && std::atoi(getenv("IK2_SERVE_DSPEC")) != 0;
+    if (const char* pp = getenv("IK2_PARALLEL")) { int v = std::atoi(pp); if (v >= 1 && v <= 8) g_parallel = v; }
     g_moe_group_exp = getenv("IK2_MOE_GROUP_EXPERT") && std::atoi(getenv("IK2_MOE_GROUP_EXPERT")) != 0;
     if (getenv("IK2_INT4_DENSE")) g_int4_dense = std::atoi(getenv("IK2_INT4_DENSE"));
     if (const char* pf = getenv("IK2_DECODE_PFULL")) { int v = std::atoi(pf); if (v >= 1 && v <= 512) g_decode_pfull = v; }
@@ -5249,6 +5568,45 @@ int run(int argc, char** argv) {
         Vi.h_attn = dalloc<float>(3 * C);
         Vi.h_mlp = dalloc<float>(3 * C);
     }
+    if (g_batch_decode) {
+        // IK2_BATCH_ATTN: real extra VRAM -- one complete KV+conv state per (slot, visit).  Host-mapped KV,
+        // FP8/FP16 KV, CPU-offload and multi-GPU are explicitly unsupported; falling back keeps those paths exact.
+        if (g_parallel < 2 || g_dev.size() != 1 || g_ep || g_tp || !kv_is_int() || g_kv_host) {
+            fprintf(stderr, "ik2: IK2_BATCH_ATTN=1 ignored (requires IK2_PARALLEL>=2, one GPU, INT KV in VRAM)\n");
+            g_batch_decode = false;
+        } else {
+            use_dev(0);
+            BatchSlots& B = g_batch_slots;
+            B.n_slot = std::min(g_parallel, BatchSlots::kMaxRows);
+            B.n_visit = c.n_visit;
+            const size_t nv = (size_t) B.n_visit, ns = (size_t) B.n_slot;
+            const int bits = kv_int_bits();
+            B.kci.resize(nv * ns); B.vci.resize(nv * ns);
+            B.ks.resize(nv * ns);  B.vs.resize(nv * ns);
+            B.h_k.resize(nv * ns); B.h_v.resize(nv * ns);
+            B.h_attn.resize(nv * ns); B.h_mlp.resize(nv * ns);
+            B.bytes = 0;
+            for (int v = 0; v < c.n_visit; ++v) {
+                const Visit& Vi = M.V[v];
+                const size_t code_b = (size_t) Vi.kv_cap * KD * bits / 8;
+                const size_t scale_b = (size_t) Vi.kv_cap * c.KV * sizeof(uint16_t);
+                const size_t conv_b = 3 * KD * sizeof(float), conv_c = 3 * C * sizeof(float);
+                B.bytes += ns * (2 * code_b + 2 * scale_b + 2 * conv_b + 2 * conv_c);
+                for (int s = 0; s < B.n_slot; ++s) {
+                    const size_t i = B.idx(s, v);
+                    B.kci[i] = dalloc<uint8_t>(code_b); B.vci[i] = dalloc<uint8_t>(code_b);
+                    B.ks[i]  = dalloc<uint16_t>((size_t) Vi.kv_cap * c.KV);
+                    B.vs[i]  = dalloc<uint16_t>((size_t) Vi.kv_cap * c.KV);
+                    B.h_k[i] = dalloc<float>(3 * KD); B.h_v[i] = dalloc<float>(3 * KD);
+                    B.h_attn[i] = dalloc<float>(3 * C); B.h_mlp[i] = dalloc<float>(3 * C);
+                    CU(cudaMemset(B.h_k[i], 0, conv_b)); CU(cudaMemset(B.h_v[i], 0, conv_b));
+                    CU(cudaMemset(B.h_attn[i], 0, conv_c)); CU(cudaMemset(B.h_mlp[i], 0, conv_c));
+                }
+            }
+            printf("ik2: IK2_BATCH_ATTN: %d slots x %d visits of extra KV/conv VRAM = %.2f GiB\n",
+                   B.n_slot, B.n_visit, B.bytes / 1073741824.0);
+        }
+    }
     vram_mark("after-KV-visits");
     c.n_rows = (int) (S.info("output.weight")->elements() / C);
     // IK2_INT4_HEAD_DECODE: skip the head's Q8/raw copy entirely; the INT4 sidecar (loaded below) is the only
@@ -5624,6 +5982,25 @@ int run(int argc, char** argv) {
         W.kv_v16 = dalloc<uint16_t>((size_t) W.kv_tmp_cap * KD);
     }
     W.pos = dalloc<int>(T_buf);
+    if (g_batch_decode) {
+        const int R = BatchSlots::kMaxRows;
+        const int NS = g_batch_moe_device ? Work::kBatchStageSlots : 1;
+        W.bkci_d = dalloc<uint8_t*>(R); W.bvci_d = dalloc<uint8_t*>(R);
+        W.bks_d = dalloc<uint16_t*>(R); W.bvs_d = dalloc<uint16_t*>(R);
+        W.bh_k_d = dalloc<float*>(R); W.bh_v_d = dalloc<float*>(R);
+        W.bh_attn_d = dalloc<float*>(R); W.bh_mlp_d = dalloc<float*>(R);
+        CU(cudaHostAlloc((void**) &W.bkci_h, (size_t) R * NS * sizeof(uint8_t*), cudaHostAllocDefault));
+        CU(cudaHostAlloc((void**) &W.bvci_h, (size_t) R * NS * sizeof(uint8_t*), cudaHostAllocDefault));
+        CU(cudaHostAlloc((void**) &W.bks_h, (size_t) R * NS * sizeof(uint16_t*), cudaHostAllocDefault));
+        CU(cudaHostAlloc((void**) &W.bvs_h, (size_t) R * NS * sizeof(uint16_t*), cudaHostAllocDefault));
+        CU(cudaHostAlloc((void**) &W.bh_k_h, (size_t) R * NS * sizeof(float*), cudaHostAllocDefault));
+        CU(cudaHostAlloc((void**) &W.bh_v_h, (size_t) R * NS * sizeof(float*), cudaHostAllocDefault));
+        CU(cudaHostAlloc((void**) &W.bh_attn_h, (size_t) R * NS * sizeof(float*), cudaHostAllocDefault));
+        CU(cudaHostAlloc((void**) &W.bh_mlp_h, (size_t) R * NS * sizeof(float*), cudaHostAllocDefault));
+        if (g_batch_moe_device)
+            for (int i = 0; i < Work::kBatchStageSlots; ++i)
+                CU(cudaEventCreateWithFlags(&W.batch_stage_ev[i], cudaEventDisableTiming));
+    }
     W.rlog = dalloc<float>(T_buf * c.E), W.route_d = dalloc<int>(S_buf * 2);
     W.ex16 = dalloc<uint16_t>(T_buf * C), W.w16 = dalloc<uint16_t>((size_t) 2 * c.F * C);   // (one expert's tokens)
     W.h16 = dalloc<uint16_t>(std::max<size_t>(64, T_buf) * c.F);
@@ -5967,12 +6344,17 @@ int run(int argc, char** argv) {
         // goes back to that point instead of the start. Full-layer KV needs nothing: positions rewrite cleanly.
         struct Snap {
             int pos = -1;
+            bool full = false;   // batch slot snapshots must park full-attention KV too (different prompts share cells)
             std::vector<float*> h;   // [layer * 4 + conv]
             std::vector<std::vector<uint8_t>> kv_k, kv_v;
             std::vector<std::vector<uint8_t>> kv_ks, kv_vs;   // int8/int4: per-head fp16 scales
         };
         const size_t kv_elem_b = g_kv_fp8 ? 1 : 2;
-        const size_t kv_code_b = kv_is_int() ? (size_t) kv_int_bits() / 8 : kv_elem_b;
+        // Per-token KV row bytes.  For INT4 the old `KD * bits / 8` was computed as `KD * (bits/8)` = 0,
+        // so every int4 KV snapshot silently copied zero bytes.  Batch slots switch between different
+        // prompts, so that bug shows up as cross-slot state corruption; compute the row width after the
+        // multiply, matching the allocation at :5224 (`cap * KD * kv_int_bits() / 8`).
+        const size_t kv_row_b = kv_is_int() ? ((size_t) KD * kv_int_bits() / 8) : ((size_t) KD * kv_elem_b);
         // IK2_CONV_CACHE_MIB: conversation-cache budget in host RAM (default 8192 = 8 GiB). The cache parks each
         // session's snapshot (conv histories + sliding KV windows +, with IK2_CONV_CACHE_FULL, the full-attention
         // KV) so an agent's next turn reuses the shared prefix instead of re-running it. The number of snapshots is
@@ -5980,13 +6362,20 @@ int run(int argc, char** argv) {
         const size_t conv_cache_mib = getenv("IK2_CONV_CACHE_MIB") ? (size_t) std::atof(getenv("IK2_CONV_CACHE_MIB")) : 8192;
         const bool conv_cache_full = getenv("IK2_CONV_CACHE_FULL") && std::atoi(getenv("IK2_CONV_CACHE_FULL"));
         size_t snap_bytes = 0;   // host bytes per snapshot (sliding KV + scales; conv histories are VRAM)
+        size_t batch_snap_bytes = 0;   // a batch slot must restore full-attention KV of a different prompt
         for (size_t l = 0; l < M.V.size(); ++l) {
             const Layer& Ly = bind_visit(M, (int) l);
             const bool park_full = conv_cache_full && !Ly.sliding;
             if ((Ly.sliding && Ly.kv_cap < ctx) || park_full) {
                 const size_t cap = park_full ? (size_t) ctx : (size_t) c.window;
-                snap_bytes += 2 * cap * KD * kv_code_b;
+                snap_bytes += 2 * cap * kv_row_b;
                 if (kv_is_int()) snap_bytes += 2 * cap * c.KV * 2;
+            }
+            const bool batch_full = !Ly.sliding;
+            if ((Ly.sliding && Ly.kv_cap < ctx) || batch_full) {
+                const size_t cap = batch_full ? (size_t) ctx : (size_t) c.window;
+                batch_snap_bytes += 2 * cap * kv_row_b;
+                if (kv_is_int()) batch_snap_bytes += 2 * cap * c.KV * 2;
             }
         }
         int n_snaps = 8;
@@ -5994,8 +6383,8 @@ int run(int argc, char** argv) {
         std::printf("conversation cache: %zu MiB budget, %d snapshots of %.1f MiB host RAM (%s)\n",
                     conv_cache_mib, n_snaps, snap_bytes / 1048576.0, conv_cache_full ? "full KV" : "sliding KV");
         std::fflush(stdout);
-        std::vector<Snap> snaps(n_snaps);
-        for (auto& sn : snaps) {
+        auto alloc_snap = [&](Snap& sn, bool full) {
+            sn.full = full;
             sn.kv_k.resize(M.V.size());
             sn.kv_v.resize(M.V.size());
             sn.kv_ks.resize(M.V.size());
@@ -6005,10 +6394,10 @@ int run(int argc, char** argv) {
                 use_dev(Ly.dev);
                 const size_t cc[4] = {KD, KD, C, C};
                 for (int i = 0; i < 4; ++i) sn.h.push_back(dalloc<float>(3 * cc[i]));
-                const bool park_full = conv_cache_full && !Ly.sliding;
+                const bool park_full = full && !Ly.sliding;
                 if ((Ly.sliding && Ly.kv_cap < ctx) || park_full) {
                     const size_t cap = park_full ? (size_t) ctx : (size_t) c.window;
-                    const size_t bytes = cap * KD * kv_code_b;
+                    const size_t bytes = cap * kv_row_b;
                     sn.kv_k[l].resize(bytes);
                     sn.kv_v[l].resize(bytes);
                     if (kv_is_int()) {
@@ -6017,7 +6406,9 @@ int run(int argc, char** argv) {
                     }
                 }
             }
-        }
+        };
+        std::vector<Snap> snaps(n_snaps);
+        for (auto& sn : snaps) alloc_snap(sn, conv_cache_full);
         int snap_next = 0;
         auto snap_copy = [&](Snap& sn, bool save) {
             const size_t cc[4] = {KD, KD, C, C};
@@ -6030,14 +6421,14 @@ int run(int argc, char** argv) {
                     float* sv = sn.h[l * 4 + i];
                     CU(cudaMemcpyAsync(save ? sv : hs[i], save ? hs[i] : sv, 3 * cc[i] * 4, cudaMemcpyDeviceToDevice, g_s));
                 }
-                const bool park_full = conv_cache_full && !Ly.sliding;
+                const bool park_full = sn.full && !Ly.sliding;
                 if (sn.pos > 0 && ((Ly.sliding && Ly.kv_cap < ctx) || park_full)) {
                     const int w = park_full ? sn.pos : std::min(sn.pos, c.window);
                     const int k_start = sn.pos - w;
                     const int s0 = k_start % Ly.kv_cap;
                     const int n1 = std::min(w, Ly.kv_cap - s0);
                     const int n2 = w - n1;
-                    const size_t row_b = (size_t) KD * kv_code_b;
+                    const size_t row_b = kv_row_b;
                     uint8_t* dk = kv_is_int() ? Ly.kci : (g_kv_fp8 ? Ly.kc8 : (uint8_t*) Ly.kc);
                     uint8_t* dv = kv_is_int() ? Ly.vci : (g_kv_fp8 ? Ly.vc8 : (uint8_t*) Ly.vc);
                     uint8_t* hk = sn.kv_k[l].data();
@@ -6084,6 +6475,97 @@ int run(int argc, char** argv) {
             }
             return v;
         };
+        // ---- P1 continuous batching (IK2_PARALLEL>1). The solo path below is untouched when it is off. ----
+        struct Ik2Req {
+            bool active = false, cancel = false, admitted = false;
+            int slot = -1, max_new = 0, generated = 0, prompt_len = 0, prefill_pos = 0, next_tok = -1;
+            double temp = 0, top_p = 1, top_k = 0;
+            long long seed = -1;
+            std::mt19937_64 rng;
+            std::vector<int> prompt_ids, hist, stops;
+            std::vector<uint64_t> sig;
+            std::vector<float> last;
+            bool cand = false;
+            bool have_state = false;
+            Snap state;
+            double t_start = 0, prompt_ms = 0, decode_t0 = 0;
+            int cached_prefix = 0;
+        };
+        // A batch slot restores full-attention KV of a different prompt, so its snapshot is much bigger than
+        // the sliding-only conversation snapshot. Cap the total host footprint and the free VRAM; never let
+        // a misconfigured IK2_PARALLEL turn into an OOM hang (q36 does the same kind of early capacity check).
+        if (g_parallel > 1 && batch_snap_bytes > 0) {
+            const size_t budget = (size_t) (getenv("IK2_BATCH_HOST_MIB")
+                                            ? std::atof(getenv("IK2_BATCH_HOST_MIB")) : 8192) << 20;
+            const int fit = (int) std::max<size_t>(1, budget / batch_snap_bytes);
+            if (fit < g_parallel) {
+                std::fprintf(stderr, "ERR batch host KV needs %.1f MiB/slot (ctx=%d), IK2_BATCH_HOST_MIB=%zu: "
+                                     "lowering IK2_PARALLEL %d -> %d\n",
+                             batch_snap_bytes / 1048576.0, ctx, budget >> 20, g_parallel, fit);
+                g_parallel = fit;
+            }
+        }
+        if (g_parallel > 1) {
+            size_t free_b = 0, total_b = 0;
+            if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < (256u << 20)) {
+                std::fprintf(stderr, "ERR only %.1f MiB VRAM free; lowering IK2_PARALLEL %d -> 1\n",
+                             free_b / 1048576.0, g_parallel);
+                g_parallel = 1;
+            }
+        }
+        std::vector<Ik2Req> reqs;
+        int loaded_slot = -1;
+        bool batch_dirty = false;
+        long long batch_steps = 0, batch_tokens = 0;
+        const bool batch_stats = getenv("IK2_BATCH_STATS") && std::atoi(getenv("IK2_BATCH_STATS"));
+        if (g_parallel > 1) {
+            if (batch_stats)
+                std::printf("batch host KV: %.1f MiB/slot, %d slots\n", batch_snap_bytes / 1048576.0, g_parallel);
+            reqs.resize(g_parallel);
+            for (int b = 0; b < g_parallel; ++b) {
+                reqs[b].slot = b;
+                alloc_snap(reqs[b].state, true);
+            }
+        }
+        // Sampling, shared by the solo path and the batch scheduler. Parameterized so the solo path keeps its
+        // original RNG stream byte for byte (same code, same order of draws).
+        auto pick_top = [&](std::vector<std::pair<float, int>>& cd, double temp, double top_p, int top_k,
+                            std::mt19937_64& rg) -> int {
+            const int kk = std::min((int) cd.size(), top_k > 0 ? std::min(top_k, kCandK) : kCandK);
+            std::partial_sort(cd.begin(), cd.begin() + kk, cd.end(),
+                              [](const std::pair<float, int>& a2, const std::pair<float, int>& b2) {
+                                  return a2.first > b2.first || (a2.first == b2.first && a2.second < b2.second);
+                              });
+            std::vector<double> pr(kk);
+            double z = 0;
+            for (int j = 0; j < kk; ++j) z += (pr[j] = std::exp((cd[j].first - cd[0].first) / temp));
+            double acc = 0;
+            int keep = kk;
+            for (int j = 0; j < kk; ++j) {
+                acc += pr[j] / z;
+                if (acc >= top_p) { keep = j + 1; break; }
+            }
+            double zk = 0;
+            for (int j = 0; j < keep; ++j) zk += pr[j];
+            double u = std::uniform_real_distribution<double>(0, zk)(rg);
+            for (int j = 0; j < keep; ++j) {
+                u -= pr[j];
+                if (u <= 0) return cd[j].second;
+            }
+            return cd[keep - 1].second;
+        };
+        auto pick = [&](const float* r, double temp, double top_p, int top_k, std::mt19937_64& rg) -> int {
+            if (temp <= 0) return (int) (std::max_element(r, r + c.n_vocab) - r);
+            std::vector<std::pair<float, int>> cd(c.n_vocab);
+            for (int v = 0; v < c.n_vocab; ++v) cd[v] = {r[v], v};
+            return pick_top(cd, temp, top_p, top_k, rg);
+        };
+        auto pick_cand = [&](double temp, double top_p, int top_k, std::mt19937_64& rg) -> int {
+            std::vector<std::pair<float, int>> cd(g_cand.n);
+            for (int i = 0; i < g_cand.n; ++i) cd[i] = {g_cand.val[i], g_cand.idx[i]};
+            return pick_top(cd, temp, top_p, top_k, rg);
+        };
+        const bool use_cand = !(getenv("IK2_CAND") && !std::atoi(getenv("IK2_CAND")));
         std::signal(SIGUSR1, on_usr1);
         // The engine protocol (serve/server.py's StrataEngine): "GEN <max_new> [key=value ...] <ids>" in; "PP ..." per
         // prompt pass, "T <id>" per token and "DONE <generated> <prompt> <prompt_ms> <decode_ms> <stop|length|cancel>
@@ -6094,8 +6576,8 @@ int run(int argc, char** argv) {
             eos_ids.push_back(199999);   // (Inkling 2's <|endoftext|>)
         }
         if (serve_strata) {
-            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d\n",
-                        kv_is_int() ? (kv_int_bits() == 4 ? "int4" : "int8") : (g_kv_fp8 ? "fp8" : "f16"), ctx, n_gpu);
+            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d batch_slots=%d slot_read=1\n",
+                        kv_is_int() ? (kv_int_bits() == 4 ? "int4" : "int8") : (g_kv_fp8 ? "fp8" : "f16"), ctx, n_gpu, g_parallel);
             std::printf("READY %d stop\n", ctx);
         } else {
             std::printf("@READY ctx %d\n", ctx);
@@ -6131,9 +6613,264 @@ int run(int argc, char** argv) {
             in_q.pop_front();
             return true;
         };
+        // Non-blocking companion to next_line: while batch slots run we must keep serving new BGEN/BSTOP lines.
+        auto poll_line = [&](std::string& l) {
+            std::lock_guard<std::mutex> lk(in_m);
+            if (in_q.empty()) return false;
+            l = std::move(in_q.front());
+            in_q.pop_front();
+            return true;
+        };
+        auto rq_pos = [](const Ik2Req& r) {
+            return r.prefill_pos < r.prompt_len ? r.prefill_pos : (int) r.hist.size();
+        };
+        auto any_active = [&]() {
+            for (const auto& r : reqs) if (r.active) return true;
+            return false;
+        };
+        auto finish_req = [&](int b, const char* reason) {
+            Ik2Req& r = reqs[b];
+            const double d0 = r.decode_t0 > 0 ? r.decode_t0 : r.t_start;
+            std::printf("BDONE %d %d %s %.1f read=%.1f\n", b, r.generated, reason, (now() - d0) * 1e3, r.prompt_ms);
+            r.active = false;
+            r.cancel = false;
+        };
+        // The device holds one state at a time. Park the outgoing slot's conv state + full/sliding KV in its own
+        // snapshot, then restore the incoming one. Solo requests never call this (g_parallel==1 path unchanged).
+        auto ensure_loaded = [&](int b) {
+            if (g_batch_decode) {
+                // Every request has its own resident KV/conv state; no snapshot swap.  Preflills use M.V, so point
+                // the layer state at this slot's storage, and zero conv histories on first use.
+                if (loaded_slot == b) return;
+                Ik2Req& r = reqs[b];
+                if (!r.have_state) { reset_batch_slot(b, M.c.KV * M.c.D, M.c.C); r.have_state = true; }
+                load_batch_slot(M, b);
+                loaded_slot = b;
+                return;
+            }
+            if (loaded_slot == b) return;
+            if (loaded_slot >= 0 && reqs[loaded_slot].active) {
+                Ik2Req& p = reqs[loaded_slot];
+                p.state.pos = rq_pos(p);
+                snap_copy(p.state, true);
+            }
+            Ik2Req& r = reqs[b];
+            r.state.pos = rq_pos(r);
+            if (r.have_state) snap_copy(r.state, false);
+            else { reset(); r.have_state = true; }
+            loaded_slot = b;
+        };
+        auto admit_bgen = [&](const std::string& ln) {
+            std::istringstream s(ln);
+            std::string cmd, ids_s, w;
+            int b = -1, mx = 0;
+            double temp = 0, top_p = 1, top_k = 0;
+            long long seed = -1;
+            s >> cmd >> b >> mx;
+            while (s >> w) {
+                const size_t eq = w.find('=');
+                if (eq == std::string::npos) { ids_s = w; continue; }
+                const std::string k = w.substr(0, eq), v = w.substr(eq + 1);
+                if (k == "temperature") temp = std::atof(v.c_str());
+                else if (k == "top_p") top_p = std::atof(v.c_str());
+                else if (k == "top_k") top_k = std::atof(v.c_str());
+                else if (k == "seed") seed = std::atoll(v.c_str());
+            }
+            const std::vector<int> ids = parse_ints(ids_s);
+            const char* err = nullptr;
+            if (cmd != "BGEN") err = "BGENI is not supported by the ik2 batch scheduler (no per-slot pictures)";
+            else if (b < 0 || b >= g_parallel) err = "no such batch slot";
+            else if (reqs[b].active) err = "batch slot is busy";
+            else if (mx <= 0) err = "bad max_new";
+            else if (ids.empty()) err = "an empty prompt";
+            else if ((int) ids.size() + mx > ctx) err = "the prompt and max_tokens pass the context";
+            if (err) {
+                std::printf("ERR BGEN: %s (--batch %d)\n", err, g_parallel);
+                std::fflush(stdout);
+                return;
+            }
+            Ik2Req& r = reqs[b];
+            r.active = true; r.cancel = false; r.admitted = true;
+            r.slot = b; r.max_new = mx; r.generated = 0;
+            r.prompt_len = (int) ids.size(); r.prefill_pos = 0; r.next_tok = -1;
+            r.temp = temp; r.top_p = top_p; r.top_k = top_k; r.seed = seed;
+            r.rng.seed(seed >= 0 ? (uint64_t) seed : (uint64_t) (1234 + b));
+            r.prompt_ids = ids; r.hist.clear(); r.sig.assign(ids.size(), 0); r.stops = eos_ids;
+            r.last.clear(); r.cand = false; r.next_tok = -1;
+            r.have_state = false; r.state.pos = 0;
+            r.t_start = now(); r.prompt_ms = 0; r.decode_t0 = 0; r.cached_prefix = 0;
+            // slot_read=1: zero-HoL admission goes on the control stream before the prompt is read.
+            std::printf("DONE 0 %zu 0.0 0.0 admit 0 0 0\n", r.prompt_ids.size());
+            std::printf("BADM %d 1\n", b);
+            std::fflush(stdout);
+        };
+        auto batch_control = [&](const std::string& ln, bool& quit) {
+            if (ln == "QUIT") {
+                quit = true;
+                for (auto& r : reqs) r.cancel = true;
+                return;
+            }
+            if (ln.rfind("BSTOP ", 0) == 0 || ln.rfind("CANCEL ", 0) == 0) {
+                const int b = std::atoi(ln.c_str() + (ln[0] == 'B' ? 6 : 7));
+                if (b >= 0 && b < g_parallel && reqs[b].active) reqs[b].cancel = true;
+                return;
+            }
+            if (ln == "BYIELD" || ln.rfind("BYIELD ", 0) == 0 || ln.rfind("BSTAT", 0) == 0) return;
+            if (ln.rfind("BGEN ", 0) == 0 || ln.rfind("BGENI ", 0) == 0) { admit_bgen(ln); return; }
+            if (ln == "STOP" || ln.rfind("STOP ", 0) == 0) return;   // solo-only cancel
+            if (ln == "GEN" || ln.rfind("GEN ", 0) == 0)
+                std::printf("ERR solo GEN while batch slots are active\nDONE 0 0 0.0 0.0 cancel 0 0 0\n");
+        };
+        // One continuous-batching step: decode one token for every decoding slot first (no head-of-line
+        // blocking), then fill the remaining token budget with chunked prefill, round-robin over slots.
+        // P1 calls the existing single-token / single-chunk forward for each step; the kernels are unchanged.
+        auto batch_step = [&]() {
+            if (!any_active()) { busy = false; return; }
+            busy = true;
+            ++batch_steps;
+            // IK2_BATCH_ATTN: one greedy decode forward for all ready slots.  Sampling slots (and single ready
+            // slots) keep the original serial path, so their RNG/order and output are unchanged.
+            std::vector<char> batched((size_t) g_parallel, 0);
+            if (g_batch_decode) {
+                std::vector<int> ids, toks, poss;
+                for (int b = 0; b < g_parallel; ++b) {
+                    Ik2Req& r = reqs[b];
+                    if (!r.active || r.prefill_pos < r.prompt_len || r.next_tok < 0 || r.cancel ||
+                        r.generated >= r.max_new || r.temp > 0) continue;
+                    ensure_loaded(b);
+                    ids.push_back(b); toks.push_back(r.next_tok); poss.push_back(rq_pos(r));
+                }
+                if (ids.size() >= 2 && (int) ids.size() <= BatchSlots::kMaxRows) {
+                    std::vector<int> ag;
+                    forward_batch(M, toks.data(), (int) ids.size(), poss.data(), ids.data(), OutMode::kArgmax,
+                                  &ag, t_exp);
+                    if ((int) ag.size() == (int) ids.size()) {
+                        for (size_t i = 0; i < ids.size(); ++i) {
+                            const int b = ids[i], ntok = ag[i];
+                            Ik2Req& r = reqs[b];
+                            r.hist.push_back(toks[i]);
+                            ++r.generated;
+                            r.next_tok = ntok;
+                            r.cand = false;
+                            r.last.clear();
+                            std::printf("BT %d %d\n", b, ntok);
+                            ++batch_tokens;
+                            batched[b] = 1;
+                            if (r.cancel || std::find(r.stops.begin(), r.stops.end(), ntok) != r.stops.end())
+                                finish_req(b, r.cancel ? "cancel" : "stop");
+                            else if (r.generated >= r.max_new) finish_req(b, "length");
+                        }
+                        loaded_slot = -1;
+                    }
+                }
+            }
+            for (int b = 0; b < g_parallel; ++b) {
+                if (batched[b]) continue;
+                Ik2Req& r = reqs[b];
+                if (!r.active || r.prefill_pos < r.prompt_len || r.next_tok < 0) continue;
+                if (r.cancel) { finish_req(b, "cancel"); continue; }
+                if (r.generated >= r.max_new) { finish_req(b, "length"); continue; }
+                ensure_loaded(b);
+                const int tok = r.next_tok;
+                int ntok = -1;
+                if (r.temp <= 0) {
+                    std::vector<float> lo;
+                    std::vector<int> ag;
+                    forward(M, &tok, 1, rq_pos(r), false, OutMode::kArgmax, std::string(), lo, &ag, t_exp);
+                    ntok = ag.empty() ? 0 : ag[0];
+                    r.cand = false;
+                    r.last.clear();
+                } else {
+                    std::vector<float> lo;
+                    forward(M, &tok, 1, rq_pos(r), false, use_cand ? OutMode::kCand : OutMode::kLogits,
+                            std::string(), lo, nullptr, t_exp);
+                    r.cand = use_cand && g_cand.n >= 0;
+                    r.last = std::move(lo);
+                    ntok = r.cand ? pick_cand(r.temp, r.top_p, r.top_k, r.rng)
+                                  : pick(r.last.data(), r.temp, r.top_p, r.top_k, r.rng);
+                }
+                r.hist.push_back(tok);
+                ++r.generated;
+                r.next_tok = ntok;
+                std::printf("BT %d %d\n", b, ntok);
+                ++batch_tokens;
+                if (r.cancel || std::find(r.stops.begin(), r.stops.end(), ntok) != r.stops.end()) {
+                    finish_req(b, r.cancel ? "cancel" : "stop");
+                    continue;
+                }
+                if (r.generated >= r.max_new) finish_req(b, "length");
+            }
+            int n_pf = 0;
+            for (const auto& r : reqs) if (r.active && r.prefill_pos < r.prompt_len) ++n_pf;
+            if (n_pf > 0) {
+                const int per = std::max(1, std::min(chunk, 512) / n_pf);
+                for (int b = 0; b < g_parallel; ++b) {
+                    Ik2Req& r = reqs[b];
+                    if (!r.active || r.prefill_pos >= r.prompt_len) continue;
+                    if (r.cancel) { finish_req(b, "cancel"); continue; }
+                    ensure_loaded(b);
+                    const int p0 = r.prefill_pos;
+                    const int n = std::min(per, r.prompt_len - p0);
+                    const bool last_c = p0 + n == r.prompt_len;
+                    std::vector<float> lo;
+                    forward(M, r.prompt_ids.data() + p0, n, p0, false,
+                            last_c ? OutMode::kLogits : OutMode::kNone, std::string(), lo, nullptr, t_exp);
+                    r.prefill_pos += n;
+                    if (last_c) {
+                        r.hist = r.prompt_ids;
+                        r.decode_t0 = now();
+                        r.prompt_ms = (r.decode_t0 - r.t_start) * 1e3;
+                        const int first = pick(lo.data(), r.temp, r.top_p, r.top_k, r.rng);
+                        r.last = std::move(lo);
+                        r.next_tok = first;
+                        r.generated = 1;
+                        r.cand = false;
+                        std::printf("BT %d %d\n", b, first);
+                        ++batch_tokens;
+                        if (r.cancel || std::find(r.stops.begin(), r.stops.end(), first) != r.stops.end())
+                            finish_req(b, r.cancel ? "cancel" : "stop");
+                        else if (r.generated >= r.max_new) finish_req(b, "length");
+                    }
+                }
+            }
+            if (batch_stats && batch_steps % 64 == 0) {
+                int n_act = 0;
+                for (const auto& r : reqs) if (r.active) ++n_act;
+                std::printf("BSTAT active=%d steps=%lld tokens=%lld\n", n_act, batch_steps, batch_tokens);
+            }
+            if (!any_active()) busy = false;
+            batch_dirty = true;
+            std::fflush(stdout);
+        };
         std::string line;
         std::mt19937_64 rng(1234);
-        while (next_line(line)) {
+        bool quit = false;
+        while (!quit) {
+            // With batch slots active we poll control lines and run one scheduler step per iteration: a
+            // blocking next_line here would stall already-running requests behind an idle stdin.
+            if (g_parallel > 1 && any_active()) {
+                while (poll_line(line)) {
+                    batch_control(line, quit);
+                    if (quit) break;
+                }
+                if (quit) break;
+                batch_step();
+                continue;
+            }
+            if (!next_line(line)) break;
+            if (g_parallel > 1) {
+                if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {
+                    admit_bgen(line);
+                    batch_step();
+                    continue;
+                }
+                if (line == "QUIT" || line.rfind("BSTOP ", 0) == 0 || line.rfind("CANCEL ", 0) == 0 ||
+                    line == "BYIELD" || line.rfind("BYIELD ", 0) == 0 || line.rfind("BSTAT", 0) == 0) {
+                    batch_control(line, quit);
+                    if (quit) break;
+                    continue;
+                }
+            }
             std::istringstream in(line);
             std::string cmd, stops_s, ids_s, emb_path;
             int max_new = 0, top_k = 0;
@@ -6202,6 +6939,12 @@ int run(int argc, char** argv) {
                 }
             }
             busy = true;
+            if (g_parallel > 1 && batch_dirty) {
+                // a solo GEN after batch slots: batch left a different prompt's state in the device
+                reset();
+                batch_dirty = false;
+                loaded_slot = -1;
+            }
             if (seed >= 0) rng.seed((uint64_t) seed);
             g_cancel = 0;
             // IK2_SERVE_DSPEC (default OFF): greedy (temp<=0) spec decoding needs a drafter and ctx room
@@ -6315,53 +7058,12 @@ int run(int argc, char** argv) {
                             "routing %llu, prefetched and unused %llu\n",
                             (unsigned long long) g_src_hist[0], (unsigned long long) g_src_hist[1],
                             (unsigned long long) g_src_hist[2], (unsigned long long) g_src_hist[3]);
-            // softmax(logits / T) over the top_p mass of the 1000 largest of the (logit, token) pairs given (the
-            // whole vocabulary, or the candidates the resident token path found on the device: every logit of the
-            // highest bins that hold 1000 - the same 1000 either way; ties: the lower token first)
-            auto pick_top = [&](std::vector<std::pair<float, int>>& cd) -> int {
-                const int kk = std::min((int) cd.size(), top_k > 0 ? std::min(top_k, kCandK) : kCandK);
-                std::partial_sort(cd.begin(), cd.begin() + kk, cd.end(),
-                                  [](const std::pair<float, int>& a2, const std::pair<float, int>& b2) {
-                                      return a2.first > b2.first || (a2.first == b2.first && a2.second < b2.second);
-                                  });
-                std::vector<double> pr(kk);
-                double z = 0;
-                for (int j = 0; j < kk; ++j) z += (pr[j] = std::exp((cd[j].first - cd[0].first) / temp));
-                double acc = 0;
-                int keep = kk;
-                for (int j = 0; j < kk; ++j) {
-                    acc += pr[j] / z;
-                    if (acc >= top_p) {
-                        keep = j + 1;
-                        break;
-                    }
-                }
-                double zk = 0;
-                for (int j = 0; j < keep; ++j) zk += pr[j];
-                double u = std::uniform_real_distribution<double>(0, zk)(rng);
-                for (int j = 0; j < keep; ++j) {
-                    u -= pr[j];
-                    if (u <= 0) return cd[j].second;
-                }
-                return cd[keep - 1].second;
-            };
-            auto pick = [&](const float* r) -> int {
-                if (temp <= 0) return (int) (std::max_element(r, r + c.n_vocab) - r);
-                std::vector<std::pair<float, int>> cd(c.n_vocab);
-                for (int v = 0; v < c.n_vocab; ++v) cd[v] = {r[v], v};
-                return pick_top(cd);
-            };
-            auto pick_cand = [&]() -> int {
-                std::vector<std::pair<float, int>> cd(g_cand.n);
-                for (int i = 0; i < g_cand.n; ++i) cd[i] = {g_cand.val[i], g_cand.idx[i]};
-                return pick_top(cd);
-            };
-            // IK2_CAND=0: sampling takes the whole vocabulary's logits from the device every token
-            const bool use_cand = !(getenv("IK2_CAND") && !std::atoi(getenv("IK2_CAND")));
+            // Sampling helpers (pick/pick_cand/pick_top) and `use_cand` live above the serve loop so the batch
+            // scheduler can share them; the solo path passes its own rng/options and keeps the same draw order.
             bool cand = false;   // the last token's logits came as candidates (g_cand), not in `last`
             const char* reason = "length";
             int n_out = 0;
-            int greedy_tok = temp <= 0 && !last.empty() ? pick(last.data()) : -1;
+            int greedy_tok = temp <= 0 && !last.empty() ? pick(last.data(), temp, top_p, top_k, rng) : -1;
             // IK2_SERVE_DSPEC (default OFF): greedy requests take the shared DSpark speculative loop,
             // which emits only the target's own argmax (accepted drafts equal it), so the stream is
             // bit-identical to the AR greedy path. The commit callback keeps `hist` aligned with the
@@ -6389,7 +7091,8 @@ int run(int argc, char** argv) {
                     reason = "cancelled";
                     break;
                 }
-                const int tok = temp <= 0 ? greedy_tok : cand ? pick_cand() : pick(last.data());
+                const int tok = temp <= 0 ? greedy_tok : cand ? pick_cand(temp, top_p, top_k, rng)
+                                                              : pick(last.data(), temp, top_p, top_k, rng);
                 ++n_out;
                 std::printf(serve_strata ? "T %d\n" : "@TOK %d\n", tok);
                 std::fflush(stdout);
