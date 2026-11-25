@@ -462,6 +462,14 @@ void mv_q8p_rms2(const int8_t* q, const uint16_t* d, int N, int K, const float* 
 void int4_dense_rot(const uint8_t* Wp, const uint8_t* Wh, const float* WS, int M, int K, const float* X, float* dst,
                     const MvConv& c0, const MvConv& c1, float inv, cudaStream_t s, const MvAlt& a0 = MvAlt{},
                     const MvAlt& a1 = MvAlt{});
+/// IK2_BATCH_ROTMV: the same dense decode matvec over T activation rows at once (T 1..8, dst row-major
+/// [T][ldy]). Each row runs int4_dense_rot's rotate+quantize+sdot+reduction order verbatim, so NC=1
+/// (T=1) is bit-exact with int4_dense_rot; the rows share each weight-row read. convs[row]/nconv apply
+/// row `row`'s mv_conv_row epilogue (convs=nullptr, nconv=0 = raw results). Same shape rules: M%16==0,
+/// K%256==0, only K=2304/3072 instantiated.
+void int4_dense_rot_rows(const uint8_t* Wp, const uint8_t* Wh, const float* WS, int M, int K, const float* X,
+                         int T, float* dst, int ldy, float inv, cudaStream_t s, const MvConv* convs = nullptr,
+                         int nconv = 0);
 void decode_q8p_f16(const int8_t* q, const uint16_t* d, size_t n, uint16_t* out, cudaStream_t s);
 /// y [N] = W [N][K] . x [K] for a small dense matrix kept in FP16 (the sinks, a full layer's dynamic taps, the
 /// router): F32 sums, a warp a row.
@@ -583,6 +591,11 @@ void prep_qkv_r_int_rows(int bits, float* q, const float* q_clip, const float* k
                          int d_rel, float qk_clip, float rel_clip, float eps, const int* pos, float alpha,
                          float n_floor, int kv_cap, uint16_t* q16, const uint16_t* sink_w, const float* sink_x,
                          int sink_k, float* sink_y, cudaStream_t s, const int* tau_pos = nullptr);
+/// IK2_BATCH_GRAPH_EXACT: the f32 sink dot from prep_qkv_r_int_at for T activation rows. One warp per
+/// (row, head), lane stride 32 and wsum reduction copied verbatim from prep_qkv_r_int_kernel's sink tail;
+/// sink_y is [T][H].
+void sink_dot_rows(const uint16_t* sink_w, const float* sink_x, int T, int H, int K, int sink_ld,
+                   float* sink_y, cudaStream_t s);
 void attn_multi_int_g(int bits, const float* q, const float* r, const float* sink, const uint8_t* kci,
                       const uint8_t* vci, const uint16_t* ks, const uint16_t* vs, int kv_cap, int nq, int H,
                       int Hkv, const int* pos_d, int P, float qk_scale, const float* proj, int d_rel, int extent,

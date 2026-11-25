@@ -251,6 +251,9 @@ struct Mat {
     // IK2_INT4_MSG: mat_rows' row slice carries ft0-shifted sidecar pointers. The repack is 16-row-block local, so
     // the slice reads the same bytes a standalone conversion of its rows would. mv1/mv1c skip it (T=1 stays Q8).
     bool i4_row_slice = false;
+    // IK2_BATCH_DENSE_MV_MATS: which dense projection this is (1=wqkvrg, 2=wqrg/wq, 3=wk/wv, 4=wo, 5=wr/wgate).
+    // Lets the A/B bisect gate individual mats; 0 (default) = excluded from the batched INT4 matvec.
+    int batch_mv_cat = 0;
 };
 
 struct Layer {
@@ -511,15 +514,54 @@ bool g_verify_fast = false;   // IK2_VERIFY_FAST=1: device-only INT4 verify MoE 
 bool g_verify_graph = false;  // IK2_VERIFY_GRAPH=1: capture the T=8 verify forward once and replay it. Needs
                               // IK2_VERIFY_FAST=1 and the single-GPU resident path. Default OFF.
 bool g_batch_decode = false;  // IK2_BATCH_ATTN=1: true multi-slot batched decode (one row per slot) through the
-                              // 48 visits. Reuses the verify-fast T=2..8 path with per-row KV/conv pointer tables.
-                              // Default OFF; IK2_PARALLEL=1 stays byte-identical.
+                               // 48 visits. Reuses the verify-fast T=2..8 path with per-row KV/conv pointer tables.
+                               // Default OFF; IK2_PARALLEL=1 stays byte-identical.
+bool g_batch_exact = true;     // IK2_BATCH_EXACT (default 1): route every batched greedy step through the serial
+                               // T=1 forward()/fast_token path, which is byte-identical to solo. IK2_BATCH_EXACT=0
+                               // restores the original true-batched T=2..8 general path (faster but not bit-exact).
 bool g_batch_moe_device = false;  // IK2_BATCH_MOE_DEVICE=1 (default OFF): device-only INT4 MoE for the true batched
                                   // decode. Reproduces run_prefill_moe's rot_pack8 + gemm8 + expert-major scatter
                                   // numerics without the per-visit route D2H/sync. Applies only when W.batch.
 bool g_batch_moe_compact = false; // IK2_BATCH_MOE_COMPACT=1 (default OFF): launch int4_gemm8_moe_masked on only the
                                   // experts with routed rows (grid.z <= S instead of E), preserving pack8/gemm8 math.
+bool g_batch_graph = false;        // IK2_BATCH_GRAPH=1 (default OFF): capture the true batched T=2..8 forward into one
+                                   // CUDA graph and replay it. The graph reads per-row state through Work's stable
+                                   // device pointer tables (stage_batch_tables), so changing slot state needs only a
+                                   // pinned-host table refresh before replay. Implies g_batch_moe_device: the general
+                                   // MoE path's route D2H + cudaStreamSynchronize cannot be captured.
+bool g_batch_graph_exact = false;  // IK2_BATCH_GRAPH_EXACT=1 (default OFF): while a true-batched CUDA graph is
+                                   // captured/replayed, use the T=1 solo-equivalent numeric kernels for the stages
+                                   // that differ in the general T=2..8 path (dense projections, sink, dynamic KV,
+                                   // attention splits, router/MoE, head and argmax). No host sync inside capture.
+bool g_fast_graph_capturing = false; bool g_batch_graph_capturing = false;  // true only inside the batch graph's cudaStreamBeginCapture window; makes
+                                       // stage_batch_tables() skip its event-ring sync and use the fixed slot 0.
 bool g_serve_dspec = false;  // IK2_SERVE_DSPEC=1: --serve greedy (temp<=0) uses DSpark spec when a drafter is
                              // loaded and ctx has room; temp>0/short ctx fall back to byte-identical AR. Default OFF.
+bool g_batch_dense_mv = false;  // IK2_BATCH_DENSE_MV=1: W.batch T>1 dense projections take the row-aware INT4
+                                // matvec (i4Wp VRAM sidecar read once per weight row for all T rows) instead of the
+                                // Q8->f16 decode + M=4 cublas GEMM. Default OFF -> binary byte-identical.
+int g_batch_dense_mv_mask = 0x3F;  // IK2_BATCH_DENSE_MV_MATS: bitmask of Mat::batch_mv_cat to enable (bisect aid).
+bool g_batch_solo_fast = false;  // IK2_BATCH_SOLO_FAST=1: when exactly one slot is decoding (no prefill pending),
+                                 // run the existing solo fast_token/forward T=1 path for it instead of the batch
+                                 // scheduler's general forward. Recovers ~107 t/s/slot for the 1-active case.
+                                 // Default OFF -> batch path byte-identical.
+inline bool batch_dense_mv_on(int T) {
+    return g_batch_dense_mv && g_batch_active && T > 1 && T <= 8;
+}
+inline bool batch_dense_mv_mat_ok(const Mat& m) {
+    return m.batch_mv_cat >= 1 && m.batch_mv_cat <= 5 && ((g_batch_dense_mv_mask >> m.batch_mv_cat) & 1);
+}
+bool g_batch_rotmv = false;   // IK2_BATCH_ROTMV=1 (default OFF): batched T=2..8 dense projections run k::int4_dense_rot_rows,
+                              // the multi-row generalization of the T=1 int4_dense_rot path (rotate+quantize+sdot+reduction
+                              // verbatim per row, one weight-row read shared by all T rows). Unlike IK2_BATCH_DENSE_MV it
+                              // does NOT go through int4_rot_q8x/int4_matvec (a different activation quantizer), so it stays
+                              // bit-exact with the solo T=1 path. Default OFF -> byte-identical.
+inline bool batch_rotmv_on(int T) {
+    return (g_batch_rotmv || (g_batch_graph_exact && g_batch_graph)) && g_batch_active && T > 1 && T <= 8;
+}
+inline bool batch_graph_exact_on(int T) {
+    return g_batch_graph_exact && g_batch_graph && g_batch_active && T > 1 && T <= 8;
+}
 bool g_moe_group_exp = false; // IK2_MOE_GROUP_EXPERT=1: verify-fast MoE grouped BY EXPERT -- each expert's
                               // weights read once for all its slots (bit-exact vs k_mv_grouped). Needs
                               // IK2_VERIFY_FAST=1. Default OFF.
@@ -943,10 +985,48 @@ void matmul(const Mat& m, const float* x32, const uint16_t* x16, int T, float* Y
     // mv1/mv1c and the DENSE_MULTI gate skip it, so T=1 decode and the prompt path (chunks of 16) keep their
     // existing route even when IK2_INT4_HEAD=1.
     const bool i4_multi = m.i4_head_only ? g_int4_head : (m.i4_row_slice ? g_int4_msg : g_int4_dense_multi);
+    // IK2_BATCH_DENSE_MV: W.batch T>1 dense projections (wqkvrg/wqrg/wk/wv/wo) use the SAME row-aware INT4
+    // matvec the T=1 resident path uses, so one weight row is read from VRAM for all T rows. Head and msg row
+    // slices keep their existing route (the sidecar is whole-matrix / head-only); a mat without an i4Wp sidecar
+    // falls through to the existing Q8->f16 GEMM path unchanged.
+    const bool batch_mv = batch_dense_mv_on(T) && g_int4_dense && !m.i4_head_only && !m.i4_row_slice &&
+                          batch_dense_mv_mat_ok(m) && m.i4Wp && m.i4Wh && m.i4WS;
+    // IK2_BATCH_ROTMV: the batched T=2..8 dense projections take k::int4_dense_rot_rows, the exact multi-row
+    // generalization of the T=1 int4_dense_rot path (same rotate_block/quant_rot8/sdot4/swap_rows reduction
+    // order per row, weight row read once for all T rows). No convs here: the batch path applies conv_rec_w /
+    // conv4_w AFTER matmul, exactly as the T=1 path does for these matrices, so the raw product is what
+    // matmul must return (nconv=0). Head and msg row slices keep their route; a mat without an i4Wp sidecar
+    // falls through unchanged.
+    const bool batch_rotmv = batch_rotmv_on(T) && g_int4_dense && !m.i4_head_only && !m.i4_row_slice &&
+                             m.i4Wp && m.i4Wh && m.i4WS && x32 &&
+                             m.K % 256 == 0 && m.N % 16 == 0 && ldy == m.N;
+    if (batch_graph_exact_on(T) && g_batch_active && m.i4Wp && !m.i4_head_only && !m.i4_row_slice &&
+        m.K % 256 == 0 && m.N % 16 == 0 && ldy == m.N) {
+        if (getenv("IK2_GXE_HASH")) std::fprintf(stderr, "GXM matmul_exact N=%d K=%d T=%d ldy=%d x32=%d\n", m.N, m.K, T, ldy, x32 != nullptr);
+        if (x32) {
+            if (getenv("IK2_GXE_HASH")) std::fprintf(stderr, "GXM wo_int4rows N=%d K=%d T=%d ldy=%d\n", m.N, m.K, T, ldy);
+            k::int4_dense_rot_rows(m.i4Wp, m.i4Wh, m.i4WS, m.N, m.K, x32, T, Y, ldy,
+                                   1.f / (1 << k::kInt4Sh8), g_s);
+        } else {
+            if (getenv("IK2_GXE_HASH")) std::fprintf(stderr, "GXM wo_fallback N=%d K=%d T=%d ldy=%d\n", m.N, m.K, T, ldy);
+            for (int t = 0; t < T; ++t) {
+                float xbuf[8192];
+                const uint16_t* src = x16 + (size_t) t * m.K;
+                for (int i = 0; i < m.K; ++i) xbuf[i] = __half2float(__ushort_as_half(src[i]));
+                mv1(m, xbuf, Y + (size_t) t * ldy);
+            }
+        }
+        return;
+    }
+    if (batch_rotmv) {
+        k::int4_dense_rot_rows(m.i4Wp, m.i4Wh, m.i4WS, m.N, m.K, x32, T, Y, ldy,
+                               1.f / (1 << k::kInt4Sh8), g_s);
+        return;
+    }
     // IK2_INT4_DENSE_MV: verify projections over the decode-style dp4a matvec instead of the prefill WMMA GEMM.
     // The GEMM tiles the token dim to 256, so T=8 leaves 7 of 8 waves idle; the matvec reads each weight row once
     // and reuses it across the T tokens (NC). rot+quant once, then one launch per matrix (slices keep ldy).
-    if (i4_multi && g_int4_dense_mv && m.i4Wp && m.i4Wh && m.i4WS && x32 && T > 1 && T <= 8 &&
+    if ((i4_multi || batch_mv) && g_int4_dense_mv && m.i4Wp && m.i4Wh && m.i4WS && x32 && T > 1 && T <= 8 &&
         m.K % 256 == 0 && m.N % 16 == 0 && (m.i4_row_slice ? ldy >= m.N : ldy == m.N) &&
         try_int4_dense_mv(m, x32, T, Y, ldy))
         return;
@@ -1523,6 +1603,7 @@ struct Work {
     float* wtr_h[2] = {nullptr, nullptr};
     // IK2_INT4_EXPERTS decode scratch
     int8_t *i4_xq = nullptr; float2 *i4_xd = nullptr;        // [C], [C/32]: quantized input activation (verify-fast: [Tm] rows)
+    int i4_xq_rows = 1;
     float *i4_hf = nullptr; int8_t *i4_hq = nullptr; float2 *i4_hd = nullptr;   // [S][Kpad], [S][Kpad], [S][Kpad/32]
     const uint8_t **i4_Wp_s = nullptr, **i4_Wh_s = nullptr; const float **i4_WS_s = nullptr;  // [S] per-slot ptrs (gate_up)
     const uint8_t **i4_Wp_dn = nullptr, **i4_Wh_dn = nullptr; const float **i4_WS_dn = nullptr;  // [S] per-slot ptrs (down)
@@ -1633,10 +1714,24 @@ inline void reset_batch_slot(int slot, int kd, int Cc) {
         CU(cudaMemsetAsync(B.h_mlp[i], 0, (size_t) 3 * Cc * 4, g_s));
     }
 }
+// Fill one visit's pinned host pointer-table slice.  The device tables' ADDRESSES never change; only their contents
+// (which slot's KV/conv blocks this visit reads) do.  During graph replay all 48 visits copy from off=0, so refreshing
+// that one slice per visit before cudaGraphLaunch is enough to retarget the whole replayed batch.
+inline void fill_batch_table_host(Work& W, int vis, int n_rows, const int* slot_ids, int off) {
+    const BatchSlots& B = g_batch_slots;
+    for (int i = 0; i < n_rows; ++i) {
+        const size_t j = B.idx(slot_ids[i], vis);
+        W.bkci_h[off + i] = B.kci[j]; W.bvci_h[off + i] = B.vci[j];
+        W.bks_h[off + i] = B.ks[j];  W.bvs_h[off + i] = B.vs[j];
+        W.bh_k_h[off + i] = B.h_k[j]; W.bh_v_h[off + i] = B.h_v[j];
+        W.bh_attn_h[off + i] = B.h_attn[j]; W.bh_mlp_h[off + i] = B.h_mlp[j];
+    }
+}
 inline void stage_batch_tables(Work& W, int vis, int n_rows, const int* slot_ids) {
     const BatchSlots& B = g_batch_slots;
     int si = 0;
-    if (g_batch_moe_device) {
+    // A capture cannot contain cudaEventQuery/cudaEventSynchronize; use the fixed slot 0 and skip the ring entirely.
+    if (g_batch_moe_device && !g_batch_graph_capturing) {
         si = W.batch_stage_next++ % Work::kBatchStageSlots;
         if (W.batch_stage_ev_ok[si]) {
             const cudaError_t q = cudaEventQuery(W.batch_stage_ev[si]);
@@ -1645,13 +1740,7 @@ inline void stage_batch_tables(Work& W, int vis, int n_rows, const int* slot_ids
         }
     }
     const int off = si * BatchSlots::kMaxRows;
-    for (int i = 0; i < n_rows; ++i) {
-        const size_t j = B.idx(slot_ids[i], vis);
-        W.bkci_h[off + i] = B.kci[j]; W.bvci_h[off + i] = B.vci[j];
-        W.bks_h[off + i] = B.ks[j];  W.bvs_h[off + i] = B.vs[j];
-        W.bh_k_h[off + i] = B.h_k[j]; W.bh_v_h[off + i] = B.h_v[j];
-        W.bh_attn_h[off + i] = B.h_attn[j]; W.bh_mlp_h[off + i] = B.h_mlp[j];
-    }
+    fill_batch_table_host(W, vis, n_rows, slot_ids, off);
     CU(cudaMemcpyAsync(W.bkci_d, W.bkci_h + off, n_rows * sizeof(uint8_t*), cudaMemcpyHostToDevice, g_s));
     CU(cudaMemcpyAsync(W.bvci_d, W.bvci_h + off, n_rows * sizeof(uint8_t*), cudaMemcpyHostToDevice, g_s));
     CU(cudaMemcpyAsync(W.bks_d, W.bks_h + off, n_rows * sizeof(uint16_t*), cudaMemcpyHostToDevice, g_s));
@@ -1660,7 +1749,7 @@ inline void stage_batch_tables(Work& W, int vis, int n_rows, const int* slot_ids
     CU(cudaMemcpyAsync(W.bh_v_d, W.bh_v_h + off, n_rows * sizeof(float*), cudaMemcpyHostToDevice, g_s));
     CU(cudaMemcpyAsync(W.bh_attn_d, W.bh_attn_h + off, n_rows * sizeof(float*), cudaMemcpyHostToDevice, g_s));
     CU(cudaMemcpyAsync(W.bh_mlp_d, W.bh_mlp_h + off, n_rows * sizeof(float*), cudaMemcpyHostToDevice, g_s));
-    if (g_batch_moe_device) {
+    if (g_batch_moe_device && !g_batch_graph_capturing) {
         CU(cudaEventRecord(W.batch_stage_ev[si], g_s));
         W.batch_stage_ev_ok[si] = true;
     }
@@ -1818,7 +1907,8 @@ bool try_int4_dense_multi(const Mat& m, const float* x32, int T, float* Y, int l
 bool try_int4_dense_mv(const Mat& m, const float* x32, int T, float* Y, int ldy) {
     if (g_cur < 0 || g_cur >= (int) g_dev.size()) return false;
     Work& W = dev_work(g_cur);
-    if (!W.i4_mv_xq || !W.i4_mv_xd || m.K > W.i4_pf_Kmax || T > (g_verify_fast ? 8 : 1)) return false;
+    if (!W.i4_mv_xq || !W.i4_mv_xd || m.K > W.i4_pf_Kmax ||
+        T > ((g_verify_fast || batch_dense_mv_on(T)) ? 8 : 1)) return false;
     // IK2_INT4_ROT_DEDUP: the rotation is a pure function of (x32, T, K), so within ONE run_layer_attn call an
     // input already rotated into its own slot needs no second rotation (the msg branch projects in_q twice).
     // The epoch matches only the current call and the flag is only set inside it, so codes from a previous
@@ -2014,6 +2104,13 @@ Mat mat_rows(const Mat& m, int r0, int n) {   // the rows [r0, r0 + n) of a matr
     return p;
 }
 void matmul_rows(const Mat& m, int r0, int n, const float* x32, const uint16_t* x16, int T, float* Y, int ldy) {
+    if (batch_graph_exact_on(T) && m.i4Wp && !m.i4_head_only && x32 && r0 % 16 == 0 && n % 16 == 0 &&
+        m.K % 256 == 0 && (m.K == 2304 || m.K == 3072)) {
+        const size_t nsb = m.K / 256, ft0 = r0 / 16;
+        k::int4_dense_rot_rows(m.i4Wp + ft0 * nsb * 2048, m.i4Wh + ft0 * nsb * 64, m.i4WS + r0, n, m.K,
+                               x32, T, Y, ldy, 1.f / (1 << k::kInt4Sh8), g_s, nullptr, 0);
+        return;
+    }
     matmul(mat_rows(m, r0, n), x32, x16, T, Y, ldy);
 }
 
@@ -2060,6 +2157,17 @@ struct RotDedupScope {
     }
     ~RotDedupScope() { if (on) { W.i4_rot_in_attn = false; ++W.i4_rot_epoch; } }
 };
+extern int g_decode_pfull;   // defined with the solo decode path below; read here for IK2_BATCH_GRAPH_EXACT P
+static void gx_hash_dev(const char* tag, const float* d, int n, int T, int vis) {
+    if (!getenv("IK2_GXE_HASH") || g_batch_graph_capturing || g_fast_graph_capturing) return;
+    std::vector<float> hv((size_t) n);
+    cudaMemcpy(hv.data(), d, (size_t) n * 4, cudaMemcpyDeviceToHost);
+    unsigned long long hv64 = 1469598103934665603ull;
+    for (int i = 0; i < n; ++i) {
+        unsigned int u; std::memcpy(&u, &hv[(size_t) i], 4); hv64 = (hv64 ^ u) * 1099511628211ull;
+    }
+    std::fprintf(stderr, "GXH %s T=%d vis=%d h=%016llx\\n", tag, T, vis, hv64);
+}
 void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const float* h_in, const int* pos_p, int nb,
                     size_t blk_off, float* r_out, Work& W, const float* msg = nullptr) {
     RotDedupScope rot_dedup_scope(W);   // (no-op unless IK2_INT4_ROT_DEDUP=1)
@@ -2068,7 +2176,8 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const size_t TC = (size_t) T * C;
     auto blk = [&](int i) { return W.blocks + ((size_t) i * W.blk_ld + blk_off) * C; };
 
-    const bool need_x32 = g_dense_q8 && (T == 1 || g_int4_dense_multi || g_int4_msg || g_int4_prefill);
+    const bool need_x32 = g_dense_q8 && (T == 1 || g_int4_dense_multi || g_int4_msg || g_int4_prefill ||
+                                         batch_dense_mv_on(T) || batch_rotmv_on(T));
     const bool apr = g_prof && T > 1;   // profile prefill attention sub-phases (sync per phase)
     const double ap0 = apr ? now() : 0;
     const uint16_t* xk16 = W.x16;
@@ -2174,14 +2283,22 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                 else
                     unpack_segments(W.qkv, T, {{W.q, HD}, {W.kk, KD}, {W.vv, KD}, {W.rr, HR}, {W.gate, HD}}, g_s);
             }
-            if (!has_sink) gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
+            if (!has_sink) {
+                if (batch_graph_exact_on(T) && W.batch && Ly.sink16)
+                    k::sink_dot_rows(Ly.sink16, in_q, T, c.H, C, C, W.sink, g_s);
+                else
+                    gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
+            }
         } else {
             matmul(Ly.wq, in_q, W.x16, T, q_p, HD);
             matmul(Ly.wk, in_k, xk16, T, k_p, KD);
             matmul(Ly.wv, in_v, xv16, T, v_p, KD);
             matmul(Ly.wr, in_q, W.x16, T, r_p, HR);
             matmul(Ly.wgate, in_q, W.x16, T, gate_p, HD);
-            gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
+            if (batch_graph_exact_on(T) && W.batch && Ly.sink16)
+                k::sink_dot_rows(Ly.sink16, in_q, T, c.H, C, C, W.sink, g_s);
+            else
+                gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
         }
         conv_rec_w(Ly, W, 0, k_p, T, KD);
         conv_rec_w(Ly, W, 1, v_p, T, KD);
@@ -2202,12 +2319,20 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                 else
                     unpack_segments(W.qkv, T, {{W.q, HD}, {W.rr, HR}, {W.gate, HD}}, g_s);
             }
-            if (!has_sink) gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
+            if (!has_sink) {
+                if (batch_graph_exact_on(T) && W.batch && Ly.sink16)
+                    k::sink_dot_rows(Ly.sink16, in_q, T, c.H, C, C, W.sink, g_s);
+                else
+                    gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
+            }
         } else {
             matmul(Ly.wq, in_q, W.x16, T, q_p, HD);
             matmul(Ly.wr, in_q, W.x16, T, r_p, HR);
             matmul(Ly.wgate, in_q, W.x16, T, gate_p, HD);
-            gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
+            if (batch_graph_exact_on(T) && W.batch && Ly.sink16)
+                k::sink_dot_rows(Ly.sink16, in_q, T, c.H, C, C, W.sink, g_s);
+            else
+                gemm16(Ly.sink16, c.H, C, W.x16, T, sink_p, c.H);
         }
         if (!g_dense_q8) {
             const int off_k = T == 1 ? Ly.wqrg.N : 0;
@@ -2233,12 +2358,20 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
             conv4_v_w(Ly, W, v_p, Ly.sc_v, vd_p, c.KV, T, KD, W.vconv);
         } else {
             matmul(Ly.wk, in_k, xk16, T, k_p, KD);
-            gemm16(Ly.sc_k_dyn16, c.KV * 4, C, xk16, T, kd_p, c.KV * 4);
+            if (batch_graph_exact_on(T) && W.batch)
+                for (int t = 0; t < T; ++t)
+                    k::mv_f16(Ly.sc_k_dyn16, c.KV * 4, C, in_k + (size_t) t * C, kd_p + (size_t) t * c.KV * 4, g_s);
+            else
+                gemm16(Ly.sc_k_dyn16, c.KV * 4, C, xk16, T, kd_p, c.KV * 4);
             conv_rec_w(Ly, W, 0, k_p, T, KD);
             conv4_w(Ly, W, k_p, Ly.sc_k, kd_p, c.KV, T, KD, W.kconv);
 
             matmul(Ly.wv, in_v, xv16, T, v_p, KD);
-            gemm16(Ly.sc_v_dyn16, c.KV * 4, C, xv16, T, vd_p, c.KV * 4);
+            if (batch_graph_exact_on(T) && W.batch)
+                for (int t = 0; t < T; ++t)
+                    k::mv_f16(Ly.sc_v_dyn16, c.KV * 4, C, in_v + (size_t) t * C, vd_p + (size_t) t * c.KV * 4, g_s);
+            else
+                gemm16(Ly.sc_v_dyn16, c.KV * 4, C, xv16, T, vd_p, c.KV * 4);
             conv_rec_w(Ly, W, 1, v_p, T, KD);
             conv4_v_w(Ly, W, v_p, Ly.sc_v, vd_p, c.KV, T, KD, W.vconv);
         }
@@ -2286,6 +2419,10 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                           Ly.kv_cap, g_s);
         }
     }
+    gx_hash_dev("qprep", q_p, T * HD, T, l);
+    gx_hash_dev("kprep", k_p, T * KD, T, l);
+    gx_hash_dev("vprep", v_p, T * KD, T, l);
+    gx_hash_dev("sink", W.sink, T * c.H, T, l);
 
     const int extent = Ly.sliding ? c.extent_swa : c.extent;
     const int window = Ly.sliding ? c.window : (1 << 30);
@@ -2313,18 +2450,22 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                                Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         }
     } else if (W.batch && T > 1 && T <= BatchSlots::kMaxRows && kv_is_int()) {
+        const int P = batch_graph_exact_on(T)
+                          ? (Ly.sliding ? std::min(128, std::max(1, (c.window + 63) / 64)) : g_decode_pfull)
+                          : 128;
         const uint8_t* const* kci_tab = (const uint8_t* const*) W.bkci_d;
         const uint8_t* const* vci_tab = (const uint8_t* const*) W.bvci_d;
         const uint16_t* const* ks_tab = (const uint16_t* const*) W.bks_d;
         const uint16_t* const* vs_tab = (const uint16_t* const*) W.bvs_d;
         if (g_attn_gqa && c.H % c.KV == 0 && c.H / c.KV == 3)
             k::attn_decode_int_rows_gqa(kv_int_bits(), q_p, r_p, sink_p, kci_tab, vci_tab, ks_tab, vs_tab,
-                                        attn_kv_cap, c.H, c.KV, pos_p, 128, qk_scale, Ly.rel_proj, c.d_rel, extent,
-                                        window, T, W.lg, W.o, g_s, nullptr, g_attn_dpp ? 1 : 0);
+                                        attn_kv_cap, c.H, c.KV, pos_p, P, qk_scale, Ly.rel_proj, c.d_rel, extent,
+                                        window, T, W.lg, W.o, g_s,
+                                        batch_graph_exact_on(T) ? gate_p : nullptr, g_attn_dpp ? 1 : 0);
         else
             k::attn_decode_int_rows(kv_int_bits(), q_p, r_p, sink_p, kci_tab, vci_tab, ks_tab, vs_tab, attn_kv_cap,
-                                    c.H, c.KV, pos_p, 128, qk_scale, Ly.rel_proj, c.d_rel, extent, window, T, W.lg,
-                                    W.o, g_s, nullptr, g_attn_dpp ? 1 : 0);
+                                    c.H, c.KV, pos_p, P, qk_scale, Ly.rel_proj, c.d_rel, extent, window, T, W.lg,
+                                    W.o, g_s, batch_graph_exact_on(T) ? gate_p : nullptr, g_attn_dpp ? 1 : 0);
     } else if (T <= 8 && g_group && g_group_attn) {
         if (g_vg_stage != VG_NORMAL) {
             // P fixed at capture; W.lg is already sized for 8 queries x 128 splits.
@@ -2540,8 +2681,11 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         if (apr) { cudaStreamSynchronize(g_s); g_pf.a_out += now() - ap1; }
     }
     if (vp_attn_idx >= 0) cudaEventRecord(vpF[vp_attn_idx], g_s);
-    k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && (T == 1 || g_int4_dense_multi || g_int4_msg || g_int4_prefill), g_s);
+    gx_hash_dev("attnout", W.o, C, T, l);
+    if (!batch_graph_exact_on(T))
+        k::gate_mul_f16(W.o, gate_p, (size_t) T * HD, W.x16, g_dense_q8 && (T == 1 || g_int4_dense_multi || g_int4_msg || g_int4_prefill || batch_dense_mv_on(T) || batch_rotmv_on(T)), g_s);
     matmul(Ly.wo, W.o, W.x16, T, W.tmp, C);
+    gx_hash_dev("wo", W.tmp, C, T, l);
     conv_rec_w(Ly, W, 2, W.tmp, T, C);
     if (l % c.block == 0) {
         CU(cudaMemcpyAsync(blk(nb), h_in, TC * 4, cudaMemcpyDeviceToDevice, g_s));
@@ -2549,6 +2693,7 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     } else {
         conv4_attn_w(Ly, W, false, W.tmp, h_in, r_out, T, C);
     }
+    gx_hash_dev("postattn", r_out, C, T, l);
 }
 
 // A layer-major prefill pass of many tokens uses nearly every expert of a layer, so the ones not in VRAM can be
@@ -2978,10 +3123,22 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
             // sidecar; n=1 and the prompt chunks (n=16) keep their existing route, with matmul's fallback intact.
             if (out_mode == OutMode::kArgmax) {
                 argmax_out->resize(nt);
+                const bool exact = batch_graph_exact_on(T) && W.batch && M.out_w.i4Wp && M.out_w.i4Wh &&
+                                   M.out_w.i4WS && C % 256 == 0 && M.out_w.N % 16 == 0 && T <= 8;
                 for (int i = 0; i < nt; i += 16) {
                     const int n = std::min(16, nt - i);
-                    matmul(M.out_w, W.xq + (size_t) (t0 + i) * C, W.x16 + (size_t) i * C, n, W.logits, c.n_rows);
-                    if (n == 1) k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, W.argmax_d + i, g_s);
+                    const float* xrow = W.xq + (size_t) (t0 + i) * C;
+                    if (exact) {
+                        k::int4_dense_rot_rows(M.out_w.i4Wp, M.out_w.i4Wh, M.out_w.i4WS, M.out_w.N, C, xrow, n,
+                                               W.logits, M.out_w.N, 1.f / (1 << k::kInt4Sh8), g_s, nullptr, 0);
+                    } else {
+                        matmul(M.out_w, xrow, W.x16 + (size_t) i * C, n, W.logits, c.n_rows);
+                    }
+                    if (exact) {
+                        for (int r = 0; r < n; ++r)
+                            k::argmax_sum(W.logits + (size_t) r * M.out_w.N, nullptr, nullptr, c.n_vocab,
+                                          W.argmax_d + i + r, g_s);
+                    } else if (n == 1) k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, W.argmax_d + i, g_s);
                     else k::argmax_rows(W.logits, c.n_rows, n, c.n_vocab, W.argmax_d + i, g_s);
                 }
                 if (g_vg_stage == VG_NORMAL) { CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) nt * 4, cudaMemcpyDeviceToHost, g_s));
@@ -3039,6 +3196,20 @@ struct VerifyGraph {
     bool warmed = false;   // one normal pass first: warms hipBLAS shapes/workspace before capture
 };
 VerifyGraph g_vgraph;
+
+// IK2_BATCH_GRAPH: one graph for a true batched greedy step (T rows, one per slot).  Captured after one direct warm-up
+// pass; the token rows, positions and per-visit pointer tables are staged into the same pinned buffers the graph was
+// captured with, so replay only needs to refresh those buffers and launch.  The head's argmaxes are read after the
+// launch; host sampling stays outside the graph.
+struct BatchGraph {
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    bool built = false;
+    bool warmed = false;
+    bool disabled = false;
+    int rows = 0;
+};
+BatchGraph g_bgraph;
 
 // one token's launches: its embedding row in W.emb_h and its position in W.pos_h[0] (pinned host; copied first)
 void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
@@ -3193,6 +3364,10 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             k::prep_qkv_r_int_at(bits, q_p, Ly.q_clip, W.kconv, Ly.kci, Ly.ks, W.vconv, Ly.vci, Ly.vs, r_p,
                                  Ly.r_clip, c.H, c.KV, c.D, c.d_rel, c.qk_clip, c.rel_clip, c.eps, W.pos,
                                  !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap, q16, g_s, Ly.sink16, W.xq, C, W.sink);
+            gx_hash_dev("qprep", q_p, HD, 1, l);
+            gx_hash_dev("kprep", k_p, KD, 1, l);
+            gx_hash_dev("vprep", v_p, KD, 1, l);
+            gx_hash_dev("sink", W.sink, c.H, 1, l);
             if (g_onepass && Ly.sliding)
                 k::attn_decode_int_onepass(bits, q_p, r_p, W.sink, Ly.kci, Ly.vci, Ly.ks, Ly.vs, Ly.kv_cap, c.H,
                                            c.KV, W.pos, qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.o, g_s,
@@ -3250,9 +3425,36 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         // stream joins the blocks and starts again)
         pf_fast::mark(6, g_s);
         const bool first = l % c.block == 0;
-        if (first) CU(cudaMemcpyAsync(blk(nb), W.h, Cb, cudaMemcpyDeviceToDevice, g_s));
+        if (first) CU(cudaMemcpyAsync(blk(nb), W.h, Cb, cudaMemcpyDeviceToHost, g_s));
+        if (getenv("IK2_GXE_HASH") && !g_batch_graph_capturing && !g_fast_graph_capturing) {
+            std::vector<float> hv(C);
+            CU(cudaMemcpy(hv.data(), W.o, (size_t) C * 4, cudaMemcpyDeviceToHost));
+            unsigned long long x = 1469598103934665603ull;
+            for (int i = 0; i < C; ++i) {
+                unsigned int u; std::memcpy(&u, &hv[(size_t) i], 4); x = (x ^ u) * 1099511628211ull;
+            }
+            std::fprintf(stderr, "GXH fastattnout vis=%d h=%016llx\\n", vis, x);
+        }
         mv1c(Ly.wo, W.o, W.tmp, k::MvConv{0, C, Ly.h_attn, Ly.sc_attn, nullptr, 0, first ? nullptr : W.h, W.r});
+        if (getenv("IK2_GXE_HASH") && !g_batch_graph_capturing && !g_fast_graph_capturing) {
+            std::vector<float> hv(C);
+            CU(cudaMemcpy(hv.data(), W.tmp, (size_t) C * 4, cudaMemcpyDeviceToHost));
+            unsigned long long x = 1469598103934665603ull;
+            for (int i = 0; i < C; ++i) {
+                unsigned int u; std::memcpy(&u, &hv[(size_t) i], 4); x = (x ^ u) * 1099511628211ull;
+            }
+            std::fprintf(stderr, "GXH wo vis=%d h=%016llx\\n", vis, x);
+        }
         if (first) ++nb;
+        if (getenv("IK2_GXE_HASH") && !g_batch_graph_capturing && !g_fast_graph_capturing) {
+            std::vector<float> hv(C);
+            CU(cudaMemcpy(hv.data(), W.r, (size_t) C * 4, cudaMemcpyDeviceToHost));
+            unsigned long long x = 1469598103934665603ull;
+            for (int i = 0; i < C; ++i) {
+                unsigned int u; std::memcpy(&u, &hv[(size_t) i], 4); x = (x ^ u) * 1099511628211ull;
+            }
+            std::fprintf(stderr, "GXH fastattn vis=%d h=%016llx\\n", vis, x);
+        }
         // the MoE: its input, the router and the picks' tables on the device, the experts
         pf_fast::mark(7, g_s);
         {
@@ -3402,6 +3604,15 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             k::ep_combine_conv(dev_work(0).y32, y_peer, dev_work(0).blob, dev_work(0).wt,
                                S, C, Ly.h_mlp, Ly.sc_mlp, dev_work(0).r, dev_work(0).h, g_s);
         }
+        if (getenv("IK2_GXE_HASH") && !g_batch_graph_capturing && !g_fast_graph_capturing) {
+            std::vector<float> hv(C);
+            CU(cudaMemcpy(hv.data(), W.h, (size_t) C * 4, cudaMemcpyDeviceToHost));
+            unsigned long long x = 1469598103934665603ull;
+            for (int i = 0; i < C; ++i) {
+                unsigned int u; std::memcpy(&u, &hv[(size_t) i], 4); x = (x ^ u) * 1099511628211ull;
+            }
+            std::fprintf(stderr, "GXH fast vis=%d h=%016llx\\n", vis, x);
+        }
     }
     pf_fast::mark(11, g_s);
     if (out_mode == OutMode::kNone) { pf_fast::mark(12, g_s); return; }
@@ -3444,8 +3655,8 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
         if (!G.exec && !G.disabled) {
             cudaError_t ce = cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal);
             if (ce == cudaSuccess) {
-                fast_token_launches(M, W, out_mode);
-                ce = cudaStreamEndCapture(g_s, &G.graph);
+                g_fast_graph_capturing = true; fast_token_launches(M, W, out_mode);
+                ce = cudaStreamEndCapture(g_s, &G.graph); g_fast_graph_capturing = false;
                 if (ce == cudaSuccess) {
                     ce = cudaGraphInstantiate(&G.exec, G.graph, 0);
                     if (ce == cudaSuccess) {
@@ -3541,6 +3752,71 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         for (int t = 0; t < T; ++t) (*argmax_out)[t] = Wv.argmax_h[t];
         return;
     }
+
+    // IK2_BATCH_GRAPH: the true batched T>1 path.  The graph is captured after ONE direct, launch-only warm-up pass
+    // (hipBLAS shapes/workspace).  Its launch list reads token rows from W.emb_h, positions from W.pos_h, and per-row
+    // KV/conv pointers from Work's stable device tables.  Before each replay we refresh only those pinned buffers;
+    // no per-visit raw pointer in the captured kernels ever changes.  Host sampling stays outside forward().
+    const bool bg_base = g_batch_graph && g_batch_active && g_batch_pos && g_batch_slot_ids && dev_work(0).batch &&
+                         T > 1 && T <= BatchSlots::kMaxRows && out_mode == OutMode::kArgmax && argmax_out &&
+                         !g_bgraph.disabled && !getenv("IK2_GXE_HASH") && !g_prof && !g_prof_fast && !vprof2 && dump.empty() &&
+                         !g_trace && g_pop.empty() && !dual() && !g_ep && !g_tp && !g_taps && !g_rec &&
+                         g_fast && g_group && g_group_attn && g_int4_experts && !g_int4_pf_off &&
+                         g_dev.size() == 1 && vg_shape_ok && vg_layers_ok && (2 * (size_t) c.F) % 32 == 0;
+    if (bg_base && g_bgraph.rows && g_bgraph.rows != T) {   // a shape change needs a fresh capture
+        CU(cudaStreamSynchronize(g_s));
+        if (g_bgraph.exec) cudaGraphExecDestroy(g_bgraph.exec);
+        if (g_bgraph.graph) cudaGraphDestroy(g_bgraph.graph);
+        g_bgraph.graph = nullptr; g_bgraph.exec = nullptr;
+        g_bgraph.built = false; g_bgraph.warmed = false; g_bgraph.rows = 0;
+    }
+    const bool bg_try = bg_base && !g_bgraph.disabled;
+    auto bg_stage = [&](Work& Wb) {
+        const size_t rb = (size_t) C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
+        for (int t = 0; t < T; ++t)
+            k::decode_host(M.embd_type, M.embd + (size_t) tok[t] * rb, C, Wb.emb_h + (size_t) t * C);
+        for (int t = 0; t < T; ++t) Wb.pos_h[t] = g_batch_pos[t];
+        for (int vis = 0; vis < c.n_visit; ++vis)
+            fill_batch_table_host(Wb, vis, T, g_batch_slot_ids, 0);
+    };
+    auto bg_read_argmax = [&](Work& Wb) {
+        CU(cudaMemcpyAsync(Wb.argmax_h, Wb.argmax_d, (size_t) T * 4, cudaMemcpyDeviceToHost, g_s));
+        CU(cudaStreamSynchronize(g_s));
+        argmax_out->resize(T);
+        for (int t = 0; t < T; ++t) (*argmax_out)[t] = Wb.argmax_h[t];
+    };
+    if (bg_try && g_bgraph.built && g_bgraph.exec && g_bgraph.rows == T) {
+        use_dev(0);
+        Work& Wb = dev_work(0);
+        bg_stage(Wb);
+        CU(cudaGraphLaunch(g_bgraph.exec, g_s));
+        bg_read_argmax(Wb);
+        return;
+    }
+    const bool bg_warm = bg_try && !g_bgraph.warmed;
+    bool bg_cap = bg_try && !bg_warm && !g_bgraph.built;
+    bool bg_began = false;
+    bool bg_direct_read = bg_warm;
+    if (bg_warm || bg_cap) {
+        use_dev(0);
+        g_vg_stage = bg_cap ? VG_CAPTURE : VG_REPLAY;   // launch-only MoE on every layer, including non-INT4 ones
+        if (bg_cap) {
+            const cudaError_t ce = cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal);
+            if (ce == cudaSuccess) {
+                bg_began = true;
+                g_batch_graph_capturing = true;
+            } else {
+                g_bgraph.disabled = true;
+                bg_cap = false;
+                bg_direct_read = true;
+                g_vg_stage = VG_REPLAY;
+                (void) cudaGetLastError();
+                std::printf("batch graph: begin capture failed (%s), fallback to direct launches\n",
+                            cudaGetErrorString(ce));
+                std::fflush(stdout);
+            }
+        }
+    }
     use_dev(M.L[0].dev);
     Work* Wp = &dev_work(g_cur);
     ExpertCache* ECp = &dev_cache(g_cur);
@@ -3586,6 +3862,18 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         if (!f) die("cannot write in " + dump);
         std::fwrite(h.data(), 4, n, f);
         std::fclose(f);
+    };
+    auto gxe_hash = [&](const char* tag, const float* d, int v) {
+        if (!getenv("IK2_GXE_HASH") || g_batch_graph_capturing) return;
+        std::vector<float> h(C);
+        CU(cudaMemcpy(h.data(), d, (size_t) C * 4, cudaMemcpyDeviceToHost));
+        unsigned long long hv = 1469598103934665603ull;
+        for (int i = 0; i < C; ++i) {
+            unsigned int u;
+            std::memcpy(&u, &h[(size_t) i], 4);
+            hv = (hv ^ u) * 1099511628211ull;
+        }
+        std::fprintf(stderr, "GXH %s T=%d vis=%d h=%016llx\\n", tag, T, v, hv);
     };
 
     int nb_pre = 0, n_bank = 0;   // (a looped core: the blocks before it, the states of the pass before's bank)
@@ -3658,6 +3946,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             }
         }
         run_layer_attn(M, Ly, l, T, pos0, W.h, W.pos, nb, 0, W.r, W, msg);
+        gxe_hash("attn", W.h, vis);
         dump_f("blk." + std::to_string(vis) + ".attn_out", W.r, TC);
         if (l % c.block == 0) ++nb;
         // the MoE
@@ -3681,11 +3970,17 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         g_pf.lap(g_pf.attn);
         vp_attn_idx = -1;
         if (vprof2 && vis < 64) { cudaEventRecord(vpB[vis], g_s); vp_n = vis + 1; }
-        gemm16(Ly.router16, c.E, C, W.x16, T, W.rlog, c.E);
+        const bool graph_exact = batch_graph_exact_on(T) && W.batch;
+        if (graph_exact) {
+            for (int t = 0; t < T; ++t)
+                k::mv_f16(Ly.router16, c.E, C, W.xq + (size_t) t * C, W.rlog + (size_t) t * c.E, g_s);
+        } else {
+            gemm16(Ly.router16, c.E, C, W.x16, T, W.rlog, c.E);
+        }
         const int S = T * c.K;
         int* rtop = W.route_d;
         float* rw = (float*) (W.route_d + S);
-        k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
+        if (!graph_exact) k::route(W.rlog, Ly.probs_b, T, c.E, c.K, c.route_scale, rtop, rw, g_s);
 #if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
         // IK2_VERIFY_FAST (default OFF): a verify window's INT4 MoE entirely on the device, with no route D2H
         // and no stream sync. The resident T=1 sequence (above) at S=T*K slots; the slots' f32 input is gathered
@@ -3697,6 +3992,70 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         // the batch device-only path must reproduce pack8+gemm8 numerics (IK2_BATCH_MOE_DEVICE work).
         // IK2_BATCH_MOE_DEVICE: W.batch's bit-exact device MoE (pack8+gemm8, expert-major scatter).
         // Only true batched decode (W.batch); the non-batch g_rec verify path keeps fast_moe_ok verbatim.
+        // IK2_BATCH_GRAPH_EXACT: reproduce the solo T=1 INT4 expert sequence row by row. The old device batch
+        // MoE uses rot_pack8+gemm8, a different quantizer/reduction from the resident q8x+matvec solo path.
+        const bool graph_exact_moe = graph_exact && g_int4_experts && Ly.i4_loaded && l < g_int4_layers &&
+            !g_int4_pf_off && !dual() && !g_ep_fast && !g_prof && dump.empty() && !g_trace && g_pop.empty() &&
+            C % 256 == 0 && (2 * c.F) % 16 == 0 && W.i4_Kpad_f % 256 == 0 && Ly.tab_blob &&
+            Ly.i4_tab_Wp[0] && Ly.i4_tab_Wh[0] && Ly.i4_tab_WS[0] && Ly.i4_tab_Wp[2] &&
+            Ly.i4_tab_Wh[2] && Ly.i4_tab_WS[2] && T <= W.Tm && c.K <= 8 &&
+            T <= W.i4_xq_rows;
+        if (getenv("IK2_GRAPH_EXACT_DEBUG"))
+            std::fprintf(stderr, "GXE l=%d vis=%d T=%d exact=%d moe=%d xqrows=%d K=%d Tm=%d\\n", l, vis, T,
+                         (int) graph_exact, (int) graph_exact_moe, W.i4_xq_rows, c.K, W.Tm);
+        if (graph_exact_moe) {
+            const int F = c.F, Kp = W.i4_Kpad_f, K = c.K;
+            const float inv4 = 1.0f / (float) (1 << k::kInt4Sh8);
+#if defined(__HIPCC__)
+            static const int exp_mma_x = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 0;
+#else
+            static const int exp_mma_x = getenv("IK2_EXPERT_MMA") ? atoi(getenv("IK2_EXPERT_MMA")) : 1;
+#endif
+            const bool exp_tc_x = exp_mma_x && k::experts_mma_fits(Ly.ty[0], Ly.ty[1], Ly.ty[2], C, F);
+            for (int t = 0; t < T; ++t) {
+                int* top_t = rtop + t * K;
+                float* w_t = rw + t * K;
+                const uint8_t** wp_s = W.i4_Wp_s + t * K;
+                const uint8_t** wh_s = W.i4_Wh_s + t * K;
+                const float** ws_s = W.i4_WS_s + t * K;
+                k::route_token(W.rlog + (size_t) t * c.E, Ly.probs_b, c.E, K, c.route_scale, Ly.tab_blob,
+                               nullptr, nullptr, nullptr, top_t, w_t, W.blob + t * K, W.tok + t * K,
+                               W.inv + t * K, W.sg + t * K, W.su + t * K, W.wt + t * K, g_s,
+                               W.xq + (size_t) t * C, C, exp_tc_x ? (uint16_t*) W.gu32 : nullptr,
+                               Ly.i4_tab_Wp[0], Ly.i4_tab_Wh[0], Ly.i4_tab_WS[0], wp_s, wh_s, ws_s);
+                int8_t* xq_t = W.i4_xq + (size_t) t * C;
+                float2* xd_t = W.i4_xd + (size_t) t * (C / 32 + 2);
+                k::int4_rot_q8x(W.xq + (size_t) t * C, 1, C, xq_t, xd_t, g_s);
+                float* gu_t = W.gu32;
+                k::int4_matvec_grouped(wp_s, wh_s, ws_s, 2 * F, C, xq_t, xd_t, K, gu_t, 2 * F, inv4, g_s);
+                if (g_i4_mid_fuse) {
+                    k::int4_mid(gu_t, K, F, Kp, c.gate_cap, c.up_cap,
+                                W.i4_hq + (size_t) t * K * Kp,
+                                W.i4_hd + (size_t) t * K * (Kp / 32 + 2), g_s);
+                } else {
+                    k::swiglu_cap_f32(gu_t, K, F, W.sg + t * K, W.su + t * K, c.gate_cap, c.up_cap,
+                                      W.h16 + (size_t) t * K * F, g_s);
+                    float* hf_t = W.i4_hf + (size_t) t * K * Kp;
+                    int8_t* hq_t = W.i4_hq + (size_t) t * K * Kp;
+                    float2* hd_t = W.i4_hd + (size_t) t * K * (Kp / 32 + 2);
+                    k::int4_prep_down(W.h16 + (size_t) t * K * F, hf_t, K, F, Kp, g_s);
+                    k::int4_rot_q8x(hf_t, K, Kp, hq_t, hd_t, g_s);
+                }
+                k::int4_gather_slots(top_t, Ly.i4_tab_Wp[2], Ly.i4_tab_Wh[2], Ly.i4_tab_WS[2], K,
+                                     W.i4_Wp_dn + t * K, W.i4_Wh_dn + t * K, W.i4_WS_dn + t * K, g_s);
+                k::int4_matvec_grouped(W.i4_Wp_dn + t * K, W.i4_Wh_dn + t * K, W.i4_WS_dn + t * K,
+                                       C, Kp, W.i4_hq + (size_t) t * K * Kp,
+                                       W.i4_hd + (size_t) t * K * (Kp / 32 + 2), K,
+                                       W.y32 + (size_t) t * K * C, C, inv4, g_s, Kp, Kp / 32);
+            }
+            for (int t = 0; t < T; ++t)
+                k::moe_combine_f32(W.y32 + (size_t) t * K * C, W.inv + t * K, W.wt + t * K, 1, K, C,
+                                   W.tmp + (size_t) t * C, false, g_s);
+            conv_rec_w(Ly, W, 3, W.tmp, T, C);
+            conv4_mlp_w(Ly, W, W.tmp, W.r, W.h, T, C);
+            gxe_hash("moe", W.h, vis);
+            continue;
+        }
         const bool batch_moe_ok = g_batch_moe_device && W.batch && T > 1 && T <= 8 && S <= 64 &&
             g_int4_experts && Ly.i4_loaded && l < g_int4_layers && !g_int4_pf_off && !dual() &&
             !g_ep_fast && !g_prof && dump.empty() && !g_trace && g_pop.empty() && C % 256 == 0 &&
@@ -3939,6 +4298,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             conv_rec_w(Ly, W, 3, W.tmp, T, C);
             conv4_mlp_w(Ly, W, W.tmp, W.r, W.h, T, C);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
+            gxe_hash("moe", W.h, vis);
             continue;
         }
         if (fast_ep_token) {
@@ -4107,6 +4467,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             conv_rec_w(Ly, W, 3, W.tmp, T, C);
             conv4_mlp_w(Ly, W, W.tmp, W.r, W.h, T, C);
             dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
+            gxe_hash("moe", W.h, vis);
             continue;
         }
         const bool i4_layer = g_int4_experts && Ly.i4_loaded && l < g_int4_layers;
@@ -4400,6 +4761,44 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             forward(M, tok, T, pos0, all_logits, out_mode, dump, logits_out, argmax_out, t_exp);
         }
     }
+    if (bg_direct_read) {
+        // The warm-up pass (or a failed capture begin) ran with g_vg_stage != VG_NORMAL, so run_head left the
+        // argmaxes on the device.  Read them here before returning; the next eligible call captures the graph.
+        g_vg_stage = VG_NORMAL;
+        use_dev(0);
+        Work& Wb = dev_work(0);
+        bg_read_argmax(Wb);
+        g_bgraph.warmed = true;
+        return;
+    }
+    if (bg_began) {
+        g_batch_graph_capturing = false;
+        g_vg_stage = VG_NORMAL;
+        cudaGraph_t gr = nullptr;
+        cudaError_t ce = cudaStreamEndCapture(g_s, &gr);
+        if (ce == cudaSuccess) ce = cudaGraphInstantiate(&g_bgraph.exec, gr, 0);
+        if (ce == cudaSuccess && g_bgraph.exec) {
+            g_bgraph.graph = gr;
+            g_bgraph.built = true;
+            g_bgraph.rows = T;
+            std::printf("batch graph: captured T=%d, %d visits, one launch per step\n", T, c.n_visit);
+            std::fflush(stdout);
+            use_dev(0);
+            CU(cudaGraphLaunch(g_bgraph.exec, g_s));
+            bg_read_argmax(dev_work(0));
+        } else {
+            std::printf("batch graph: %s failed (%s), fallback to direct launches\n",
+                        gr ? "instantiate" : "end capture", cudaGetErrorString(ce));
+            std::fflush(stdout);
+            if (gr) cudaGraphDestroy(gr);
+            g_bgraph.graph = nullptr;
+            g_bgraph.exec = nullptr;
+            g_bgraph.disabled = true;
+            (void) cudaGetLastError();
+            forward(M, tok, T, pos0, all_logits, out_mode, dump, logits_out, argmax_out, t_exp);
+            return;
+        }
+    }
 #undef W
 #undef EC
 }
@@ -4422,6 +4821,20 @@ void forward_batch(Model& M, const int* tok, int n_rows, const int* pos, const i
             if (argmax_out && !one.empty()) argmax_out->push_back(one[0]);
         }
     };
+    // IK2_BATCH_EXACT (default 1): the true-batched T=2..8 general path is not numerically identical to the
+    // serial resident T=1 path (dense Q8/INT4 GEMM vs rotated-int4 matvec, separate f16 sink GEMM vs fused f32
+    // sink dot, rows attention with P=128 vs at_gqa, row argmax vs sum argmax).  Route every slot through the
+    // proven byte-identical serial path.  IK2_BATCH_EXACT=0 keeps the old batched kernels as an escape hatch.
+    // The resident CUDA graph captures raw per-visit pointers; with per-slot batch state those pointers change
+    // on every load_batch_slot(), so replay would read the first captured slot's KV/conv state.  Direct launches
+    // are required here; restore g_graph afterwards so non-batched requests keep their graph path.
+    if (g_batch_exact) {
+        const bool saved_graph = g_graph;
+        g_graph = false;
+        serial();
+        g_graph = saved_graph;
+        return;
+    }
     bool ok = g_batch_decode && g_batch_slots.n_slot > 0 && n_rows > 1 &&
               n_rows <= BatchSlots::kMaxRows && out_mode == OutMode::kArgmax && argmax_out &&
               kv_is_int() && !g_kv_host && g_dev.size() == 1 && !dual() && !g_ep && !g_tp &&
@@ -4484,8 +4897,8 @@ size_t big_carve(const Config& c, int T, size_t gu32_have, size_t lg_want, size_
     int* route = (int*) take(S * 8);
     uint16_t* ex16 = (uint16_t*) take(T * C * 2);
     uint16_t* h16 = (uint16_t*) take(Tr * F * 2);
-    const bool new_gu = (size_t) T * 2 * F * 4 > gu32_have;
-    float* gu32 = new_gu ? (float*) take((size_t) T * 2 * F * 4) : nullptr;
+    const bool new_gu = (size_t) S * 2 * F * 4 > gu32_have;
+    float* gu32 = new_gu ? (float*) take((size_t) S * 2 * F * 4) : nullptr;
     float* y32 = (float*) take(Tr * C * 4);
     float* sg = (float*) take(S * 4);
     float* su = (float*) take(S * 4);
@@ -4954,9 +5367,20 @@ int run(int argc, char** argv) {
     g_verify_fast = getenv("IK2_VERIFY_FAST") && std::atoi(getenv("IK2_VERIFY_FAST")) != 0;
     g_verify_graph = getenv("IK2_VERIFY_GRAPH") && std::atoi(getenv("IK2_VERIFY_GRAPH")) != 0;
     g_batch_decode = getenv("IK2_BATCH_ATTN") && std::atoi(getenv("IK2_BATCH_ATTN")) != 0;
+    // IK2_BATCH_EXACT defaults to 1: batched greedy decoding must stay byte-identical to solo.
+    g_batch_exact = !getenv("IK2_BATCH_EXACT") || std::atoi(getenv("IK2_BATCH_EXACT")) != 0;
     g_batch_moe_device = getenv("IK2_BATCH_MOE_DEVICE") && std::atoi(getenv("IK2_BATCH_MOE_DEVICE")) != 0;
     g_batch_moe_compact = getenv("IK2_BATCH_MOE_COMPACT") && std::atoi(getenv("IK2_BATCH_MOE_COMPACT")) != 0;
+    g_batch_graph = getenv("IK2_BATCH_GRAPH") && std::atoi(getenv("IK2_BATCH_GRAPH")) != 0;
+    g_batch_graph_exact = getenv("IK2_BATCH_GRAPH_EXACT") && std::atoi(getenv("IK2_BATCH_GRAPH_EXACT")) != 0;
+    // The general MoE path does a route D2H + stream sync per visit, which CUDA graph capture cannot contain.
+    // IK2_BATCH_GRAPH therefore selects the device-only batch MoE even if IK2_BATCH_MOE_DEVICE was not set.
+    if (g_batch_graph) g_batch_moe_device = true;
     g_serve_dspec = getenv("IK2_SERVE_DSPEC") && std::atoi(getenv("IK2_SERVE_DSPEC")) != 0;
+    g_batch_dense_mv = getenv("IK2_BATCH_DENSE_MV") && std::atoi(getenv("IK2_BATCH_DENSE_MV")) != 0;
+    if (getenv("IK2_BATCH_DENSE_MV_MATS")) g_batch_dense_mv_mask = std::atoi(getenv("IK2_BATCH_DENSE_MV_MATS"));
+    g_batch_rotmv = getenv("IK2_BATCH_ROTMV") && std::atoi(getenv("IK2_BATCH_ROTMV")) != 0;
+    g_batch_solo_fast = getenv("IK2_BATCH_SOLO_FAST") && std::atoi(getenv("IK2_BATCH_SOLO_FAST")) != 0;
     if (const char* pp = getenv("IK2_PARALLEL")) { int v = std::atoi(pp); if (v >= 1 && v <= 8) g_parallel = v; }
     g_moe_group_exp = getenv("IK2_MOE_GROUP_EXPERT") && std::atoi(getenv("IK2_MOE_GROUP_EXPERT")) != 0;
     if (getenv("IK2_INT4_DENSE")) g_int4_dense = std::atoi(getenv("IK2_INT4_DENSE"));
@@ -5362,6 +5786,10 @@ int run(int argc, char** argv) {
             }
         }
         Ly.wo = load_mat(S, b + "attn_output.weight", (int) C, (int) HD);
+        // IK2_BATCH_DENSE_MV_MATS: tag each dense projection for per-mat A/B gating (unset/null mats are inert).
+        Ly.wqkvrg.batch_mv_cat = 1; Ly.wqrg.batch_mv_cat = 2; Ly.wq.batch_mv_cat = 2;
+        Ly.wk.batch_mv_cat = 3; Ly.wv.batch_mv_cat = 3; Ly.wk_dyn.batch_mv_cat = 3; Ly.wv_dyn.batch_mv_cat = 3;
+        Ly.wo.batch_mv_cat = 4; Ly.wr.batch_mv_cat = 5; Ly.wgate.batch_mv_cat = 5;
         Ly.router16 = load_f16(S, b + "ffn_gate_inp.weight", (size_t) c.E * C);
         Ly.probs_b = load_f32(S, b + "exp_probs_b.bias", c.E);
         Ly.ffn_norm = load_f32(S, b + "ffn_norm.weight", C);
@@ -5438,7 +5866,7 @@ int run(int argc, char** argv) {
                 const int role = rr[q][0] >= 0 ? rr[q][0] : rr[q][2];
                 const int M = (q == 0) ? 2 * c.F : C;
                 const int Kpad = (q == 0) ? C : ((c.F + 255) / 256) * 256;
-                const size_t wpsz = (size_t) c.E * (M / 2) * Kpad;   //每层每专家 Wp bytes = M*Kpad/2
+                const size_t wpsz = (size_t) c.E * (M / 2) * Kpad;   // per-row Wp bytes = M*Kpad/2
                 const size_t whsz = (size_t) c.E * (size_t) (M / 16) * (Kpad / 256) * 64;
                 const size_t wssz = (size_t) c.E * M * sizeof(float);
                 uint8_t* wp = dalloc<uint8_t>(wpsz);
@@ -6046,8 +6474,12 @@ int run(int argc, char** argv) {
     if (g_int4_experts) {
         const int Kpad_f = ((c.F + 255) / 256) * 256;
         W.i4_Kpad_f = Kpad_f;
-        // verify-fast rotates S=T*K slot rows into i4_xq/i4_xd; without it these hold the T=1 token only (unchanged).
-        const int i4_act_rows = g_verify_fast ? (int) std::max<size_t>(Tm, 8) : 1;
+        // verify-fast rotates S=T*K slot rows into i4_xq/i4_xd; batched dense MV rotates T rows per projection.
+        // IK2_BATCH_GRAPH_EXACT needs one q8x row per decode slot for the solo-equivalent MoE matvec.
+        // Without any of these these hold the T=1 token only (unchanged).
+        const int i4_act_rows = (g_verify_fast || g_batch_dense_mv || g_batch_graph_exact)
+                                    ? (int) std::max<size_t>(Tm, 8) : 1;
+        W.i4_xq_rows = i4_act_rows;
         W.i4_xq = dalloc<int8_t>((size_t) i4_act_rows * C); W.i4_xd = dalloc<float2>((size_t) i4_act_rows * (C / 32 + 2));
         W.i4_hf = dalloc<float>(S8 * Kpad_f); W.i4_hq = dalloc<int8_t>(S8 * Kpad_f); W.i4_hd = dalloc<float2>(S8 * (Kpad_f / 32 + 2));
         W.i4_Wp_s = dalloc<const uint8_t*>(S8); W.i4_Wh_s = dalloc<const uint8_t*>(S8); W.i4_WS_s = dalloc<const float*>(S8);
@@ -6060,7 +6492,7 @@ int run(int argc, char** argv) {
         // prefill scratch: one expert's rows at a time, capped at T_buf (rot_pack8 pads rows to 256)
         const int cap = (int) ((T_buf + 255) / 256 * 256);
         const size_t Kmax_sz = std::max<size_t>(C, (size_t) Kpad_f);
-        const int Kmax = (int) ((g_int4_dense_multi || g_int4_prefill) ? std::max<size_t>(Kmax_sz, HD) : Kmax_sz);
+        const int Kmax = (int) ((g_int4_dense_multi || g_int4_prefill || g_batch_dense_mv) ? std::max<size_t>(Kmax_sz, HD) : Kmax_sz);
         W.i4_pf_cap = cap;
         W.i4_pf_Kmax = Kmax;
         W.i4_pf_x = dalloc<float>((size_t) cap * Kmax);
@@ -6751,6 +7183,47 @@ int run(int argc, char** argv) {
             if (!any_active()) { busy = false; return; }
             busy = true;
             ++batch_steps;
+            // IK2_BATCH_SOLO_FAST: exactly one slot decoding, none prefilling -> the existing solo T=1
+            // fast path (forward -> fast_token resident graph), bit-exact and ~107 t/s/slot. The batched
+            // branch below needs >=2 ready rows, so a lone slot would otherwise take the general forward.
+            if (g_batch_solo_fast) {
+                int solo = -1, n_dec = 0, n_pf_chk = 0;
+                for (int b = 0; b < g_parallel; ++b) {
+                    const Ik2Req& r = reqs[b];
+                    if (!r.active) continue;
+                    if (r.prefill_pos < r.prompt_len) { ++n_pf_chk; continue; }
+                    if (r.next_tok < 0 || r.cancel || r.generated >= r.max_new || r.temp > 0) continue;
+                    ++n_dec; solo = b;
+                }
+                if (solo >= 0 && n_dec == 1 && n_pf_chk == 0) {
+                    Ik2Req& r = reqs[solo];
+                    ensure_loaded(solo);
+                    const int tok = r.next_tok;
+                    std::vector<float> lo;
+                    std::vector<int> ag;
+                    forward(M, &tok, 1, rq_pos(r), false, OutMode::kArgmax, std::string(), lo, &ag, t_exp);
+                    const int ntok = ag.empty() ? 0 : ag[0];
+                    r.hist.push_back(tok);
+                    ++r.generated;
+                    r.next_tok = ntok;
+                    r.cand = false;
+                    r.last.clear();
+                    std::printf("BT %d %d\n", solo, ntok);
+                    ++batch_tokens;
+                    if (r.cancel || std::find(r.stops.begin(), r.stops.end(), ntok) != r.stops.end())
+                        finish_req(solo, r.cancel ? "cancel" : "stop");
+                    else if (r.generated >= r.max_new) finish_req(solo, "length");
+                    if (batch_stats && batch_steps % 64 == 0) {
+                        int n_act = 0;
+                        for (const auto& r : reqs) if (r.active) ++n_act;
+                        std::printf("BSTAT active=%d steps=%lld tokens=%lld\n", n_act, batch_steps, batch_tokens);
+                    }
+                    if (!any_active()) busy = false;
+                    batch_dirty = true;
+                    std::fflush(stdout);
+                    return;
+                }
+            }
             // IK2_BATCH_ATTN: one greedy decode forward for all ready slots.  Sampling slots (and single ready
             // slots) keep the original serial path, so their RNG/order and output are unchanged.
             std::vector<char> batched((size_t) g_parallel, 0);

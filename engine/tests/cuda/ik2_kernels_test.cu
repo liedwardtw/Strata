@@ -2831,10 +2831,47 @@ void test_int4_gemm8_grouped_exact() {
     for (uint8_t* p : {dWp, dWh, dx4, dxm, dx4row, dxmrow}) cudaFree(p);
     cudaFree(dRowE);
 }
+// IK2_BATCH_ROTMV: int4_dense_rot_rows over NC=4 activation rows must be bit-exact with 4 separate
+// int4_dense_rot calls on the same weights and the same activation rows - the rows kernel only
+// shares each weight-row read across rows; nothing about the arithmetic may change.
+void test_int4_dense_rot_rows() {
+    const int M = 512, K = 2304, T = 4, sh = k::kInt4Sh8;
+    const size_t wp_n = (size_t) M * K / 2, wh_n = (size_t) (M / 16) * (K / 256) * 64;
+    std::vector<uint8_t> Wp(wp_n), Wh(wh_n);
+    std::vector<float> WS(M), X((size_t) T * K);
+    std::mt19937 rrng(20261126);
+    for (auto& v : Wp) v = (uint8_t) (rrng() & 0xFF);
+    for (auto& v : Wh) v = (uint8_t) (rrng() & 0xFF);
+    for (auto& v : WS) v = std::uniform_real_distribution<float>(-2.f, 2.f)(rrng);
+    for (auto& v : X) v = frand(2.f);
+    uint8_t *dWp = dev(Wp), *dWh = dev(Wh);
+    float *dWS = dev(WS), *dX = dev(X);
+    const float inv = 1.f / (1 << sh);
+    // rows kernel: one launch, T rows, dst row-major [T][M]
+    float* dRows = dev_n<float>((size_t) T * M);
+    k::int4_dense_rot_rows(dWp, dWh, dWS, M, K, dX, T, dRows, M, inv, 0);
+    // reference: T separate T=1 launches, one per activation row
+    float* dOne = dev_n<float>(M);
+    std::vector<float> want((size_t) T * M);
+    for (int r = 0; r < T; ++r) {
+        k::int4_dense_rot(dWp, dWh, dWS, M, K, dX + (size_t) r * K, dOne, k::MvConv{}, k::MvConv{}, inv, 0);
+        std::vector<float> one = host(dOne, M);
+        std::copy(one.begin(), one.end(), want.begin() + (size_t) r * M);
+    }
+    expect_exact("int4_dense_rot_rows NC=4 vs int4_dense_rot", host(dRows, (size_t) T * M), want);
+    // NC=1 (T=1) through the rows kernel is the same T=1 path bit for bit
+    float* dRow1 = dev_n<float>(M);
+    k::int4_dense_rot_rows(dWp, dWh, dWS, M, K, dX, 1, dRow1, M, inv, 0);
+    expect_exact("int4_dense_rot_rows NC=1 vs int4_dense_rot", host(dRow1, M),
+                 std::vector<float>(want.begin(), want.begin() + M));
+    for (float* p : {dWS, dX, dRows, dOne, dRow1}) cudaFree(p);
+    for (uint8_t* p : {dWp, dWh}) cudaFree(p);
+}
 #else
 void test_int4() { std::printf("skip int4 (no WMMA)\n"); }
 void test_int4_real() { std::printf("skip int4_real (no WMMA)\n"); }
 void test_int4_gemm8_grouped_exact() { std::printf("skip int4_gemm8_grouped_exact (no WMMA)\n"); }
+void test_int4_dense_rot_rows() { std::printf("skip int4_dense_rot_rows (no WMMA)\n"); }
 #endif
 
 #if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
@@ -3233,6 +3270,7 @@ int main() {
     test_int4();
     test_int4_real();
     test_int4_gemm8_grouped_exact();
+    test_int4_dense_rot_rows();
     test_batch_rows();
     test_batch_rows_gqa();
     test_batch_prep_rows();

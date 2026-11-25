@@ -7743,6 +7743,26 @@ void prep_qkv_r_int_g(int bits, float* q, const float* q_clip, const float* k_in
                                  0, nullptr, s);
 }
 
+// IK2_BATCH_GRAPH_EXACT: T-row f32 sink dot. The loop, h2f conversion and wsum reduction are the sink tail
+// of prep_qkv_r_int_kernel verbatim; only the activation pointer is advanced per row. sink_y is [T][H].
+__global__ void sink_dot_rows_kernel(const uint16_t* __restrict__ sink_w, const float* __restrict__ sink_x,
+                                     int H, int K, int sink_ld, float* __restrict__ sink_y) {
+    const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x;
+    const uint16_t* w = sink_w + (size_t) h * K;
+    const float* x = sink_x + (size_t) t * sink_ld;
+    float a = 0.0f;
+    for (int i = lane; i < K; i += 32) a += h2f(w[i]) * x[i];
+    a = wsum(a);
+    if (lane == 0) sink_y[(size_t) t * H + h] = a;
+}
+
+void sink_dot_rows(const uint16_t* sink_w, const float* sink_x, int T, int H, int K, int sink_ld,
+                   float* sink_y, cudaStream_t s) {
+    if (!sink_w || T <= 0 || H <= 0 || K <= 0) return;
+    sink_dot_rows_kernel<<<dim3((unsigned) H, (unsigned) T), 32, 0, s>>>(sink_w, sink_x, H, K, sink_ld, sink_y);
+    check("sink_dot_rows");
+}
+
 // True batched write counterpart of prep_qkv_r_int: every row t writes its K/V through its own cache pointers
 // (kci_tab[t] etc.) into slot pos[t] (mod kv_cap when given) and uses pos[t] for q/r's tau.  The tables are DEVICE
 // arrays of n_rows pointers; pos is a DEVICE int array used for KV slots, and optional tau_pos is a DEVICE int
@@ -9137,6 +9157,75 @@ __global__ __launch_bounds__(32 * NW) void k_mv_dense_rot(
     }
 }
 
+// NC activation rows share each weight-row read. Each row runs the same rotate/quant/sdot/reduction
+// order as k_mv_dense_rot (one row's lq/ld/red buffers reused per iteration, weights stay in
+// registers across rows), so NC=1 is bit-exact with that kernel.
+template <int NC, int NW, int ALT>
+__global__ __launch_bounds__(32 * NW) void k_mv_dense_rot_rows(
+        const uint8_t* __restrict__ Wp, const uint8_t* __restrict__ Wh, const float* __restrict__ S, float inv,
+        const float* __restrict__ X, int K, int T, float* __restrict__ dst, int ldy,
+        const MvConv* __restrict__ convs, int nconv) {
+    const int lane = threadIdx.x, r = lane & 15, h = lane >> 4, wv = threadIdx.y;
+    const int ft = blockIdx.x;
+    const int prow = ft * 16 + r;
+    const float pS = S[prow];
+    __shared__ __align__(16) int8_t lq[NW * 256];
+    __shared__ __align__(16) float2 ld[NW * 8];
+    __shared__ float red[NW][16];
+    (void) ALT;
+    half16v b1, a2;
+#pragma unroll
+    for (int k = 0; k < 16; k++) { b1[k] = h16(k, r); a2[k] = h16(r, k < 8 ? 2 * k : 2 * (k - 8) + 1); }
+    // wave wv owns block sb=wv (K/256 == NW); read the weight row ONCE for all NC activation rows.
+    const size_t wo = ((size_t) (ft * NW + wv) * 8 + h * 4) * 256 + r * 16;
+    const size_t so = ((size_t) (ft * NW + wv) * 16 + r) * 4 + h * 2;
+    uint4 w[4];
+#pragma unroll
+    for (int g = 0; g < 4; g++) w[g] = nt128(Wp, wo + g * 256);
+    const uint32_t sc = *(const uint16_t *) (Wh + so);
+#pragma unroll
+    for (int row = 0; row < NC; ++row) {
+        const float8v rot = rotate_block(X + (size_t) row * K + wv * 256, lane, b1, a2);
+        quant_rot8(rot, lane, lq + wv * 256, ld + wv * 8);
+        __syncthreads();
+        float acc = 0.f;
+        {
+            const uint4* xq = (const uint4*) (lq + wv * 256 + h * 128);
+            const float4* xd = (const float4*) (ld + wv * 8 + h * 4);
+            uint4 xv[8]; float4 dv[2];
+#pragma unroll
+            for (int i = 0; i < 8; i++) xv[i] = xq[i];
+            dv[0] = xd[0]; dv[1] = xd[1];
+#pragma unroll
+            for (int g = 0; g < 4; g++) {
+                const float2 ds = g < 2 ? (g == 0 ? make_float2(dv[0].x, dv[0].y) : make_float2(dv[0].z, dv[0].w)) : (g == 2 ? make_float2(dv[1].x, dv[1].y) : make_float2(dv[1].z, dv[1].w));
+                const uint32_t xw[8] = {xv[2 * g].x, xv[2 * g].y, xv[2 * g].z, xv[2 * g].w, xv[2 * g + 1].x, xv[2 * g + 1].y, xv[2 * g + 1].z, xv[2 * g + 1].w};
+                const uint32_t ww[4] = {w[g].x, w[g].y, w[g].z, w[g].w};
+                int si = 0;
+#pragma unroll
+                for (int wi = 0; wi < 4; wi++) {
+                    si = sdot4((int) ((ww[wi] & 0x0F0F0F0Fu) ^ 0x08080808u), (int) xw[2 * wi], si);
+                    si = sdot4((int) (((ww[wi] >> 4) & 0x0F0F0F0Fu) ^ 0x08080808u), (int) xw[2 * wi + 1], si);
+                }
+                acc += (float) ((sc >> (4 * g)) & 0xF) * (ds.x * (float) si - 8.f * ds.y);
+            }
+        }
+        acc += swap_rows(acc);
+        if (h == 0) red[wv][r] = acc;
+        __syncthreads();
+        if (wv == 0 && h == 0) {
+            float a = 0.f;
+#pragma unroll
+            for (int q = 0; q < NW; q++) a += red[q][r];
+            const float res = a * (pS * inv);
+            const int yrow = row * ldy + prow;
+            if (row < nconv && !mv_conv_row(convs[row], prow, res)) dst[yrow] = res;
+            else if (row >= nconv) dst[yrow] = res;
+        }
+        __syncthreads();
+    }
+}
+
 // Gather per-slot INT4 weight pointers from the routing's expert ids. One thread per slot.
 __global__ void int4_gather_slots_kernel(const int* __restrict__ top,
         const uint8_t* const* __restrict__ tabWp, const uint8_t* const* __restrict__ tabWh,
@@ -9450,6 +9539,41 @@ void int4_dense_rot(const uint8_t* Wp, const uint8_t* Wh, const float* WS, int M
 #undef IDR_LAUNCH
     check("int4_dense_rot");
 }
+// IK2_BATCH_ROTMV: batched T=1-equivalent dense decode matvec - T activation rows share each
+// weight-row read (k_mv_dense_rot_rows). Same rotate/quant/sdot/reduction order per row, so
+// NC=1 is bit-exact with int4_dense_rot. convs[row] applies row `row`'s mv_conv_row epilogue;
+// nconv=0 (or row >= nconv) writes the raw result to dst[row*ldy + prow].
+void int4_dense_rot_rows(const uint8_t* Wp, const uint8_t* Wh, const float* WS, int M, int K,
+                         const float* X, int T, float* dst, int ldy, float inv, cudaStream_t s,
+                         const MvConv* convs, int nconv) {
+    if (M % 16 != 0 || K % 256 != 0 || T < 1 || T > 8) {
+        std::fprintf(stderr, "ik2::k::int4_dense_rot_rows: M %d K %d T %d bad shape\n", M, K, T);
+        std::abort();
+    }
+    if (nconv < 0) nconv = 0;
+    if (nconv > T) nconv = T;
+    const int nw = K / 256;
+    const dim3 grid(M / 16);
+#define IDR_ROWS_LAUNCH(NC, NWV) int4w::k_mv_dense_rot_rows<NC, NWV, 0><<<grid, dim3(32, NWV), 0, s>>>(Wp, Wh, WS, inv, X, K, T, dst, ldy, convs, nconv)
+#define IDR_ROWS_NW(NC) do { \
+        if (nw == 9) IDR_ROWS_LAUNCH(NC, 9); \
+        else if (nw == 12) IDR_ROWS_LAUNCH(NC, 12); \
+        else { std::fprintf(stderr, "ik2::k::int4_dense_rot_rows: K %d (nw %d) not instantiated\n", K, nw); std::abort(); } \
+    } while (0)
+    switch (T) {
+        case 1: IDR_ROWS_NW(1); break;
+        case 2: IDR_ROWS_NW(2); break;
+        case 3: IDR_ROWS_NW(3); break;
+        case 4: IDR_ROWS_NW(4); break;
+        case 5: IDR_ROWS_NW(5); break;
+        case 6: IDR_ROWS_NW(6); break;
+        case 7: IDR_ROWS_NW(7); break;
+        default: IDR_ROWS_NW(8); break;
+    }
+#undef IDR_ROWS_NW
+#undef IDR_ROWS_LAUNCH
+    check("int4_dense_rot_rows");
+}
 #else
 void int4_rot_pack8(const float*, int, int, uint8_t*, uint8_t*, float*, cudaStream_t) {}
 void int4_gemm8(const uint8_t*, const uint8_t*, const float*, int, int, const uint8_t*, const uint8_t*, const float*, int, int, int, float*, const float*, int, cudaStream_t, int) {}
@@ -9463,6 +9587,7 @@ void int4_moe_group_build(const int*, int, int*, int*, int*, int*, cudaStream_t)
 void int4_matvec_grouped_exp(const uint8_t* const*, const uint8_t* const*, const float* const*, int, int, const int8_t*, const float2*, int, float*, int, float, cudaStream_t, int, int, const int*, const int*, const int*, const int*) {}
 void int4_matvec_grouped_rot(const uint8_t* const*, const uint8_t* const*, const float* const*, int, int, const float*, const uint16_t*, int, int, float*, int, float, cudaStream_t) {}
 void int4_dense_rot(const uint8_t*, const uint8_t*, const float*, int, int, const float*, float*, const MvConv&, const MvConv&, float, cudaStream_t, const MvAlt&, const MvAlt&) {}
+void int4_dense_rot_rows(const uint8_t*, const uint8_t*, const float*, int, int, const float*, int, float*, int, float, cudaStream_t, const MvConv*, int) {}
 void int4_gather_slots(const int*, const uint8_t* const*, const uint8_t* const*, const float* const*, int, const uint8_t**, const uint8_t**, const float**, cudaStream_t) {}
 void int4_prep_down(const uint16_t*, float*, int, int, int, cudaStream_t) {}
 // IK2_DRAFT_CAND stubs: the drafter gates its calls on the same build flag, so these are never used;
