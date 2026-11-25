@@ -152,11 +152,14 @@ void int4_gemm8(const uint8_t* Wp, const uint8_t* Wh, const float* WS, int M, in
 /// IK2_BATCH_MOE_DEVICE: bit-exact int4_gemm8 variant for the device-only batched MoE.  blockIdx.z
 /// selects the expert; row_expert[row] masks the rows that the host would have passed to that
 /// expert's N=cnt[e] call.  Written rows use the identical pack8+gemm8 arithmetic and order.
+/// IK2_BATCH_MOE_COMPACT: active_expert[z] maps z-plane to expert id; active_count holds its device length.
+/// When both are null the original blockIdx.z == expert_id behavior is used (bit-identical default).
 void int4_gemm8_moe_masked(const uint8_t* Wp, const uint8_t* Wh, const float* WS,
                            size_t wp_stride, size_t wh_stride, int ws_stride, int E,
                            const int* row_expert, int M, int K, const uint8_t* x4,
                            const uint8_t* xm, const float* xr, int N, int gw, int wn,
-                           float* out, const float* res, int sh, cudaStream_t s, int ldy = 0);
+                           float* out, const float* res, int sh, cudaStream_t s, int ldy = 0,
+                           const int* active_expert = nullptr, const int* active_count = nullptr);
 /// Rotate + 8-bit quantize X [N][K] into int8 codes Xq [N][K] + per-32-group (d, d*sum) Xd [N][K/32]
 /// for the decode matvec. smem = K*2 + (K/256)*4.
 void int4_rot_q8x(const float* X, int N, int K, int8_t* Xq, float2* Xd, cudaStream_t s);

@@ -516,6 +516,8 @@ bool g_batch_decode = false;  // IK2_BATCH_ATTN=1: true multi-slot batched decod
 bool g_batch_moe_device = false;  // IK2_BATCH_MOE_DEVICE=1 (default OFF): device-only INT4 MoE for the true batched
                                   // decode. Reproduces run_prefill_moe's rot_pack8 + gemm8 + expert-major scatter
                                   // numerics without the per-visit route D2H/sync. Applies only when W.batch.
+bool g_batch_moe_compact = false; // IK2_BATCH_MOE_COMPACT=1 (default OFF): launch int4_gemm8_moe_masked on only the
+                                  // experts with routed rows (grid.z <= S instead of E), preserving pack8/gemm8 math.
 bool g_serve_dspec = false;  // IK2_SERVE_DSPEC=1: --serve greedy (temp<=0) uses DSpark spec when a drafter is
                              // loaded and ctx has room; temp>0/short ctx fall back to byte-identical AR. Default OFF.
 bool g_moe_group_exp = false; // IK2_MOE_GROUP_EXPERT=1: verify-fast MoE grouped BY EXPERT -- each expert's
@@ -1580,6 +1582,10 @@ struct Work {
     cudaEvent_t batch_stage_ev[kBatchStageSlots] = {};
     bool batch_stage_ev_ok[kBatchStageSlots] = {};
     int batch_stage_next = 0;
+    // IK2_BATCH_MOE_COMPACT: device-built z->expert map (<= S entries) and active count. No D2H required:
+    // the masked GEMM launches min(E,S) z-planes and early-exits beyond this count.
+    int* moe_active_map = nullptr;
+    int* moe_active_count = nullptr;
     std::vector<int> cnt, start, fill, hit_exps, miss_exps;
     std::vector<uint8_t*> slot_ptrs;
     std::vector<uint32_t> seen_stamp, gi_stamp;
@@ -1950,7 +1956,9 @@ __global__ void moe_batch_perm_kernel(const int* __restrict__ top, const float* 
                                       const uint8_t** __restrict__ Wp0, const uint8_t** __restrict__ Wh0,
                                       const float** __restrict__ WS0, const uint8_t** __restrict__ Wp2,
                                       const uint8_t** __restrict__ Wh2, const float** __restrict__ WS2,
-                                       int* __restrict__ rexp) {
+                                       int* __restrict__ rexp,
+                                       int* __restrict__ active_map,
+                                       int* __restrict__ active_count) {
     extern __shared__ int sh[];
     int* cnt = sh;
     int* start = sh + E;
@@ -1962,6 +1970,11 @@ __global__ void moe_batch_perm_kernel(const int* __restrict__ top, const float* 
     if (tid == 0) {
         int sum = 0;
         for (int e = 0; e < E; ++e) { start[e] = sum; sum += cnt[e]; }
+        if (active_map && active_count) {
+            int z = 0;
+            for (int e = 0; e < E; ++e) if (cnt[e] > 0) active_map[z++] = e;
+            *active_count = z;
+        }
     }
     __syncthreads();
     if (tid < S) {
@@ -3748,11 +3761,16 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         if (batch_moe_ok) {
             const double te0 = now();
             const int F = c.F, Kp = W.i4_Kpad_f;
+            const bool moe_compact = g_batch_moe_compact && W.moe_active_map && W.moe_active_count;
+            const int* active_map = moe_compact ? W.moe_active_map : nullptr;
+            const int* active_count = moe_compact ? W.moe_active_count : nullptr;
             moe_batch_perm_kernel<<<1, 256, (size_t) c.E * 2 * sizeof(int), g_s>>>(
                 rtop, rw, Ly.i4_tab_Wp[0], Ly.i4_tab_Wh[0], Ly.i4_tab_WS[0],
                 Ly.i4_tab_Wp[2], Ly.i4_tab_Wh[2], Ly.i4_tab_WS[2], c.E, c.K, S,
                 W.gidx, W.tok, W.wtr, W.sg, W.su,
-                W.i4_Wp_s, W.i4_Wh_s, W.i4_WS_s, W.i4_Wp_dn, W.i4_Wh_dn, W.i4_WS_dn, W.inv);
+                W.i4_Wp_s, W.i4_Wh_s, W.i4_WS_s, W.i4_Wp_dn, W.i4_Wh_dn, W.i4_WS_dn, W.inv,
+                g_batch_moe_compact ? W.moe_active_map : nullptr,
+                g_batch_moe_compact ? W.moe_active_count : nullptr);
             // W.tok[expert-major row] = its slot's token; this is the same row order run_prefill_moe
             // builds with fill[e]++, so each token receives the expert contributions in expert order.
             gather_f32_16_kernel<<<S, 256, 0, g_s>>>(W.x16, W.tok, S, C, W.i4_pf_x);
@@ -3760,7 +3778,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             k::int4_gemm8_moe_masked(Ly.i4_Wp[0], Ly.i4_Wh[0], Ly.i4_WS[0],
                                      Ly.i4_wp_stride[0], Ly.i4_wh_stride[0], 2 * F, c.E, W.inv,
                                      2 * F, C, W.i4_pf_x4, W.i4_pf_xm, W.i4_pf_xr, S, 4, 8,
-                                     W.gu32, nullptr, k::kInt4Sh8, g_s, 2 * F);
+                                     W.gu32, nullptr, k::kInt4Sh8, g_s, 2 * F, active_map, active_count);
             k::swiglu_cap_f32(W.gu32, S, F, W.sg, W.su, c.gate_cap, c.up_cap, W.h16, g_s);
             i4_pad_h_kernel<<<S, 256, 0, g_s>>>(W.h16, S, F, Kp, W.i4_pf_x);
             k::int4_rot_pack8(W.i4_pf_x, S, Kp, W.i4_pf_x4, W.i4_pf_xm, W.i4_pf_xr, g_s);
@@ -3768,7 +3786,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             k::int4_gemm8_moe_masked(Ly.i4_Wp[2], Ly.i4_Wh[2], Ly.i4_WS[2],
                                      Ly.i4_wp_stride[2], Ly.i4_wh_stride[2], C, c.E, W.inv,
                                      C, Kp, W.i4_pf_x4, W.i4_pf_xm, W.i4_pf_xr, S, 4, 8,
-                                     W.y32, nullptr, k::kInt4Sh8, g_s, C);
+                                     W.y32, nullptr, k::kInt4Sh8, g_s, C, active_map, active_count);
             moe_batch_scatter_kernel<<<T, 256, 0, g_s>>>(W.y32, W.tok, W.wtr, S, C, W.tmp, C);
             g_pf.lap(g_pf.experts);
             t_exp += now() - te0;
@@ -4937,6 +4955,7 @@ int run(int argc, char** argv) {
     g_verify_graph = getenv("IK2_VERIFY_GRAPH") && std::atoi(getenv("IK2_VERIFY_GRAPH")) != 0;
     g_batch_decode = getenv("IK2_BATCH_ATTN") && std::atoi(getenv("IK2_BATCH_ATTN")) != 0;
     g_batch_moe_device = getenv("IK2_BATCH_MOE_DEVICE") && std::atoi(getenv("IK2_BATCH_MOE_DEVICE")) != 0;
+    g_batch_moe_compact = getenv("IK2_BATCH_MOE_COMPACT") && std::atoi(getenv("IK2_BATCH_MOE_COMPACT")) != 0;
     g_serve_dspec = getenv("IK2_SERVE_DSPEC") && std::atoi(getenv("IK2_SERVE_DSPEC")) != 0;
     if (const char* pp = getenv("IK2_PARALLEL")) { int v = std::atoi(pp); if (v >= 1 && v <= 8) g_parallel = v; }
     g_moe_group_exp = getenv("IK2_MOE_GROUP_EXPERT") && std::atoi(getenv("IK2_MOE_GROUP_EXPERT")) != 0;
@@ -6019,6 +6038,10 @@ int run(int argc, char** argv) {
     W.wtr = dalloc<float>(S_buf);
     W.sg = dalloc<float>(S_buf), W.su = dalloc<float>(S_buf), W.wt = dalloc<float>(S_buf);
     W.gidx = dalloc<int>(S_buf), W.inv = dalloc<int>(S_buf);
+    if (g_batch_moe_compact) {
+        W.moe_active_map = dalloc<int>(S_buf);
+        W.moe_active_count = dalloc<int>(1);
+    }
     W.blob = dalloc<const uint8_t*>(S8), W.tok = dalloc<int>(S8);
     if (g_int4_experts) {
         const int Kpad_f = ((c.F + 255) / 256) * 256;

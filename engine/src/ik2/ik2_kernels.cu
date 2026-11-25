@@ -8393,14 +8393,15 @@ __global__ __launch_bounds__(WN * 32) void k_gemm8w_moe_masked(const uint8_t* __
         size_t wp_stride, size_t wh_stride, int ws_stride, int E, const int* __restrict__ row_expert,
         const uint8_t* __restrict__ Xhp, const uint8_t* __restrict__ Xlp, const uint8_t* __restrict__ XMp,
         const float* __restrict__ XRp, float* __restrict__ out, int M, int N, int K, const float* res,
-        int sh, int ldy) {
+        int sh, int ldy, const int* __restrict__ active_expert, const int* __restrict__ active_count) {
     const int lane = threadIdx.x & 31;
     const int wn = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
     const int h = lane >> 4, lc = lane & 15;
     const int nsb = K / 256;
     const int ft0 = blockIdx.x * MI;
     const int tt0 = (blockIdx.y * WN + wn) * NJ;
-    const int e = blockIdx.z;
+    if (active_expert && blockIdx.z >= *active_count) return;
+    const int e = active_expert ? active_expert[blockIdx.z] : blockIdx.z;
     const uint8_t* Wp_e = Wp + (size_t) e * wp_stride;
     const uint8_t* Wh_e = Wh + (size_t) e * wh_stride;
     const float* WS_e = WS + (size_t) e * ws_stride;
@@ -9323,14 +9324,16 @@ void int4_gemm8_moe_masked(const uint8_t* Wp, const uint8_t* Wh, const float* WS
                            size_t wp_stride, size_t wh_stride, int ws_stride, int E,
                            const int* row_expert, int M, int K, const uint8_t* x4,
                            const uint8_t* xm, const float* xr, int N, int gw, int wn_,
-                           float* out, const float* res, int sh, cudaStream_t s, int ldy) {
+                           float* out, const float* res, int sh, cudaStream_t s, int ldy,
+                            const int* active_expert, const int* active_count) {
     if (N <= 0 || M % int4w::TILE_M != 0 || K % 256 != 0) return;
     const int ld = ldy > 0 ? ldy : M;
     const int Npad = ((N + int4w::TILE_N - 1) / int4w::TILE_N) * int4w::TILE_N;
     const size_t plane = (size_t) Npad * K / 2;
     const uint8_t* xh = x4; const uint8_t* xl = x4 + plane;
-    const dim3 grid(M / int4w::TILE_M, Npad / (wn_ * int4w::NJ * 16), E);
-#define I4_G8M(GW, WN) int4w::k_gemm8w_moe_masked<GW, WN><<<grid, WN * 32, 0, s>>>(Wp, Wh, WS, wp_stride, wh_stride, ws_stride, E, row_expert, xh, xl, xm, xr, out, M, N, K, res, sh, ld)
+    const int planes = active_expert ? (M < E ? M : E) : E;
+    const dim3 grid(M / int4w::TILE_M, Npad / (wn_ * int4w::NJ * 16), planes);
+#define I4_G8M(GW, WN) int4w::k_gemm8w_moe_masked<GW, WN><<<grid, WN * 32, 0, s>>>(Wp, Wh, WS, wp_stride, wh_stride, ws_stride, E, row_expert, xh, xl, xm, xr, out, M, N, K, res, sh, ld, active_expert, active_count)
     if (wn_ == 4) { if (gw == 1) I4_G8M(1, 4); else if (gw == 2) I4_G8M(2, 4); else I4_G8M(4, 4); }
     else { if (gw == 1) I4_G8M(1, 8); else if (gw == 2) I4_G8M(2, 8); else I4_G8M(4, 8); }
 #undef I4_G8M
