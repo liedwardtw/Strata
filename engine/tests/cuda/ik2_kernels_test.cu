@@ -641,6 +641,29 @@ std::vector<uint8_t> rand_blocks(int type, size_t n_values) {
     return raw;
 }
 
+// IK2_AR_KSTEP: the device gather must be bit-identical to decode_host(), including out-of-range token ids.
+void test_embed_gather_f32() {
+    const int type = k::kQ8_0, C = 256, n_rows = 7, n_tokens = 9;
+    const size_t bv = k::block_values(type), bb = k::block_bytes(type), rb = (size_t) C / bv * bb;
+    std::vector<uint8_t> table = rand_blocks(type, (size_t) n_rows * C);
+    const std::vector<int> tok = {0, 2, 4, 6, 1, 3, 5, -1, n_rows};
+    std::vector<float> want((size_t) n_tokens * C, 0.0f);
+    for (int t = 0; t < n_tokens; ++t) {
+        if (tok[t] >= 0 && tok[t] < n_rows)
+            k::decode_host(type, table.data() + (size_t) tok[t] * rb, (size_t) C, want.data() + (size_t) t * C);
+    }
+    uint8_t* d_table = dev(table);
+    int* d_tok = dev(tok);
+    float* d_out = dev_n<float>((size_t) n_tokens * C);
+    k::embed_gather_f32(type, d_table, n_rows, rb, C, d_tok, n_tokens, d_out, 0);
+    const std::vector<float> got = host(d_out, (size_t) n_tokens * C);
+    expect_exact("embed_gather_f32: device gather = decode_host, bit for bit", got, want);
+    double worst = 0.0;
+    for (size_t i = 0; i < want.size(); ++i) worst = std::max(worst, std::fabs((double) got[i] - want[i]));
+    expect_true("embed_gather_f32: worst absolute difference = 0", worst == 0.0);
+    cudaFree(d_table), cudaFree(d_tok), cudaFree(d_out);
+}
+
 // ggml's dequantize_row_iq3_xxs / dequantize_row_iq4_xs, transcribed (ksigns_iq2xs[i] = i | parity(i) << 7)
 static const uint32_t g_iq3xxs_grid[256] = {IK2_IQ3XXS_GRID};
 static const int8_t g_iq4nl[16] = {IK2_IQ4NL_VALUES};
@@ -3251,6 +3274,7 @@ int main() {
     test_route();
     test_moe_pieces();
     test_decode();
+    test_embed_gather_f32();
     test_iq_ref();
     test_experts_mv();
     test_attn_decode();

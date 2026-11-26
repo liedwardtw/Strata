@@ -362,6 +362,10 @@ struct Model {
     float* lp_query_all = nullptr;   // a looped core's message queries, layer by layer ([n_core][4][C]: Layer::lp_query's)
     const uint8_t* embd;  // host Q8_0 [n_rows][C]
     int embd_type;
+    // IK2_AR_KSTEP / IK2_EMBD_GPU: the same table on the device, for device-side gather in the K-step graph.
+    const uint8_t* embd_d = nullptr;
+    int embd_rows = 0;
+    size_t embd_row_bytes = 0;
 };
 
 inline Layer& bind_visit(Model& M, int v) {
@@ -526,6 +530,11 @@ bool g_ar_dual = false;        // IK2_AR_DUAL=1 (needs IK2_PARALLEL=2): two AR d
 bool g_ar_stream2 = false;      // IK2_AR_STREAM2=1 (needs IK2_AR_DUAL=1, IK2_PARALLEL=2): replay slot 0 on g_s and
                                 // slot 1 on a second non-blocking stream g_s1, with a second isolated Work. Default
                                 // OFF: byte-identical to the original single-stream AR dual path.
+bool g_ar_kstep = false;        // IK2_AR_KSTEP=1 (implies IK2_AR_STREAM2 and IK2_EMBD_GPU): pre-captured K-token
+                                 // graphs per AR slot, with device embed gather + device pos advance. Default OFF.
+int g_ar_K = 4;                 // IK2_AR_KSTEP_K, clamped to [2,8].
+bool g_ar_kstep_ready = false;  // set only after BOTH slot graphs instantiate successfully.
+bool g_embd_gpu = false;        // IK2_EMBD_GPU=1: upload the embedding table once, for device gather.
 bool g_batch_exact = true;     // IK2_BATCH_EXACT (default 1): route every batched greedy step through the serial
                                // T=1 forward()/fast_token path, which is byte-identical to solo. IK2_BATCH_EXACT=0
                                // restores the original true-batched T=2..8 general path (faster but not bit-exact).
@@ -1601,6 +1610,11 @@ struct Work {
     // IK2_AR_STREAM2: multi-block argmax partials must be per-Work when two slot graphs replay concurrently.
     float* argmax_part_v = nullptr;
     int* argmax_part_i = nullptr;
+    // IK2_AR_KSTEP: K-step graph state, per slot (graphs bake these addresses, so slot 1 gets fresh copies).
+    int kstep_K = 0;
+    float* emb_dK = nullptr;        // [(K-1)*C] device gather output for steps 1..K-1
+    int* argmax_dK = nullptr;       // [K] device argmax writes, all in graph order
+    int* argmax_hK = nullptr;       // [K] pinned host, read only after the graph's stream sync
     std::vector<cudaEvent_t> miss_ev;
     // prefill: the next layer's experts copied in while this one runs (prefetch_layer)
     // the prefetches in flight, a ring by layer: their batches' events, expert -> its batch
@@ -1791,6 +1805,14 @@ void clone_ar_work(Work& dst, const Work& src, const Config& c) {
     dst.argmax_d = dalloc<int>(Tm);
     dst.argmax_part_v = dalloc<float>(256);
     dst.argmax_part_i = dalloc<int>(256);
+    // The K-step graph bakes these addresses too: slot 1 must NOT inherit slot 0's buffers.
+    dst.kstep_K = 0; dst.emb_dK = nullptr; dst.argmax_dK = nullptr; dst.argmax_hK = nullptr;
+    if (src.kstep_K > 0) {
+        dst.kstep_K = src.kstep_K;
+        dst.emb_dK = dalloc<float>((size_t) (src.kstep_K - 1) * C);
+        dst.argmax_dK = dalloc<int>(src.kstep_K);
+        CU(cudaHostAlloc((void**) &dst.argmax_hK, (size_t) src.kstep_K * 4, cudaHostAllocPortable));
+    }
     dst.cand_d = dalloc<int>(2 + 2 * 4096);
     dst.cand_part = dalloc<int>(k::cand_scratch(c.n_vocab));
 
@@ -3308,6 +3330,8 @@ FastGraph g_fgraph[4];      // by OutMode
 // IK2_AR_DUAL: one graph per (slot, OutMode).  Each graph captures the SAME T=1 fast_token_launches sequence with
 // that slot's per-visit KV/conv pointers baked in, so replay is bit-exact to a solo T=1 token.
 FastGraph g_ar_fgraph[2][4];
+// IK2_AR_KSTEP: one pre-captured graph per slot.  Greedy-only (kArgmax), so no OutMode dimension is needed.
+FastGraph g_ar_kgraph[2];
 
 // IK2_VERIFY_GRAPH: one graph for the whole T=8 g_rec verify forward (48 layer visits + head).  Captured on the
 // first pure-argmax verify window after a warm-up normal pass, replayed at every later window.  Inputs (token rows,
@@ -3337,11 +3361,17 @@ struct BatchGraph {
 };
 BatchGraph g_bgraph;
 
-// one token's launches: its embedding row in W.emb_h and its position in W.pos_h[0] (pinned host; copied first)
-void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
+// one token's launches.  With kstep=false this is EXACTLY the original fast_token_launches sequence (the default
+// path is byte-identical).  With kstep=true, step 0 stages the embedding/position from pinned host, steps 1..K-1
+// gather the previous token's embedding on the device from from_device_token and advance W.pos there; none of them
+// does a host sync, and argmax writes go to argmax_out_d (per-Work scratch overload) instead of W.argmax_d.
+void one_token_launches(Model& M, Work& W, OutMode out_mode, bool kstep = false, int step = 0,
+                        const int* from_device_token = nullptr, int* argmax_out_d = nullptr,
+                        bool copy_argmax_h = true) {
     const Config& c = M.c;
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel;
     const size_t Cb = (size_t) C * 4;
+    if (!argmax_out_d) argmax_out_d = W.argmax_d;
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
     const float k_scale = c.qk_clip <= 28.0f ? 16.0f : 1.0f, v_scale = 32.0f;
     // the attention's key splits: fixed, so that the launches are the same at every position
@@ -3349,9 +3379,18 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
     if (const char* ps = getenv("IK2_DECODE_P")) { int v = std::atoi(ps); if (v >= 1 && v <= 128) P_sl = v; }
     if (g_prof_fast) pf_fast::setup();
     pf_fast::mark(0, g_s);
-    CU(cudaMemcpyAsync(W.tmp, W.emb_h, Cb, cudaMemcpyHostToDevice, g_s));
-    k::rms(W.tmp, M.embd_norm, 1, C, c.eps, W.h, g_s);
-    CU(cudaMemcpyAsync(W.pos, W.pos_h, 4, cudaMemcpyHostToDevice, g_s));
+    if (kstep && step > 0) {
+        // Device gather of the token emitted by step-1, into this Work's fresh intermediate buffer.  rms reads it
+        // below; W.tmp is only the step-0 embedding staging and is reused by the visits anyway.
+        float* emb_src = W.emb_dK + (size_t) (step - 1) * C;
+        k::embed_gather_f32(M.embd_type, M.embd_d, M.embd_rows, M.embd_row_bytes, C, from_device_token, 1, emb_src, g_s);
+        k::rms(emb_src, M.embd_norm, 1, C, c.eps, W.h, g_s);
+        // W.pos already holds base+step from the device-side pos_inc between steps; no H2D here.
+    } else {
+        CU(cudaMemcpyAsync(W.tmp, W.emb_h, Cb, cudaMemcpyHostToDevice, g_s));
+        k::rms(W.tmp, M.embd_norm, 1, C, c.eps, W.h, g_s);
+        CU(cudaMemcpyAsync(W.pos, W.pos_h, 4, cudaMemcpyHostToDevice, g_s));
+    }
     pf_fast::mark(1, g_s);
     auto blk = [&](int i) { return W.blocks + (size_t) i * W.blk_ld * C; };
     int nb = 0, nb_pre = 0, n_bank = 0;
@@ -3751,8 +3790,9 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, 1, C, 1e-6f, c.eps, outs, g_s);
         mv1(M.out_w, W.xq, W.logits);
         if (out_mode == OutMode::kArgmax) {
-            k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, W.argmax_d, g_s, W.argmax_part_v, W.argmax_part_i);
-            CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, 4, cudaMemcpyDeviceToHost, g_s));
+            k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, argmax_out_d, g_s, W.argmax_part_v, W.argmax_part_i);
+            if (!kstep && copy_argmax_h)
+                CU(cudaMemcpyAsync(W.argmax_h, argmax_out_d, 4, cudaMemcpyDeviceToHost, g_s));
         } else if (out_mode == OutMode::kCand) {   // (the softcap keeps the logits within +- logit_cap)
             k::softcap(W.logits, (size_t) c.n_rows, c.logit_cap, g_s);
             k::cand_topk(W.logits, c.n_vocab, -c.logit_cap, c.logit_cap, kCandK, kCandCap, W.cand_part, W.cand_d, g_s);
@@ -3763,6 +3803,22 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         }
     }
     pf_fast::mark(12, g_s);
+}
+
+// Default entry point.  Every existing caller uses this, with no new arguments: byte-identical to HEAD.
+void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
+    one_token_launches(M, W, out_mode, false, 0, nullptr, W.argmax_d, true);
+}
+
+// IK2_AR_KSTEP: K tokens in ONE graph.  Step 0 takes the host-staged token/position; later steps read the previous
+// token's id on the device and the device-advanced position.  Exactly ONE D2H at the end publishes all K ids.
+void fast_token_launches_k(Model& M, Work& W, int K) {
+    for (int s = 0; s < K; ++s) {
+        const int* prev = s > 0 ? W.argmax_dK + (s - 1) : nullptr;
+        one_token_launches(M, W, OutMode::kArgmax, true, s, prev, W.argmax_dK + s, false);
+        if (s + 1 < K) k::pos_inc(W.pos, g_s);
+    }
+    CU(cudaMemcpyAsync(W.argmax_hK, W.argmax_dK, (size_t) K * 4, cudaMemcpyDeviceToHost, g_s));
 }
 
 // one token through the resident path: its logits appended to logits_out (kLogits) or its argmax (kArgmax)
@@ -3864,6 +3920,40 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
             g_cand.n = -1;
         }
     }
+}
+
+// IK2_AR_KSTEP: submit the PRE-BUILT K-token graph for one AR slot.  No lazy capture here: K graphs are built before
+// the serve loop, because K bookkeeping consumes K ids from argmax_hK, not one id from argmax_h.
+void fast_token_k(Model& M, int slot, int tok0, int pos0, bool submit_only,
+                  std::vector<int>* argmax_out = nullptr) {
+    const Config& c = M.c;
+    use_dev(0);
+    const bool ar_slot = slot >= 0 && slot < 2 && g_ar_dual && g_batch_decode;
+    const bool ar2 = ar_slot && g_ar_stream2 && g_s1 && slot == 1;
+    Work& W = ar2 ? g_ar_work1 : dev_work(0);
+    cudaStream_t stream = ar2 ? g_s1 : g_s;
+    FastGraph& G = g_ar_kgraph[slot];
+    if (!ar_slot || !G.exec || G.disabled) {
+        // Never replay a K graph under one-step bookkeeping.  Disable globally; batch_step falls through.
+        std::fprintf(stderr, "ik2: AR K-step graph slot %d not ready; disabling KSTEP\n", slot);
+        g_ar_kstep = false; g_ar_kstep_ready = false;
+        return;
+    }
+    if (ar_slot) load_batch_slot(M, slot);
+    const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
+    k::decode_host(M.embd_type, M.embd + (size_t) tok0 * rb, c.C, W.emb_h);
+    W.pos_h[0] = pos0;
+    const bool want_stats = ar_slot && g_ar2_stats;
+    cudaStream_t old_s = g_s;
+    if (ar2) g_s = stream;   // every launch and the final D2H capture/use the same global stream variable
+    if (want_stats) CU(cudaEventRecord(g_ar2_ev[(size_t) slot * 2], stream));
+    CU(cudaGraphLaunch(G.exec, stream));
+    if (want_stats) CU(cudaEventRecord(g_ar2_ev[(size_t) slot * 2 + 1], stream));
+    if (ar2) g_s = old_s;
+    if (submit_only) return;
+    CU(cudaStreamSynchronize(stream));
+    pf_fast::finish(stream);
+    if (argmax_out) argmax_out->assign(W.argmax_hK, W.argmax_hK + W.kstep_K);
 }
 
 void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode out_mode, const std::string& dump,
@@ -5560,6 +5650,30 @@ int run(int argc, char** argv) {
             g_ar2_stats = getenv("IK2_AR_STREAM2_STATS") && std::atoi(getenv("IK2_AR_STREAM2_STATS")) != 0;
         }
     }
+    g_embd_gpu = getenv("IK2_EMBD_GPU") && std::atoi(getenv("IK2_EMBD_GPU")) != 0;
+    g_ar_kstep = getenv("IK2_AR_KSTEP") && std::atoi(getenv("IK2_AR_KSTEP")) != 0;
+    if (g_ar_kstep) {
+        if (g_parallel != 2) {
+            std::fprintf(stderr, "ik2: IK2_AR_KSTEP=1 needs IK2_PARALLEL=2; ignoring\n");
+            g_ar_kstep = false;
+        } else {
+            // KSTEP is a self-contained opt-in: it must have the dual stream and the device embedding table.
+            if (!g_ar_dual) { g_ar_dual = true; g_batch_decode = true; }
+            g_ar_stream2 = true;
+            g_ar2_stats = getenv("IK2_AR_STREAM2_STATS") && std::atoi(getenv("IK2_AR_STREAM2_STATS")) != 0;
+            g_embd_gpu = true;
+            g_ar_K = 4;
+            // The A/B harness sets IK2_AR_K; the spec's canonical name is IK2_AR_KSTEP_K.  Accept both.
+            const char* ks = getenv("IK2_AR_KSTEP_K");
+            if (!ks) ks = getenv("IK2_AR_K");
+            if (ks) {
+                int v = std::atoi(ks);
+                if (v < 2) v = 2;
+                if (v > 8) v = 8;
+                g_ar_K = v;
+            }
+        }
+    }
     g_moe_group_exp = getenv("IK2_MOE_GROUP_EXPERT") && std::atoi(getenv("IK2_MOE_GROUP_EXPERT")) != 0;
     if (getenv("IK2_INT4_DENSE")) g_int4_dense = std::atoi(getenv("IK2_INT4_DENSE"));
     if (const char* pf = getenv("IK2_DECODE_PFULL")) { int v = std::atoi(pf); if (v >= 1 && v <= 512) g_decode_pfull = v; }
@@ -5850,6 +5964,9 @@ int run(int argc, char** argv) {
                                  "falling back to IK2_PARALLEL=1\n", kv_b / 1073741824.0);
             g_ar_dual = false;
             g_ar_stream2 = false;
+            g_ar_kstep = false;
+            g_ar_kstep_ready = false;
+            if (!getenv("IK2_EMBD_GPU")) g_embd_gpu = false;
             g_batch_decode = false;
             g_parallel = 1;
             kv_b = kv_b_one;
@@ -6316,6 +6433,36 @@ int run(int argc, char** argv) {
     M.embd = S.data("token_embd.weight");
     M.embd_type = (int) S.info("token_embd.weight")->type;
     if (!k::block_values(M.embd_type)) die("token_embd's type");
+    if (g_embd_gpu) {
+        // IK2_EMBD_GPU / IK2_AR_KSTEP: one device copy of the host Q8_0 embedding table.  Use raw cudaMalloc so an
+        // allocation failure can gracefully disable KSTEP instead of exiting from dalloc's CU check.  The EC budget
+        // below is computed from free VRAM afterwards, so this reservation is accounted for automatically.
+        use_dev(0);
+        const strata::TensorInfo* ti = S.info("token_embd.weight");
+        const size_t emb_bytes = tensor_bytes(*ti);
+        const int emb_rows = (int) (ti->elements() / (size_t) C);
+        if (emb_rows < c.n_vocab || emb_bytes < (size_t) emb_rows) {
+            std::fprintf(stderr, "ik2: embedding table too small (%d rows, vocab %d); disabling KSTEP\n",
+                         emb_rows, c.n_vocab);
+            g_ar_kstep = false; g_ar_kstep_ready = false; g_embd_gpu = false;
+        } else {
+            M.embd_rows = emb_rows;
+            M.embd_row_bytes = (size_t) emb_bytes / (size_t) emb_rows;
+            uint8_t* emb_d = nullptr;
+            cudaError_t ce = cudaMalloc((void**) &emb_d, emb_bytes);
+            if (ce == cudaSuccess) ce = cudaMemcpy(emb_d, M.embd, emb_bytes, cudaMemcpyHostToDevice);
+            if (ce == cudaSuccess) {
+                M.embd_d = emb_d;
+                std::printf("ik2: embedding table on device (%.2f GiB, %d rows, %zu bytes/row)\n",
+                            (double) emb_bytes / 1073741824.0, emb_rows, M.embd_row_bytes);
+            } else {
+                std::fprintf(stderr, "ik2: embedding upload failed (%s); disabling KSTEP\n", cudaGetErrorString(ce));
+                if (emb_d) (void) cudaFree(emb_d);
+                (void) cudaGetLastError();
+                g_ar_kstep = false; g_ar_kstep_ready = false; g_embd_gpu = false;
+            }
+        }
+    }
     if (g_stage) cudaFree(g_stage), g_stage = nullptr, g_stage_bytes = 0;
     vram_mark("after-dense-out_w");
     {
@@ -6740,6 +6887,13 @@ int run(int argc, char** argv) {
     W.argmax_part_v = dalloc<float>(256);
     W.argmax_part_i = dalloc<int>(256);
     CU(cudaHostAlloc(&W.argmax_h, Tm * 4, cudaHostAllocPortable));
+    // IK2_AR_KSTEP: per-Work K graph staging.  The clone for slot 1 allocates these freshly.
+    if (g_ar_kstep && M.embd_d) {
+        W.kstep_K = g_ar_K;
+        W.emb_dK = dalloc<float>((size_t) (g_ar_K - 1) * C);
+        W.argmax_dK = dalloc<int>(g_ar_K);
+        CU(cudaHostAlloc(&W.argmax_hK, (size_t) g_ar_K * 4, cudaHostAllocPortable));
+    }
     CU(cudaHostAlloc(&W.logits_h, (size_t) c.n_rows * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&W.cand_h, (size_t) (2 + 2 * kCandCap) * 4, cudaHostAllocPortable));
     {   // (IK2_RG_SLOTS: the slots - tokens x picks - up to which a prompt's experts go by groups; 0: never)
@@ -6989,6 +7143,82 @@ int run(int argc, char** argv) {
         return v;
     };
 
+    // IK2_AR_KSTEP: the lazy one-step capture cannot be used here.  A K graph computes K tokens while one-step
+    // bookkeeping would consume 1, so both slot graphs MUST exist before the serve loop starts.  A direct warm-up
+    // first runs the exact launch sequence (cuBLAS/hipBLAS shape setup may allocate outside capture), then the
+    // capture records it.  Anything that fails disables K globally and leaves the proven one-step path intact.
+    if (g_ar_kstep && !M.embd_d) {
+        std::fprintf(stderr, "ik2: IK2_AR_KSTEP needs the device embedding table; disabling\n");
+        g_ar_kstep = false;
+    }
+    if (g_ar_kstep) {
+        use_dev(0);
+        bool ok = true;
+        for (int slot = 0; slot < 2 && ok; ++slot) {
+            Work& W = slot == 1 ? g_ar_work1 : dev_work(0);
+            cudaStream_t stream = slot == 1 ? g_s1 : g_s;
+            cudaStream_t old_s = g_s;
+            if (slot == 1) g_s = stream;   // all launch code, capture and replay use the same global stream
+            load_batch_slot(M, slot);
+            cudaError_t ce = cudaStreamSynchronize(stream);
+            const int C = M.c.C;
+            std::memset(W.emb_h, 0, (size_t) C * 4);
+            W.pos_h[0] = 0;
+            const double t0 = now();
+            if (ce == cudaSuccess) fast_token_launches_k(M, W, g_ar_K);
+            const double t1 = now();
+            if (ce == cudaSuccess) ce = cudaStreamSynchronize(stream);
+            cudaGraph_t graph = nullptr;
+            cudaGraphExec_t exec = nullptr;
+            const double t2 = now();
+            if (ce == cudaSuccess) ce = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+            if (ce == cudaSuccess) {
+                g_fast_graph_capturing = true;
+                fast_token_launches_k(M, W, g_ar_K);
+                ce = cudaStreamEndCapture(stream, &graph);
+                g_fast_graph_capturing = false;
+            }
+            const double t3 = now();
+            double inst_s = 0.0;
+            if (ce == cudaSuccess) {
+                const double ti0 = now();
+                ce = cudaGraphInstantiate(&exec, graph, 0);
+                inst_s = now() - ti0;
+            }
+            const double t4 = now();
+            if (ce == cudaSuccess) {
+                g_ar_kgraph[slot].graph = graph;
+                g_ar_kgraph[slot].exec = exec;
+                size_t nn = 0;
+                if (cudaGraphGetNodes(graph, nullptr, &nn) != cudaSuccess) nn = (size_t) -1;
+                std::printf("ik2: AR K-step graph slot %d K=%d nodes=%zu warm=%.1fms capture=%.1fms inst=%.1fms\n",
+                            slot, g_ar_K, nn, (t1 - t0) * 1e3, (t3 - t2) * 1e3, inst_s * 1e3);
+                (void) t4;
+            } else {
+                std::fprintf(stderr, "ik2: AR K-step graph slot %d failed (%s); disabling KSTEP\n",
+                             slot, cudaGetErrorString(ce));
+                if (graph) (void) cudaGraphDestroy(graph);
+                if (exec) (void) cudaGraphExecDestroy(exec);
+                ok = false;
+                (void) cudaGetLastError();
+            }
+            if (slot == 1) g_s = old_s;
+        }
+        g_ar_kstep_ready = ok;
+        if (!ok) {
+            g_ar_kstep = false;
+            for (int slot = 0; slot < 2; ++slot) {
+                if (g_ar_kgraph[slot].exec) cudaGraphExecDestroy(g_ar_kgraph[slot].exec);
+                if (g_ar_kgraph[slot].graph) cudaGraphDestroy(g_ar_kgraph[slot].graph);
+                g_ar_kgraph[slot].exec = nullptr; g_ar_kgraph[slot].graph = nullptr;
+            }
+            std::fflush(stdout);
+        } else {
+            std::printf("ik2: AR K-step ready (K=%d, both slots pre-built)\n", g_ar_K);
+            std::fflush(stdout);
+        }
+    }
+
     if (serve) {
         // --serve: requests on stdin, a line each - "GEN max_new temperature top_p seed stop,stop ids,ids,..." - and
         // the answer on stdout as "@TOK id" lines then "@END reason prompt_tokens cached_tokens prompt_s gen_s".  The
@@ -7179,6 +7409,9 @@ int run(int argc, char** argv) {
             std::fprintf(stderr, "ik2: AR dual disabled (IK2_PARALLEL lowered to %d)\n", g_parallel);
             g_ar_dual = false;
             g_ar_stream2 = false;
+            g_ar_kstep = false;
+            g_ar_kstep_ready = false;
+            if (!getenv("IK2_EMBD_GPU")) g_embd_gpu = false;
             g_batch_decode = false;
         }
         std::vector<Ik2Req> reqs;
@@ -7456,6 +7689,59 @@ int run(int argc, char** argv) {
                     // Same kernels/order as a solo token, so the emitted ids stay bit-exact.  With IK2_AR_STREAM2
                     // the two replays are submitted to g_s and g_s1 without a host sync between them, then both
                     // streams are waited before either argmax is read.  One ready slot keeps the serial path.
+                    // IK2_AR_KSTEP branch: K tokens per graph replay, both slots submitted back-to-back.
+                    // This MUST precede the one-step ar2_ready path: a K graph writes K ids into argmax_hK,
+                    // which the one-step bookkeeping (W.argmax_h[0]) would misread as a single token.
+                    const bool kstep_ready = g_ar_kstep && g_ar_kstep_ready && ids.size() == 2 &&
+                        g_ar_kgraph[0].exec && g_ar_kgraph[1].exec;
+                    if (kstep_ready) {
+                        fast_token_k(M, ids[0], toks[0], poss[0], true);
+                        fast_token_k(M, ids[1], toks[1], poss[1], true);
+                        CU(cudaStreamSynchronize(g_s));
+                        CU(cudaStreamSynchronize(g_s1));
+                        if (g_ar2_stats) {
+                            float ms0 = 0.0f, ms1 = 0.0f;
+                            CU(cudaEventElapsedTime(&ms0, g_ar2_ev[0], g_ar2_ev[1]));
+                            CU(cudaEventElapsedTime(&ms1, g_ar2_ev[2], g_ar2_ev[3]));
+                            ar2_sum_slot0 += ms0; ar2_sum_slot1 += ms1;
+                            ar2_sum_ms += (double) ms0 + ms1;
+                            ar2_wall_ms += std::max((double) ms0, (double) ms1);
+                            ++ar2_steps;
+                            if (batch_stats && batch_steps % 64 == 0 && ar2_wall_ms > 0.0)
+                                std::printf("AR2KSTAT steps=%lld tokens/sample=%d slot0=%.3fms slot1=%.3fms wall=%.3fms speedup=%.2fx\n",
+                                            ar2_steps, g_ar_K, ar2_sum_slot0 / ar2_steps, ar2_sum_slot1 / ar2_steps,
+                                            ar2_wall_ms / ar2_steps, ar2_sum_ms / ar2_wall_ms);
+                        }
+                        for (int i = 0; i < 2; ++i) {
+                            const int b = ids[i];
+                            Ik2Req& r = reqs[b];
+                            Work& W = (b == 1) ? g_ar_work1 : dev_work(0);
+                            const int nvalid = std::min(W.kstep_K, std::max(0, r.max_new - r.generated));
+                            int cur = toks[i];
+                            for (int s = 0; s < nvalid; ++s) {
+                                const int ntok = W.argmax_hK[s];
+                                r.hist.push_back(cur);
+                                ++r.generated;
+                                r.next_tok = ntok;
+                                r.cand = false;
+                                r.last.clear();
+                                std::printf("BT %d %d\n", b, ntok);
+                                ++batch_tokens;
+                                if (r.cancel || std::find(r.stops.begin(), r.stops.end(), ntok) != r.stops.end()) {
+                                    finish_req(b, r.cancel ? "cancel" : "stop");
+                                    break;
+                                }
+                                if (r.generated >= r.max_new) { finish_req(b, "length"); break; }
+                                cur = ntok;
+                            }
+                            batched[b] = 1;
+                        }
+                        loaded_slot = -1;   // prefill must re-bind M.V after two graph replays
+                        batch_dirty = true;
+                        if (!any_active()) busy = false;
+                        std::fflush(stdout);
+                        return;
+                    }
                     const bool ar2_ready = g_ar_stream2 && ids.size() == 2 &&
                         g_ar_fgraph[0][(int) OutMode::kArgmax].exec && g_ar_fgraph[1][(int) OutMode::kArgmax].exec;
                     if (ar2_ready) {

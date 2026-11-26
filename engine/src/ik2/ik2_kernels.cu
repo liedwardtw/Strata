@@ -5126,6 +5126,23 @@ __global__ void decode_f32_kernel(int type, const uint8_t* blocks, size_t n, flo
     if (i < n) out[i] = decode_value(type, blocks, i);
 }
 
+// IK2_AR_KSTEP: gather one or more embedding rows straight from the device-resident Q8_0 table.  One thread per
+// output float; the guard keeps out-of-range token ids exactly at the host decode_host() fallback (0.0f).  This calls
+// the SAME decode_value() as the host path, so the values are bit-identical (no FP16 round trip).
+__global__ void embed_gather_f32_kernel(int type, const uint8_t* table, int n_rows, size_t row_bytes, int C,
+                                        const int* tok, int n_tokens, float* out) {
+    const int t = blockIdx.y;
+    const int c = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (t >= n_tokens || c >= C) return;
+    const int id = tok[t];
+    if (id < 0 || id >= n_rows) { out[(size_t) t * C + c] = 0.0f; return; }
+    out[(size_t) t * C + c] = decode_value(type, table + (size_t) id * row_bytes, (size_t) c);
+}
+
+// IK2_AR_KSTEP: advance the graph's staged base position by one.  One thread, one int; queued on the token stream
+// between K-step argmax writes, so the next step reads base+1 without a host round trip.
+__global__ void pos_inc_kernel(int* pos) { if (threadIdx.x == 0) ++*pos; }
+
 // A looped core's pass > 0 bank copies in one launch (the per-copy cudaMemcpyAsync's of the engine's two token
 // paths): bank i < n_bank - 1 is block nb_pre + 1 + i (blocks + i * blk_stride), bank n_bank - 1 is h; then
 // h_out = lp_pre (h_out null: no restore).  A thread copies one float of a row of `row` floats.  The h bank copy
@@ -8166,6 +8183,17 @@ void decode_f32(int type, const uint8_t* blocks, size_t n, float* out, cudaStrea
     if (!n) return;
     decode_f32_kernel<<<grid(n), kBlk, 0, s>>>(type, blocks, n, out);
     check("decode_f32");
+}
+void embed_gather_f32(int type, const uint8_t* table, int n_rows, size_t row_bytes, int C, const int* tok,
+                      int n_tokens, float* out, cudaStream_t s) {
+    if (!n_tokens || C <= 0) return;
+    dim3 g((unsigned) ((C + kBlk - 1) / kBlk), (unsigned) n_tokens);
+    embed_gather_f32_kernel<<<g, kBlk, 0, s>>>(type, table, n_rows, row_bytes, C, tok, n_tokens, out);
+    check("embed_gather_f32");
+}
+void pos_inc(int* pos, cudaStream_t s) {
+    pos_inc_kernel<<<1, 1, 0, s>>>(pos);
+    check("pos_inc");
 }
 void decode_host(int type, const uint8_t* blocks, size_t n, float* out) {
     for (size_t i = 0; i < n; ++i) out[i] = decode_value(type, blocks, i);

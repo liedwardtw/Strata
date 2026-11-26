@@ -757,6 +757,12 @@ size_t block_bytes(int type);
 /// n values (a multiple of the block's) of `type` blocks -> FP16 (nearest; NVFP4: exact) or F32.
 void decode_f16(int type, const uint8_t* blocks, size_t n, uint16_t* out, cudaStream_t s);
 void decode_f32(int type, const uint8_t* blocks, size_t n, float* out, cudaStream_t s);
+/// IK2_AR_KSTEP: out[t*C+c] = decode_value(type, table + tok[t]*row_bytes, c), bit-identical to decode_host().
+/// tok[t] outside [0,n_rows) decodes to +0.0f, matching the host staging's zero-initialized fallback.
+void embed_gather_f32(int type, const uint8_t* table, int n_rows, size_t row_bytes, int C, const int* tok,
+                      int n_tokens, float* out, cudaStream_t s);
+/// IK2_AR_KSTEP: ++*pos on the token stream, between K-step argmax writes (one thread, no host sync).
+void pos_inc(int* pos, cudaStream_t s);
 /// ... on the host (the reference of the tests, and the embedding's rows).
 void decode_host(int type, const uint8_t* blocks, size_t n, float* out);
 
