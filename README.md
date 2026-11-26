@@ -27,6 +27,7 @@ See [Measured results](#measured-results) for the full tables and conditions.
 - [Prepare model & token files](#prepare-model--token-files)
 - [INT4 weight conversion](#int4-weight-conversion)
 - [Run & benchmark](#run--benchmark)
+- [Native serve & agent tool calling](#native-serve--agent-tool-calling)
 - [Measured results](#measured-results)
 - [Correctness validation](#correctness-validation)
 - [Environment variable reference](#environment-variable-reference)
@@ -128,6 +129,14 @@ Each script takes explicit input GGUF / output dir arguments (see `--help` / fil
 ```
 
 **GPU safety**: keep only one model-loading process at a time. The engine refuses to over-commit VRAM; on a 24 GB WDDM card, spilling to host memory collapses decode by >10×. The bench script refuses to start if another model process is running.
+
+## Native serve & agent tool calling
+
+For an OpenAI/Anthropic-compatible API **with agent tool calling**, use Strata's native `serve` directly instead of the lightweight bridge. It provides `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, the `/api-monitor` page, the `/` web page and MCP. Tool calling is implemented in serve's Python layer (`frontend.py InklingOutputParser`), so the engine needs no tool-token support: the Inkling-2 chat template's typed segments are parsed into `tool_calls` automatically.
+
+See [scripts/native-serve/README.md](scripts/native-serve/README.md) for setup, one-click `start-native.bat` / `stop-native.bat`, and the verified results (plain chat + a `tools=[...]` request returning `tool_calls`). Verified on the 7900 XTX at port 8099; point the Strata Desktop custom provider at `http://127.0.0.1:8099/v1` (model `inkling-2-mini`) to use the app with tools.
+
+---
 
 ## Measured results
 
