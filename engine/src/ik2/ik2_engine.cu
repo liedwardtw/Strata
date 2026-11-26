@@ -7164,7 +7164,10 @@ int run(int argc, char** argv) {
                 g_parallel = fit;
             }
         }
-        if (g_parallel > 1) {
+        // AR dual pre-allocates both slots' KV, isolated Work and graphs at load time; replay needs
+        // no fresh device allocation, so a post-load free<256MiB (EC deliberately fills VRAM for
+        // expert residency) must NOT disable it. The guard is for P1's dynamic host-snapshot path.
+        if (g_parallel > 1 && !g_ar_dual) {
             size_t free_b = 0, total_b = 0;
             if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b < (256u << 20)) {
                 std::fprintf(stderr, "ERR only %.1f MiB VRAM free; lowering IK2_PARALLEL %d -> 1\n",
