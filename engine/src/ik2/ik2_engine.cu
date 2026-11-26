@@ -516,6 +516,9 @@ bool g_verify_graph = false;  // IK2_VERIFY_GRAPH=1: capture the T=8 verify forw
 bool g_batch_decode = false;  // IK2_BATCH_ATTN=1: true multi-slot batched decode (one row per slot) through the
                                // 48 visits. Reuses the verify-fast T=2..8 path with per-row KV/conv pointer tables.
                                // Default OFF; IK2_PARALLEL=1 stays byte-identical.
+bool g_ar_dual = false;        // IK2_AR_DUAL=1 (needs IK2_PARALLEL=2): two AR decode slots, each running the
+                               // proven T=1 resident fast_token path from its OWN CUDA graph with that slot's
+                               // KV/conv pointers baked in. One stream, round-robin. Default OFF: byte-identical.
 bool g_batch_exact = true;     // IK2_BATCH_EXACT (default 1): route every batched greedy step through the serial
                                // T=1 forward()/fast_token path, which is byte-identical to solo. IK2_BATCH_EXACT=0
                                // restores the original true-batched T=2..8 general path (faster but not bit-exact).
@@ -3182,6 +3185,9 @@ struct FastGraph {
     bool disabled = false;
 };
 FastGraph g_fgraph[4];      // by OutMode
+// IK2_AR_DUAL: one graph per (slot, OutMode).  Each graph captures the SAME T=1 fast_token_launches sequence with
+// that slot's per-visit KV/conv pointers baked in, so replay is bit-exact to a solo T=1 token.
+FastGraph g_ar_fgraph[2][4];
 
 // IK2_VERIFY_GRAPH: one graph for the whole T=8 g_rec verify forward (48 layer visits + head).  Captured on the
 // first pure-argmax verify window after a warm-up normal pass, replayed at every later window.  Inputs (token rows,
@@ -3641,18 +3647,32 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
 
 // one token through the resident path: its logits appended to logits_out (kLogits) or its argmax (kArgmax)
 void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>& logits_out,
-                std::vector<int>* argmax_out) {
+                std::vector<int>* argmax_out, int slot = -1) {
     const Config& c = M.c;
     use_dev(0);
     Work& W = dev_work(0);
+    const bool ar_slot = slot >= 0 && slot < 2 && g_ar_dual && g_batch_decode;
+    if (ar_slot) {
+        // Host-only pointer binding: point M.V at this slot's persistent KV/conv storage.  fast_token_launches()
+        // binds those pointers into M.L for every visit, so the graph captured below bakes THIS slot's addresses.
+        // M.V is left pointing at the slot, which is also what prefill needs before its own launches.
+        load_batch_slot(M, slot);
+    }
     const size_t rb = (size_t) c.C / k::block_values(M.embd_type) * k::block_bytes(M.embd_type);
     k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W.emb_h);
     W.pos_h[0] = pos;
-    if (!g_graph) {
+    // The resident graph captures the DEVICE addresses of W.emb_h / W.pos_h / W.argmax_h.  Those addresses are
+    // stable, and the single stream stages the host-side contents immediately before each replay and reads the
+    // result immediately after the stream sync, so ONE shared Work is safe for two alternating slot graphs.
+    FastGraph* PG = nullptr;
+    if (ar_slot) PG = &g_ar_fgraph[slot][(int) out_mode];
+    else if (g_graph && !g_ar_dual) PG = &g_fgraph[(int) out_mode];
+    if (!PG) {
         fast_token_launches(M, W, out_mode);
     } else {
-        FastGraph& G = g_fgraph[(int) out_mode];
+        FastGraph& G = *PG;
         if (!G.exec && !G.disabled) {
+            if (ar_slot) CU(cudaStreamSynchronize(g_s));   // no pending prefill/memset work inside the capture window
             cudaError_t ce = cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal);
             if (ce == cudaSuccess) {
                 g_fast_graph_capturing = true; fast_token_launches(M, W, out_mode);
@@ -3661,7 +3681,9 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
                     ce = cudaGraphInstantiate(&G.exec, G.graph, 0);
                     if (ce == cudaSuccess) {
                         std::printf("resident%s: CUDA graph captured and instantiated!\n",
-                                    g_ep_fast ? " EP" : "");
+                                    ar_slot ? " AR slot KV" : (g_ep_fast ? " EP" : ""));
+                        if (ar_slot) std::printf("ik2: AR dual graph slot %d (out_mode %d) captured\n",
+                                                 slot, (int) out_mode);
                         std::fflush(stdout);
                     } else {
                         std::printf("resident: graph instantiate failed (%s), fallback to direct launches\n",
@@ -5382,6 +5404,16 @@ int run(int argc, char** argv) {
     g_batch_rotmv = getenv("IK2_BATCH_ROTMV") && std::atoi(getenv("IK2_BATCH_ROTMV")) != 0;
     g_batch_solo_fast = getenv("IK2_BATCH_SOLO_FAST") && std::atoi(getenv("IK2_BATCH_SOLO_FAST")) != 0;
     if (const char* pp = getenv("IK2_PARALLEL")) { int v = std::atoi(pp); if (v >= 1 && v <= 8) g_parallel = v; }
+    g_ar_dual = getenv("IK2_AR_DUAL") && std::atoi(getenv("IK2_AR_DUAL")) != 0;
+    if (g_ar_dual) {
+        if (g_parallel != 2) {
+            std::fprintf(stderr, "ik2: IK2_AR_DUAL=1 needs IK2_PARALLEL=2; ignoring\n");
+            g_ar_dual = false;
+        } else {
+            // Per-slot VRAM KV/conv state is mandatory; without it there is nothing to bake into slot graphs.
+            g_batch_decode = true;
+        }
+    }
     g_moe_group_exp = getenv("IK2_MOE_GROUP_EXPERT") && std::atoi(getenv("IK2_MOE_GROUP_EXPERT")) != 0;
     if (getenv("IK2_INT4_DENSE")) g_int4_dense = std::atoi(getenv("IK2_INT4_DENSE"));
     if (const char* pf = getenv("IK2_DECODE_PFULL")) { int v = std::atoi(pf); if (v >= 1 && v <= 512) g_decode_pfull = v; }
@@ -5656,12 +5688,26 @@ int run(int argc, char** argv) {
             if (g_kv_host && kv_is_int() && !c.sliding[l]) continue;
             kv_b += visits * cap * kv_per_tok;
         }
+        // IK2_AR_DUAL keeps TWO independent KV/conv states in VRAM (one resident graph per slot).  Account for
+        // the second slot here so residency/fast-path decisions are made with the real footprint.  If it does
+        // not fit, fall back to the legacy single stream instead of risking an OOM hang.
+        const size_t kv_b_one = kv_b;
+        if (g_ar_dual) kv_b *= 2;
         size_t fr0 = 0, tot0 = 0;
         CU(cudaMemGetInfo(&fr0, &tot0));
         const size_t reserve_default = (size_t) 3 << 29;   // (the work buffers and a quarter of a GiB of room: 1.5 GiB)
         const size_t reserve = getenv("IK2_RESERVE_MIB") ? (size_t) (std::atof(getenv("IK2_RESERVE_MIB")) * 1048576.0) : reserve_default;
         const size_t exp_b_dev0 = dual() ? (exp_b / 2) : exp_b;
-        const bool fits = exp_b_dev0 + dense_b + kv_b + reserve <= fr0 && exp_b_dev0 <= (size_t) (cache_gb * 1073741824.0);
+        bool fits = exp_b_dev0 + dense_b + kv_b + reserve <= fr0 && exp_b_dev0 <= (size_t) (cache_gb * 1073741824.0);
+        if (g_ar_dual && !fits) {
+            std::fprintf(stderr, "ik2: IK2_AR_DUAL=1 needs 2x KV in VRAM (%.2f GiB) beside experts/dense/work; "
+                                 "falling back to IK2_PARALLEL=1\n", kv_b / 1073741824.0);
+            g_ar_dual = false;
+            g_batch_decode = false;
+            g_parallel = 1;
+            kv_b = kv_b_one;
+            fits = exp_b_dev0 + dense_b + kv_b + reserve <= fr0 && exp_b_dev0 <= (size_t) (cache_gb * 1073741824.0);
+        }
         if (fit_actual)
             std::printf("fit(actual): experts %.2f GiB + dense %.2f + KV %.2f + reserve %.2f = %.2f vs free %.2f GiB -> %s\n",
                         exp_b_dev0 / 1073741824.0, dense_b / 1073741824.0, kv_b / 1073741824.0, reserve / 1073741824.0,
@@ -6968,6 +7014,11 @@ int run(int argc, char** argv) {
                 g_parallel = 1;
             }
         }
+        if (g_ar_dual && g_parallel != 2) {
+            std::fprintf(stderr, "ik2: AR dual disabled (IK2_PARALLEL lowered to %d)\n", g_parallel);
+            g_ar_dual = false;
+            g_batch_decode = false;
+        }
         std::vector<Ik2Req> reqs;
         int loaded_slot = -1;
         bool batch_dirty = false;
@@ -7236,7 +7287,33 @@ int run(int argc, char** argv) {
                     ensure_loaded(b);
                     ids.push_back(b); toks.push_back(r.next_tok); poss.push_back(rq_pos(r));
                 }
-                if (ids.size() >= 2 && (int) ids.size() <= BatchSlots::kMaxRows) {
+                if (g_ar_dual && !ids.empty()) {
+                    // One or two greedy slots ready: one replay of EACH ready slot's own resident T=1 graph,
+                    // single stream, round-robin.  A lone slot happens at the tail when the other slot
+                    // already hit max_new; routing it through the generic serial path would replay g_fgraph,
+                    // which was captured with the OTHER slot's KV pointers, so it must stay on its AR graph.
+                    // Same kernels/order as a solo token, so the emitted ids stay bit-exact.
+                    for (size_t i = 0; i < ids.size(); ++i) {
+                        const int b = ids[i];
+                        Ik2Req& r = reqs[b];
+                        std::vector<float> lo;
+                        std::vector<int> ag;
+                        fast_token(M, toks[i], poss[i], OutMode::kArgmax, lo, &ag, b);
+                        const int ntok = ag.empty() ? 0 : ag[0];
+                        r.hist.push_back(toks[i]);
+                        ++r.generated;
+                        r.next_tok = ntok;
+                        r.cand = false;
+                        r.last.clear();
+                        std::printf("BT %d %d\n", b, ntok);
+                        ++batch_tokens;
+                        batched[b] = 1;
+                        if (r.cancel || std::find(r.stops.begin(), r.stops.end(), ntok) != r.stops.end())
+                            finish_req(b, r.cancel ? "cancel" : "stop");
+                        else if (r.generated >= r.max_new) finish_req(b, "length");
+                    }
+                    loaded_slot = -1;   // prefill must re-bind M.V to the right slot after two graph replays
+                } else if (ids.size() >= 2 && (int) ids.size() <= BatchSlots::kMaxRows) {
                     std::vector<int> ag;
                     forward_batch(M, toks.data(), (int) ids.size(), poss.data(), ids.data(), OutMode::kArgmax,
                                   &ag, t_exp);
