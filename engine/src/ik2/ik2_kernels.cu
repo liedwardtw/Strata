@@ -4757,6 +4757,46 @@ __global__ void argmax_sum_part_kernel(const float* a, const float* b, const flo
     }
 }
 
+// IK2_AR_STREAM2: the multi-block partials above are process-wide globals. Two AR slot graphs replaying on two
+// streams would mix their 197 padded-vocab partials. This scratch variant keeps the exact same reduction math and
+// launch geometry but writes the partials into caller-owned memory (one buffer per Work). Only the fast T=1 graph
+// uses it; every other caller keeps the legacy globals and remains byte-identical.
+template <bool SINGLE_BLOCK>
+__global__ void argmax_sum_part_scratch_kernel(const float* a, const float* b, const float* c, int n, int* out,
+                                               float* part_v, int* part_i) {
+    const int gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int gstride = gridDim.x * blockDim.x;
+    float best = -INFINITY;
+    int idx = 0x7fffffff;
+    const bool vec4 = (((uintptr_t) a & 15) == 0) && (!b || ((uintptr_t) b & 15) == 0) && (!c || ((uintptr_t) c & 15) == 0);
+    if (vec4) {
+        const int n4 = n >> 2;
+        const float4* a4 = (const float4*) a;
+        const float4* b4 = (const float4*) b;
+        const float4* c4 = (const float4*) c;
+        for (int v4 = gtid; v4 < n4; v4 += gstride) {
+            const float4 va = __ldg(a4 + v4);
+            const float4 vb = b4 ? __ldg(b4 + v4) : make_float4(0.f, 0.f, 0.f, 0.f);
+            const float4 vc = c4 ? __ldg(c4 + v4) : make_float4(0.f, 0.f, 0.f, 0.f);
+            const int base = v4 << 2;
+            argmax_better(va.x + vb.x + vc.x, base + 0, best, idx);
+            argmax_better(va.y + vb.y + vc.y, base + 1, best, idx);
+            argmax_better(va.z + vb.z + vc.z, base + 2, best, idx);
+            argmax_better(va.w + vb.w + vc.w, base + 3, best, idx);
+        }
+        for (int v = (n4 << 2) + gtid; v < n; v += gstride)
+            argmax_better(__ldg(a + v) + (b ? __ldg(b + v) : 0.0f) + (c ? __ldg(c + v) : 0.0f), v, best, idx);
+    } else {
+        for (int v = gtid; v < n; v += gstride)
+            argmax_better(__ldg(a + v) + (b ? __ldg(b + v) : 0.0f) + (c ? __ldg(c + v) : 0.0f), v, best, idx);
+    }
+    argmax_block_reduce(best, idx);
+    if (threadIdx.x == 0) {
+        if (SINGLE_BLOCK) *out = idx;
+        else part_v[blockIdx.x] = best, part_i[blockIdx.x] = idx;
+    }
+}
+
 template <bool SINGLE_BLOCK>
 __global__ void argmax_rows_part_kernel(const float* x, int ld, int n_cols, int* out) {
     const int r = blockIdx.y;
@@ -4865,6 +4905,15 @@ __global__ void argmax_final_kernel(int n_partials, int stride_partials, int* ou
         argmax_better(g_argmax_v[r * stride_partials + j], g_argmax_i[r * stride_partials + j], best, idx);
     argmax_block_reduce(best, idx);
     if (threadIdx.x == 0) out[r] = idx;
+}
+
+__global__ void argmax_sum_final_scratch_kernel(int n_partials, int* out, const float* part_v, const int* part_i) {
+    float best = -INFINITY;
+    int idx = 0x7fffffff;
+    for (int j = threadIdx.x; j < n_partials; j += blockDim.x)
+        argmax_better(part_v[j], part_i[j], best, idx);
+    argmax_block_reduce(best, idx);
+    if (threadIdx.x == 0) *out = idx;
 }
 
 // fast FP16 decodes: NVFP4 a thread a 16-value sub-block (__byte_perm + uint4 stores); Q8_0 8 threads a 32-value block
@@ -5675,6 +5724,20 @@ void argmax_sum(const float* a, const float* b, const float* c, int n, int* out,
     argmax_sum_part_kernel<false><<<B, 256, 0, s>>>(a, b, c, n, out);
     check("argmax_sum_part");
     argmax_final_kernel<<<1, 256, 0, s>>>(B, 1, out);
+    check("argmax_sum_final");
+}
+void argmax_sum(const float* a, const float* b, const float* c, int n, int* out, cudaStream_t s, float* part_v,
+                int* part_i) {
+    if (n <= 0) return;
+    const int B = std::min(256, std::max(1, (n + 1023) / 1024));
+    if (B == 1) {
+        argmax_sum_part_scratch_kernel<true><<<1, 256, 0, s>>>(a, b, c, n, out, part_v, part_i);
+        check("argmax_sum");
+        return;
+    }
+    argmax_sum_part_scratch_kernel<false><<<B, 256, 0, s>>>(a, b, c, n, out, part_v, part_i);
+    check("argmax_sum_part");
+    argmax_sum_final_scratch_kernel<<<1, 256, 0, s>>>(B, out, part_v, part_i);
     check("argmax_sum_final");
 }
 void argmax_rows(const float* x, int ld, int n_rows, int n_cols, int* out, cudaStream_t s) {

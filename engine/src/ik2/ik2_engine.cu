@@ -380,6 +380,10 @@ inline Layer& bind_visit(Model& M, int v) {
 
 cublasHandle_t g_blas;
 cudaStream_t g_s;
+// IK2_AR_STREAM2: second stream for AR slot 1 (non-blocking, created only when the env gate is on).
+cudaStream_t g_s1 = nullptr;
+cudaEvent_t g_ar2_ev[4] = {};
+bool g_ar2_stats = false;
 cudaStream_t g_cs;          // the experts' copies of the token path, beside the compute stream
 cudaEvent_t g_ev;
 bool g_overlap = true;      // IK2_OVERLAP=0: the copies on the compute stream, before the experts
@@ -519,6 +523,9 @@ bool g_batch_decode = false;  // IK2_BATCH_ATTN=1: true multi-slot batched decod
 bool g_ar_dual = false;        // IK2_AR_DUAL=1 (needs IK2_PARALLEL=2): two AR decode slots, each running the
                                // proven T=1 resident fast_token path from its OWN CUDA graph with that slot's
                                // KV/conv pointers baked in. One stream, round-robin. Default OFF: byte-identical.
+bool g_ar_stream2 = false;      // IK2_AR_STREAM2=1 (needs IK2_AR_DUAL=1, IK2_PARALLEL=2): replay slot 0 on g_s and
+                                // slot 1 on a second non-blocking stream g_s1, with a second isolated Work. Default
+                                // OFF: byte-identical to the original single-stream AR dual path.
 bool g_batch_exact = true;     // IK2_BATCH_EXACT (default 1): route every batched greedy step through the serial
                                // T=1 forward()/fast_token path, which is byte-identical to solo. IK2_BATCH_EXACT=0
                                // restores the original true-batched T=2..8 general path (faster but not bit-exact).
@@ -1591,6 +1598,9 @@ struct Work {
     int *gidx_h[2] = {}, *inv_h[2] = {};
     float *sg_h[2] = {}, *su_h[2] = {}, *wt_h[2] = {};
     int *argmax_d = nullptr, *argmax_h = nullptr;
+    // IK2_AR_STREAM2: multi-block argmax partials must be per-Work when two slot graphs replay concurrently.
+    float* argmax_part_v = nullptr;
+    int* argmax_part_i = nullptr;
     std::vector<cudaEvent_t> miss_ev;
     // prefill: the next layer's experts copied in while this one runs (prefetch_layer)
     // the prefetches in flight, a ring by layer: their batches' events, expert -> its batch
@@ -1692,6 +1702,116 @@ struct Work {
     int rg_slots = 0, rg_groups = 0;
     size_t rg_bytes = 0;
 };
+
+// IK2_AR_STREAM2: a second Work for slot 1.  The AR graph bakes W's device addresses into every kernel, so a
+// concurrent replay on g_s1 needs its own scratch and its own pinned emb/pos/argmax staging.  Only the fast T=1
+// path uses this Work; prefill and every other path stay on g_dev[0].W.
+Work g_ar_work1;
+
+// Deep-copy the scratch buffers used by fast_token_launches() into dst.  Scalar fields and pointer tables are
+// copied by assignment first; every writable device/pinned pointer is then replaced by a fresh allocation.
+void clone_ar_work(Work& dst, const Work& src, const Config& c) {
+    dst = src;
+    const size_t C = c.C, HD = (size_t) c.H * c.D, KD = (size_t) c.KV * c.D;
+    const size_t Tm = src.Tm, T_buf = std::max(Tm, (size_t) src.T_sup);
+    const size_t S8 = T_buf * c.K, S_buf = S8 * 2;
+    const size_t n_core = (size_t) std::max(0, c.core1 - c.core0);
+
+    for (float** p : {&dst.h, &dst.r, &dst.tmp}) *p = dalloc<float>(T_buf * C);
+    for (float** p : {&dst.res, &dst.a, &dst.xq, &dst.xk, &dst.xv}) *p = dalloc<float>(Tm * C);
+    dst.q = dalloc<float>(Tm * HD); dst.gate = dalloc<float>(Tm * HD); dst.o = dalloc<float>(Tm * HD);
+    dst.kk = dalloc<float>(Tm * KD); dst.vv = dalloc<float>(Tm * KD);
+    dst.kconv = dalloc<float>(Tm * KD); dst.vconv = dalloc<float>(Tm * KD);
+    dst.rr = dalloc<float>(Tm * (size_t) c.H * c.d_rel);
+    dst.sink = dalloc<float>(Tm * c.H);
+    dst.dyn = dalloc<float>(2 * Tm * (size_t) c.KV * 4);
+    dst.lg = dalloc<float>(src.lg_cap);
+    dst.blocks = dalloc<float>((size_t) (c.n_layer / c.block + 1) * T_buf * C);
+    dst.x16 = dalloc<uint16_t>(Tm * std::max(C, HD));
+    dst.xk16 = dalloc<uint16_t>(Tm * C); dst.xv16 = dalloc<uint16_t>(Tm * C);
+    if (src.xq16_sup) dst.xq16_sup = dalloc<uint16_t>(T_buf * C); else dst.xq16_sup = nullptr;
+    if (src.relb) dst.relb = dalloc<float>((size_t) Work::kRelbRows * c.H * src.relb_ext); else dst.relb = nullptr;
+    if (src.kv_k16) dst.kv_k16 = dalloc<uint16_t>((size_t) src.kv_tmp_cap * KD); else dst.kv_k16 = nullptr;
+    if (src.kv_v16) dst.kv_v16 = dalloc<uint16_t>((size_t) src.kv_tmp_cap * KD); else dst.kv_v16 = nullptr;
+    dst.pos = dalloc<int>(T_buf);
+    dst.rlog = dalloc<float>(T_buf * c.E);
+    dst.route_d = dalloc<int>(S_buf * 2);
+    dst.ex16 = dalloc<uint16_t>(T_buf * C);
+    dst.w16 = dalloc<uint16_t>((size_t) 2 * c.F * C);
+    dst.h16 = dalloc<uint16_t>(std::max<size_t>(64, T_buf) * c.F);
+    dst.gu32 = dalloc<float>(src.gu32_bytes / 4);
+    dst.qkv = dst.gu32; dst.lg16 = (uint16_t*) dst.gu32;
+    dst.y32 = dalloc<float>(std::max<size_t>(64, T_buf) * C);
+    dst.wtr = dalloc<float>(S_buf);
+    dst.sg = dalloc<float>(S_buf); dst.su = dalloc<float>(S_buf); dst.wt = dalloc<float>(S_buf);
+    dst.gidx = dalloc<int>(S_buf); dst.inv = dalloc<int>(S_buf);
+    dst.blob = dalloc<const uint8_t*>(S8); dst.tok = dalloc<int>(S8);
+
+    if (src.i4_xq) {
+        dst.i4_xq = dalloc<int8_t>((size_t) src.i4_xq_rows * C);
+        dst.i4_xd = dalloc<float2>((size_t) src.i4_xq_rows * (C / 32 + 2));
+        dst.i4_hf = dalloc<float>(S8 * src.i4_Kpad_f);
+        dst.i4_hq = dalloc<int8_t>(S8 * src.i4_Kpad_f);
+        dst.i4_hd = dalloc<float2>(S8 * (src.i4_Kpad_f / 32 + 2));
+        dst.i4_Wp_s = dalloc<const uint8_t*>(S8); dst.i4_Wh_s = dalloc<const uint8_t*>(S8);
+        dst.i4_WS_s = dalloc<const float*>(S8);
+        dst.i4_Wp_dn = dalloc<const uint8_t*>(S8); dst.i4_Wh_dn = dalloc<const uint8_t*>(S8);
+        dst.i4_WS_dn = dalloc<const float*>(S8);
+    }
+    if (src.i4_g_cnt) dst.i4_g_cnt = dalloc<int>(64);
+    if (src.i4_g_slots) dst.i4_g_slots = dalloc<int>(64 * 8);
+    if (src.i4_g_exp) dst.i4_g_exp = dalloc<int>(64);
+    if (src.i4_g_n) dst.i4_g_n = dalloc<int>(1);
+    if (src.i4_pf_x) dst.i4_pf_x = dalloc<float>((size_t) src.i4_pf_cap * src.i4_pf_Kmax);
+    if (src.i4_pf_x4) dst.i4_pf_x4 = dalloc<uint8_t>((size_t) src.i4_pf_cap * src.i4_pf_Kmax);
+    if (src.i4_pf_xm) dst.i4_pf_xm = dalloc<uint8_t>((size_t) (src.i4_pf_cap / 16) * (src.i4_pf_Kmax / 256) * 16);
+    if (src.i4_pf_xr) dst.i4_pf_xr = dalloc<float>(src.i4_pf_cap);
+    if (src.i4_mv_xq) dst.i4_mv_xq = dalloc<int8_t>((size_t) src.i4_xq_rows * src.i4_pf_Kmax);
+    if (src.i4_mv_xd) dst.i4_mv_xd = dalloc<float2>((size_t) src.i4_xq_rows * (src.i4_pf_Kmax / 32 + 2));
+    for (int i = 0; i < Work::kI4RotSlots; ++i) {
+        if (src.i4_rd_xq[i]) dst.i4_rd_xq[i] = dalloc<int8_t>((size_t) src.i4_xq_rows * src.i4_pf_Kmax);
+        if (src.i4_rd_xd[i]) dst.i4_rd_xd[i] = dalloc<float2>((size_t) src.i4_xq_rows * (src.i4_pf_Kmax / 32 + 2));
+    }
+    for (int i = 0; i < 3; ++i) {
+        if (src.i4_ma_xq[i]) dst.i4_ma_xq[i] = dalloc<int8_t>((size_t) src.i4_xq_rows * src.i4_pf_Kmax);
+        if (src.i4_ma_xd[i]) dst.i4_ma_xd[i] = dalloc<float2>((size_t) src.i4_xq_rows * (src.i4_pf_Kmax / 32 + 2));
+    }
+
+    if (c.n_pass > 1) {
+        dst.lp_pre = dalloc<float>(Tm * C);
+        dst.lp_bank = dalloc<float>((c.block ? n_core / c.block : 0) * Tm * C);
+        dst.lp_msg = dalloc<float>(4 * Tm * C);
+        dst.lp_msg_all = dalloc<float>(n_core * 4 * C);
+        dst.lp_in = dalloc<float>(3 * Tm * C);
+        dst.lp_g = dalloc<float>(3 * Tm * (2 * (size_t) c.rank + 2));
+        dst.lp_a = dalloc<float>(3 * Tm * c.rank);
+        dst.lp_f = dalloc<float>(2 * Tm * C);
+    }
+    dst.logits = dalloc<float>((size_t) 16 * c.n_rows);
+    dst.argmax_d = dalloc<int>(Tm);
+    dst.argmax_part_v = dalloc<float>(256);
+    dst.argmax_part_i = dalloc<int>(256);
+    dst.cand_d = dalloc<int>(2 + 2 * 4096);
+    dst.cand_part = dalloc<int>(k::cand_scratch(c.n_vocab));
+
+    const size_t S_host = (size_t) dst.T_host * c.K;
+    CU(cudaHostAlloc((void**) &dst.emb_h, Tm * C * 4, cudaHostAllocPortable));
+    CU(cudaHostAlloc((void**) &dst.pos_h, (size_t) dst.T_host * 4, cudaHostAllocPortable));
+    CU(cudaHostAlloc((void**) &dst.route_h, S_host * 8, cudaHostAllocPortable));
+    CU(cudaHostAlloc((void**) &dst.argmax_h, Tm * 4, cudaHostAllocPortable));
+    CU(cudaHostAlloc((void**) &dst.logits_h, (size_t) c.n_rows * 4, cudaHostAllocPortable));
+    CU(cudaHostAlloc((void**) &dst.cand_h, (size_t) (2 + 2 * 4096) * 4, cudaHostAllocPortable));
+    // These pinned mirrors are not touched by the AR graph; clear the inherited pointers so nothing can use
+    // the slot-0 buffers by accident.
+    for (int i = 0; i < 2; ++i) {
+        dst.gidx_h[i] = nullptr; dst.inv_h[i] = nullptr;
+        dst.sg_h[i] = nullptr; dst.su_h[i] = nullptr; dst.wt_h[i] = nullptr; dst.wtr_h[i] = nullptr;
+    }
+    dst.pack_h[0] = nullptr; dst.x_h = nullptr; dst.rg_h = nullptr;
+    std::printf("ik2: AR stream2 isolated Work allocated (%.2f GiB scratch)\n",
+                (double) (src.gu32_bytes + src.lg_cap * 4) / 1073741824.0);
+    std::fflush(stdout);
+}
 
 // IK2_BATCH_ATTN helpers.  load_batch_slot()/reset_batch_slot() are used by P1 (prefill runs one request at a
 // time through M.V); stage_batch_tables() publishes the selected slots of one visit into Work's stable device
@@ -3631,7 +3751,7 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, 1, C, 1e-6f, c.eps, outs, g_s);
         mv1(M.out_w, W.xq, W.logits);
         if (out_mode == OutMode::kArgmax) {
-            k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, W.argmax_d, g_s);
+            k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, W.argmax_d, g_s, W.argmax_part_v, W.argmax_part_i);
             CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, 4, cudaMemcpyDeviceToHost, g_s));
         } else if (out_mode == OutMode::kCand) {   // (the softcap keeps the logits within +- logit_cap)
             k::softcap(W.logits, (size_t) c.n_rows, c.logit_cap, g_s);
@@ -3647,11 +3767,15 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
 
 // one token through the resident path: its logits appended to logits_out (kLogits) or its argmax (kArgmax)
 void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>& logits_out,
-                std::vector<int>* argmax_out, int slot = -1) {
+                std::vector<int>* argmax_out, int slot = -1, bool submit_only = false) {
     const Config& c = M.c;
     use_dev(0);
-    Work& W = dev_work(0);
     const bool ar_slot = slot >= 0 && slot < 2 && g_ar_dual && g_batch_decode;
+    // IK2_AR_STREAM2: slot 1 replays on g_s1 with its OWN Work.  The graph bakes W's device addresses into
+    // every kernel, so reusing slot 0's scratch or pinned staging would race with the concurrent g_s replay.
+    const bool ar2 = ar_slot && g_ar_stream2 && g_s1 && slot == 1;
+    Work& W = ar2 ? g_ar_work1 : dev_work(0);
+    cudaStream_t stream = ar2 ? g_s1 : g_s;
     if (ar_slot) {
         // Host-only pointer binding: point M.V at this slot's persistent KV/conv storage.  fast_token_launches()
         // binds those pointers into M.L for every visit, so the graph captured below bakes THIS slot's addresses.
@@ -3662,28 +3786,34 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
     k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W.emb_h);
     W.pos_h[0] = pos;
     // The resident graph captures the DEVICE addresses of W.emb_h / W.pos_h / W.argmax_h.  Those addresses are
-    // stable, and the single stream stages the host-side contents immediately before each replay and reads the
-    // result immediately after the stream sync, so ONE shared Work is safe for two alternating slot graphs.
+    // stable; each slot stages the host-side contents into its own Work immediately before its replay and reads
+    // its own result after its stream sync.
     FastGraph* PG = nullptr;
     if (ar_slot) PG = &g_ar_fgraph[slot][(int) out_mode];
     else if (g_graph && !g_ar_dual) PG = &g_fgraph[(int) out_mode];
+    const bool want_stats = ar_slot && g_ar2_stats;
     if (!PG) {
+        cudaStream_t old_s = g_s;
+        if (ar2) g_s = stream;   // fast_token_launches() queues on the global stream; capture must see g_s1
         fast_token_launches(M, W, out_mode);
+        if (ar2) g_s = old_s;
     } else {
         FastGraph& G = *PG;
         if (!G.exec && !G.disabled) {
-            if (ar_slot) CU(cudaStreamSynchronize(g_s));   // no pending prefill/memset work inside the capture window
-            cudaError_t ce = cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal);
+            if (ar_slot) CU(cudaStreamSynchronize(stream));   // no pending prefill/memset work inside the capture window
+            cudaStream_t old_s = g_s;
+            if (ar2) g_s = stream;
+            cudaError_t ce = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
             if (ce == cudaSuccess) {
                 g_fast_graph_capturing = true; fast_token_launches(M, W, out_mode);
-                ce = cudaStreamEndCapture(g_s, &G.graph); g_fast_graph_capturing = false;
+                ce = cudaStreamEndCapture(stream, &G.graph); g_fast_graph_capturing = false;
                 if (ce == cudaSuccess) {
                     ce = cudaGraphInstantiate(&G.exec, G.graph, 0);
                     if (ce == cudaSuccess) {
                         std::printf("resident%s: CUDA graph captured and instantiated!\n",
                                     ar_slot ? " AR slot KV" : (g_ep_fast ? " EP" : ""));
-                        if (ar_slot) std::printf("ik2: AR dual graph slot %d (out_mode %d) captured\n",
-                                                 slot, (int) out_mode);
+                        if (ar_slot) std::printf("ik2: AR dual graph slot %d (out_mode %d) captured%s\n",
+                                                 slot, (int) out_mode, ar2 ? " on g_s1" : "");
                         std::fflush(stdout);
                     } else {
                         std::printf("resident: graph instantiate failed (%s), fallback to direct launches\n",
@@ -3705,15 +3835,22 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
                 G.disabled = true;
                 (void) cudaGetLastError();
             }
+            if (ar2) g_s = old_s;
         }
+        if (want_stats) CU(cudaEventRecord(g_ar2_ev[(size_t) slot * 2], stream));
         if (G.exec) {
-            CU(cudaGraphLaunch(G.exec, g_s));
+            CU(cudaGraphLaunch(G.exec, stream));
         } else {
+            cudaStream_t old_s = g_s;
+            if (ar2) g_s = stream;
             fast_token_launches(M, W, out_mode);
+            if (ar2) g_s = old_s;
         }
+        if (want_stats) CU(cudaEventRecord(g_ar2_ev[(size_t) slot * 2 + 1], stream));
     }
-    CU(cudaStreamSynchronize(g_s));
-    pf_fast::finish(g_s);
+    if (submit_only) return;   // batch_step will sync BOTH streams, then read each slot's own argmax
+    CU(cudaStreamSynchronize(stream));
+    pf_fast::finish(stream);
     if (out_mode == OutMode::kArgmax) {
         argmax_out->assign(1, W.argmax_h[0]);
     } else if (out_mode == OutMode::kLogits) {
@@ -5414,6 +5551,15 @@ int run(int argc, char** argv) {
             g_batch_decode = true;
         }
     }
+    g_ar_stream2 = getenv("IK2_AR_STREAM2") && std::atoi(getenv("IK2_AR_STREAM2")) != 0;
+    if (g_ar_stream2) {
+        if (!g_ar_dual || g_parallel != 2) {
+            std::fprintf(stderr, "ik2: IK2_AR_STREAM2=1 needs IK2_AR_DUAL=1 and IK2_PARALLEL=2; ignoring\n");
+            g_ar_stream2 = false;
+        } else {
+            g_ar2_stats = getenv("IK2_AR_STREAM2_STATS") && std::atoi(getenv("IK2_AR_STREAM2_STATS")) != 0;
+        }
+    }
     g_moe_group_exp = getenv("IK2_MOE_GROUP_EXPERT") && std::atoi(getenv("IK2_MOE_GROUP_EXPERT")) != 0;
     if (getenv("IK2_INT4_DENSE")) g_int4_dense = std::atoi(getenv("IK2_INT4_DENSE"));
     if (const char* pf = getenv("IK2_DECODE_PFULL")) { int v = std::atoi(pf); if (v >= 1 && v <= 512) g_decode_pfull = v; }
@@ -5703,6 +5849,7 @@ int run(int argc, char** argv) {
             std::fprintf(stderr, "ik2: IK2_AR_DUAL=1 needs 2x KV in VRAM (%.2f GiB) beside experts/dense/work; "
                                  "falling back to IK2_PARALLEL=1\n", kv_b / 1073741824.0);
             g_ar_dual = false;
+            g_ar_stream2 = false;
             g_batch_decode = false;
             g_parallel = 1;
             kv_b = kv_b_one;
@@ -5718,6 +5865,14 @@ int run(int argc, char** argv) {
                     exp_b / 1073741824.0, dual() ? "split across 2 GPUs" : "1 GPU",
                     dense_b / 1073741824.0, kv_b / 1073741824.0, fr0 / 1073741824.0,
                     fits ? "every expert stays in VRAM" : "the experts in host memory, a cache of them in VRAM");
+    }
+
+    if (g_ar_dual && g_ar_stream2) {
+        CU(cudaSetDevice(0));
+        CU(cudaStreamCreateWithFlags(&g_s1, cudaStreamNonBlocking));
+        if (g_ar2_stats) for (cudaEvent_t& e : g_ar2_ev) CU(cudaEventCreate(&e));
+        std::printf("ik2: AR dual stream2 enabled (slot0 g_s, slot1 g_s1, isolated Work)\n");
+        std::fflush(stdout);
     }
 
     // the dense weights
@@ -6582,6 +6737,8 @@ int run(int argc, char** argv) {
     CU(cudaHostAlloc(&W.pos_h, (size_t) W.T_host * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&W.route_h, S_host * 8, cudaHostAllocPortable));
     W.argmax_d = dalloc<int>(Tm);
+    W.argmax_part_v = dalloc<float>(256);
+    W.argmax_part_i = dalloc<int>(256);
     CU(cudaHostAlloc(&W.argmax_h, Tm * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&W.logits_h, (size_t) c.n_rows * 4, cudaHostAllocPortable));
     CU(cudaHostAlloc(&W.cand_h, (size_t) (2 + 2 * kCandCap) * 4, cudaHostAllocPortable));
@@ -6624,6 +6781,7 @@ int run(int argc, char** argv) {
         W.lp_a = dalloc<float>(3 * Tm * (size_t) c.rank);
         W.lp_f = dalloc<float>(2 * Tm * C);
     }
+    if (d == 0 && g_ar_dual && g_ar_stream2) clone_ar_work(g_ar_work1, W, c);
     for (auto& Vi : M.V) {   // the conv histories start at zero
         if (M.L[Vi.l].dev != d) continue;
         CU(cudaMemset(Vi.h_k, 0, 3 * KD * 4));
@@ -7017,12 +7175,15 @@ int run(int argc, char** argv) {
         if (g_ar_dual && g_parallel != 2) {
             std::fprintf(stderr, "ik2: AR dual disabled (IK2_PARALLEL lowered to %d)\n", g_parallel);
             g_ar_dual = false;
+            g_ar_stream2 = false;
             g_batch_decode = false;
         }
         std::vector<Ik2Req> reqs;
         int loaded_slot = -1;
         bool batch_dirty = false;
         long long batch_steps = 0, batch_tokens = 0;
+        long long ar2_steps = 0;
+        double ar2_sum_slot0 = 0.0, ar2_sum_slot1 = 0.0, ar2_sum_ms = 0.0, ar2_wall_ms = 0.0;
         const bool batch_stats = getenv("IK2_BATCH_STATS") && std::atoi(getenv("IK2_BATCH_STATS"));
         if (g_parallel > 1) {
             if (batch_stats)
@@ -7288,29 +7449,69 @@ int run(int argc, char** argv) {
                     ids.push_back(b); toks.push_back(r.next_tok); poss.push_back(rq_pos(r));
                 }
                 if (g_ar_dual && !ids.empty()) {
-                    // One or two greedy slots ready: one replay of EACH ready slot's own resident T=1 graph,
-                    // single stream, round-robin.  A lone slot happens at the tail when the other slot
-                    // already hit max_new; routing it through the generic serial path would replay g_fgraph,
-                    // which was captured with the OTHER slot's KV pointers, so it must stay on its AR graph.
-                    // Same kernels/order as a solo token, so the emitted ids stay bit-exact.
-                    for (size_t i = 0; i < ids.size(); ++i) {
-                        const int b = ids[i];
-                        Ik2Req& r = reqs[b];
+                    // One or two greedy slots ready: one replay of EACH ready slot's own resident T=1 graph.
+                    // Same kernels/order as a solo token, so the emitted ids stay bit-exact.  With IK2_AR_STREAM2
+                    // the two replays are submitted to g_s and g_s1 without a host sync between them, then both
+                    // streams are waited before either argmax is read.  One ready slot keeps the serial path.
+                    const bool ar2_ready = g_ar_stream2 && ids.size() == 2 &&
+                        g_ar_fgraph[0][(int) OutMode::kArgmax].exec && g_ar_fgraph[1][(int) OutMode::kArgmax].exec;
+                    if (ar2_ready) {
                         std::vector<float> lo;
-                        std::vector<int> ag;
-                        fast_token(M, toks[i], poss[i], OutMode::kArgmax, lo, &ag, b);
-                        const int ntok = ag.empty() ? 0 : ag[0];
-                        r.hist.push_back(toks[i]);
-                        ++r.generated;
-                        r.next_tok = ntok;
-                        r.cand = false;
-                        r.last.clear();
-                        std::printf("BT %d %d\n", b, ntok);
-                        ++batch_tokens;
-                        batched[b] = 1;
-                        if (r.cancel || std::find(r.stops.begin(), r.stops.end(), ntok) != r.stops.end())
-                            finish_req(b, r.cancel ? "cancel" : "stop");
-                        else if (r.generated >= r.max_new) finish_req(b, "length");
+                        std::vector<int> ag[2];
+                        fast_token(M, toks[0], poss[0], OutMode::kArgmax, lo, &ag[0], ids[0], true);
+                        fast_token(M, toks[1], poss[1], OutMode::kArgmax, lo, &ag[1], ids[1], true);
+                        CU(cudaStreamSynchronize(g_s));
+                        CU(cudaStreamSynchronize(g_s1));
+                        if (g_ar2_stats) {
+                            float ms0 = 0.0f, ms1 = 0.0f;
+                            CU(cudaEventElapsedTime(&ms0, g_ar2_ev[0], g_ar2_ev[1]));
+                            CU(cudaEventElapsedTime(&ms1, g_ar2_ev[2], g_ar2_ev[3]));
+                            ar2_sum_slot0 += ms0; ar2_sum_slot1 += ms1;
+                            ar2_sum_ms += (double) ms0 + ms1;
+                            ar2_wall_ms += std::max((double) ms0, (double) ms1);
+                            ++ar2_steps;
+                            if (batch_stats && batch_steps % 64 == 0 && ar2_wall_ms > 0.0)
+                                std::printf("AR2STAT steps=%lld slot0=%.3fms slot1=%.3fms wall=%.3fms speedup=%.2fx\n",
+                                            ar2_steps, ar2_sum_slot0 / ar2_steps, ar2_sum_slot1 / ar2_steps,
+                                            ar2_wall_ms / ar2_steps, ar2_sum_ms / ar2_wall_ms);
+                        }
+                        for (int i = 0; i < 2; ++i) {
+                            const int b = ids[i];
+                            Ik2Req& r = reqs[b];
+                            Work& W = (b == 1) ? g_ar_work1 : dev_work(0);
+                            const int ntok = W.argmax_h[0];
+                            r.hist.push_back(toks[i]);
+                            ++r.generated;
+                            r.next_tok = ntok;
+                            r.cand = false;
+                            r.last.clear();
+                            std::printf("BT %d %d\n", b, ntok);
+                            ++batch_tokens;
+                            batched[b] = 1;
+                            if (r.cancel || std::find(r.stops.begin(), r.stops.end(), ntok) != r.stops.end())
+                                finish_req(b, r.cancel ? "cancel" : "stop");
+                            else if (r.generated >= r.max_new) finish_req(b, "length");
+                        }
+                    } else {
+                        for (size_t i = 0; i < ids.size(); ++i) {
+                            const int b = ids[i];
+                            Ik2Req& r = reqs[b];
+                            std::vector<float> lo;
+                            std::vector<int> ag;
+                            fast_token(M, toks[i], poss[i], OutMode::kArgmax, lo, &ag, b);
+                            const int ntok = ag.empty() ? 0 : ag[0];
+                            r.hist.push_back(toks[i]);
+                            ++r.generated;
+                            r.next_tok = ntok;
+                            r.cand = false;
+                            r.last.clear();
+                            std::printf("BT %d %d\n", b, ntok);
+                            ++batch_tokens;
+                            batched[b] = 1;
+                            if (r.cancel || std::find(r.stops.begin(), r.stops.end(), ntok) != r.stops.end())
+                                finish_req(b, r.cancel ? "cancel" : "stop");
+                            else if (r.generated >= r.max_new) finish_req(b, "length");
+                        }
                     }
                     loaded_slot = -1;   // prefill must re-bind M.V to the right slot after two graph replays
                 } else if (ids.size() >= 2 && (int) ids.size() <= BatchSlots::kMaxRows) {

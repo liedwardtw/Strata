@@ -715,6 +715,10 @@ void rnn_inputs(const float* state, const uint16_t* emb, const int* prev, const 
 void rnn_gates(const float* proj, const float* bias, int R, float* state, float* latent, cudaStream_t s);
 /// *out = argmax over v < n of a[v] + b[v] + c[v] (b, c may be null; ties: the lower index), *out written on the device.
 void argmax_sum(const float* a, const float* b, const float* c, int n, int* out, cudaStream_t s);
+/// IK2_AR_STREAM2: identical reduction, but multi-block partials go into caller-owned scratch (at least 256
+/// float/int entries) instead of process-wide globals, so concurrent slot graphs cannot mix their partials.
+void argmax_sum(const float* a, const float* b, const float* c, int n, int* out, cudaStream_t s, float* part_v,
+                int* part_i);
 /// out[r] = argmax over c < n_cols of x[r * ld + c] for 0 <= r < n_rows (ties: the lower index), written on the device.
 void argmax_rows(const float* x, int ld, int n_rows, int n_cols, int* out, cudaStream_t s);
 /// *out = argmax over v < n of (base[v] + bias_f16[v] + sum_{r<R} W[r * ld + v] * x[r]), where W is [R][ld] FP16,
