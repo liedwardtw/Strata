@@ -7476,6 +7476,14 @@ int run(int argc, char** argv) {
             return pick_top(cd, temp, top_p, top_k, rg);
         };
         const bool use_cand = !(getenv("IK2_CAND") && !std::atoi(getenv("IK2_CAND")));
+        // IK2_MONITOR_INFO (default 0): opt-in Monitor fields. The default printf calls below stay byte-identical.
+        const char* monitor_env = getenv("IK2_MONITOR_INFO");
+        const bool monitor_info = monitor_env && std::atoi(monitor_env) != 0;
+        auto monitor_counts = [&](bool want_hits) -> uint64_t {
+            uint64_t n = 0;
+            for (auto& D : g_dev) n += want_hits ? (uint64_t) D.EC.hits : (uint64_t) D.EC.misses;
+            return n;
+        };
         std::signal(SIGUSR1, on_usr1);
         // The engine protocol (serve/server.py's StrataEngine): "GEN <max_new> [key=value ...] <ids>" in; "PP ..." per
         // prompt pass, "T <id>" per token and "DONE <generated> <prompt> <prompt_ms> <decode_ms> <stop|length|cancel>
@@ -7492,9 +7500,36 @@ int run(int argc, char** argv) {
             // IK2_REPORT_BATCH=1 restores the old value for real batched deployments.
             static const bool report_batch = getenv("IK2_REPORT_BATCH") && std::atoi(getenv("IK2_REPORT_BATCH"));
             const int reported_slots = report_batch ? g_parallel : 0;
-            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d batch_slots=%d%s\n",
-                        kv_is_int() ? (kv_int_bits() == 4 ? "int4" : "int8") : (g_kv_fp8 ? "fp8" : "f16"), ctx, n_gpu,
-                        reported_slots, reported_slots ? " slot_read=1" : "");
+            if (monitor_info) {
+                int expert_slots = 0;
+                size_t expert_bytes = 0;
+                for (auto& D : g_dev) {
+                    expert_slots += D.EC.total_slots();
+                    expert_bytes += D.EC.total_bytes();
+                }
+                size_t vram_free_b = 0, vram_total_b = 0;
+                use_dev(0);
+                if (cudaMemGetInfo(&vram_free_b, &vram_total_b) != cudaSuccess) vram_free_b = 0;
+#if defined(STRATA_USE_HIP) && defined(_WIN32)
+                // The Windows cudaMemGetInfo shim subtracts the WDDM budget withheld from this process; a 640k-ctx
+                // load can leave that figure at 0 even while the card has free memory. Fall back to the driver's
+                // unadjusted figure only for this opt-in Monitor field (the default path is untouched).
+                if (vram_free_b == 0) {
+                    size_t raw_free_b = 0, raw_total_b = 0;
+                    if (hipMemGetInfo(&raw_free_b, &raw_total_b) == hipSuccess) vram_free_b = raw_free_b;
+                }
+#endif
+                std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d batch_slots=%d%s "
+                            "expert_slots=%d expert_cache_mib=%d vram_free_mib=%d conversation_cache_mib=%d "
+                            "conversation_cache_slots=%d\n",
+                            kv_is_int() ? (kv_int_bits() == 4 ? "int4" : "int8") : (g_kv_fp8 ? "fp8" : "f16"), ctx, n_gpu,
+                            reported_slots, reported_slots ? " slot_read=1" : "", expert_slots,
+                            (int) (expert_bytes >> 20), (int) (vram_free_b >> 20), (int) conv_cache_mib, n_snaps);
+            } else {
+                std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d batch_slots=%d%s\n",
+                            kv_is_int() ? (kv_int_bits() == 4 ? "int4" : "int8") : (g_kv_fp8 ? "fp8" : "f16"), ctx, n_gpu,
+                            reported_slots, reported_slots ? " slot_read=1" : "");
+            }
             std::printf("READY %d stop\n", ctx);
         } else {
             std::printf("@READY ctx %d\n", ctx);
@@ -8056,11 +8091,24 @@ int run(int argc, char** argv) {
                     if (hist_sig.size() > (size_t) sp) hist_sig.resize(sp);
                     last.clear();
                     L = sp;
+                    if (monitor_info) {
+                        int parked = 0;
+                        for (const auto& sn2 : snaps) if (sn2.pos >= 0) ++parked;
+                        std::fprintf(stderr, "conversation cache: restored %d tokens; parked=%d bytes=%zu\n",
+                                     sp, parked, (size_t) parked * snap_bytes);
+                    }
                 } else {
                     reset(), L = 0;
                 }
             }
             const int cached = (int) L;
+            uint64_t monitor_h0 = 0, monitor_m0 = 0;
+            if (monitor_info) {
+                monitor_h0 = monitor_counts(true);
+                monitor_m0 = monitor_counts(false);
+                std::printf("RESUME %d\n", cached);
+                std::fflush(stdout);
+            }
             const double t0 = now();
             const uint64_t miss0 = dev_cache(0).misses, bytes0 = dev_cache(0).bytes_up;
             for (auto& v : g_cnt_hist) v = 0;
@@ -8108,8 +8156,17 @@ int run(int argc, char** argv) {
             }
             if (cancelled) {
                 reset();
-                if (serve_strata) std::printf("DONE 0 %zu %.1f 0 cancel 0 0 %d\n", ids.size(), (now() - t0) * 1e3, cached);
-                else std::printf("@END cancelled %zu %d %.3f %.3f\n", ids.size(), cached, now() - t0, 0.0);
+                if (serve_strata) {
+                    if (monitor_info) {
+                        const uint64_t h = monitor_counts(true), m = monitor_counts(false);
+                        const uint64_t dh = h > monitor_h0 ? h - monitor_h0 : 0;
+                        const uint64_t dm = m > monitor_m0 ? m - monitor_m0 : 0;
+                        std::printf("DONE 0 %zu %.1f 0 cancel 0 0 %d %llu %llu\n", ids.size(), (now() - t0) * 1e3,
+                                    cached, (unsigned long long) dh, (unsigned long long) (dh + dm));
+                    } else {
+                        std::printf("DONE 0 %zu %.1f 0 cancel 0 0 %d\n", ids.size(), (now() - t0) * 1e3, cached);
+                    }
+                } else std::printf("@END cancelled %zu %d %.3f %.3f\n", ids.size(), cached, now() - t0, 0.0);
                 std::fflush(stdout);
                 busy = false;
                 continue;
@@ -8121,8 +8178,18 @@ int run(int argc, char** argv) {
                 snap_next = (snap_next + 1) % (int) snaps.size();
                 sn.pos = (int) hist.size();
                 snap_copy(sn, true);
+                if (monitor_info) {
+                    int parked = 0;
+                    for (const auto& sn2 : snaps) if (sn2.pos >= 0) ++parked;
+                    std::fprintf(stderr, "conversation cache: parked %d tokens; parked=%d bytes=%zu\n",
+                                 sn.pos, parked, (size_t) parked * snap_bytes);
+                }
             }
             const double t1 = now();
+            if (monitor_info) {
+                monitor_h0 = monitor_counts(true);
+                monitor_m0 = monitor_counts(false);
+            }
             if (getenv("IK2_STATS"))
                 std::printf("prefill stats: %zu tokens run, %llu expert copies (%.1f GiB) in %.2f s; experts that ran 1 / 2 / 3-7 / 8+ "
                             "tokens: %llu / %llu / %llu / %llu\n",
@@ -8193,10 +8260,19 @@ int run(int argc, char** argv) {
                 }
                 hist.push_back(tok);
             }
-            if (serve_strata)
-                std::printf("DONE %d %zu %.1f %.1f %s 0 0 %d\n", n_out, ids.size(), (t1 - t0) * 1e3, (now() - t1) * 1e3,
-                            std::strcmp(reason, "cancelled") == 0 ? "cancel" : reason, cached);
-            else
+            if (serve_strata) {
+                if (monitor_info) {
+                    const uint64_t h = monitor_counts(true), m = monitor_counts(false);
+                    const uint64_t dh = h > monitor_h0 ? h - monitor_h0 : 0;
+                    const uint64_t dm = m > monitor_m0 ? m - monitor_m0 : 0;
+                    std::printf("DONE %d %zu %.1f %.1f %s 0 0 %d %llu %llu\n", n_out, ids.size(), (t1 - t0) * 1e3,
+                                (now() - t1) * 1e3, std::strcmp(reason, "cancelled") == 0 ? "cancel" : reason, cached,
+                                (unsigned long long) dh, (unsigned long long) (dh + dm));
+                } else {
+                    std::printf("DONE %d %zu %.1f %.1f %s 0 0 %d\n", n_out, ids.size(), (t1 - t0) * 1e3,
+                                (now() - t1) * 1e3, std::strcmp(reason, "cancelled") == 0 ? "cancel" : reason, cached);
+                }
+            } else
                 std::printf("@END %s %zu %d %.3f %.3f\n", reason, ids.size(), cached, t1 - t0, now() - t1);
             std::fflush(stdout);
             busy = false;

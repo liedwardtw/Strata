@@ -135,7 +135,7 @@ Endpoints (model id `inkling-2-mini`):
 | Anthropic API | `http://127.0.0.1:8099/v1/messages` |
 | Health | `http://127.0.0.1:8099/health` |
 
-Portable launcher: `scripts/native-serve/run-native-serve.ps1` (all paths from params/env, ASCII-only). It writes a serve config with `--max-context`, `--conversation-cache-mib 8192`, and `reasoning_budget_tokens: 256` (Inkling-2 is a thinking model; without a budget it thinks up to `max_tokens` and returns an empty answer). A single-stream engine reports `batch_slots=0` so serve uses its serialized FIFO — two concurrent requests queue cleanly instead of deadlocking (`IK2_REPORT_BATCH=1` restores batch reporting for real batched deployments).
+Portable launcher: `scripts/native-serve/run-native-serve.ps1` (all paths from params/env, ASCII-only). It writes a serve config with `--max-context`, `--conversation-cache-mib 8192`, `reasoning_effort: "none"` (the AR-direct speed default — no thinking pass, ~141 t/s) and `reasoning_budget_tokens: 256` (a cap only if a client explicitly asks to think; per-request `reasoning_effort` / `chat_template_kwargs.enable_thinking` can override). A single-stream engine reports `batch_slots=0` so serve uses its serialized FIFO — two concurrent requests queue cleanly instead of deadlocking (`IK2_REPORT_BATCH=1` restores batch reporting for real batched deployments). A silent-background launcher stops opening the browser: `start.bat` launches detached with `-WindowStyle Hidden`, polls `/health` until loaded, prints one `OK ...` line, and lets you close the console window (`stop.bat` / `stop-daily.ps1` stops it).
 
 ### Strata Desktop App (internal engine)
 

@@ -106,6 +106,9 @@ $envMap = [ordered]@{
     IK2_ATTN_GQA        = '1'
     IK2_ATTN_DPP        = '1'
     IK2_CONV_CACHE_MIB  = '8192'
+    # Emit monitor INFO keys (expert_slots, conversation_cache_*, ...) so the native
+    # Strata monitor page shows the 8 GiB conversation cache and expert residency.
+    IK2_MONITOR_INFO    = '1'
     IK2_INT4_PREFILL    = '1'
     IK2_LG_CTX          = '1024'
 }
@@ -119,9 +122,12 @@ $cfg = [ordered]@{
     tokenizer  = $Tokenizer
     model_name = 'inkling-2-mini'
     env        = $envMap
-    # Inkling-2 is a thinking model: without a budget it thinks until max_tokens and
-    # returns an empty answer. A modest default leaves room for the final answer;
-    # an individual request can still override it.
+    # Inkling-2 is a thinking model. Two ways to keep agent/browser answers fast:
+    #  - reasoning_effort "none" -> template enable_thinking:false (no thinking pass at all):
+    #    this is the clean speed default for AR-direct 141 t/s.
+    #  - reasoning_budget_tokens caps thinking if a client explicitly asks to think.
+    # A client can still override per-request via reasoning_effort or chat_template_kwargs.
+    reasoning_effort        = 'none'
     reasoning_budget_tokens = 256
 }
 if (-not $ConfigOut) { $ConfigOut = Join-Path $env:TEMP 'ik2-native-serve.json' }
