@@ -60,12 +60,13 @@ if (-not (Test-Path (Join-Path $TerminalDir 'serve\server.py'))) {
     Write-Output "REFUSE: terminal/serve/server.py not found under $TerminalDir"; exit 1
 }
 
-# GPU safety: refuse a second model process or a busy port.
+# GPU safety: refuse a second model process or a real listener on the port.
+# A stopped serve leaves TIME_WAIT / orphaned Listen sockets with OwningProcess=0
+# for a few seconds; those do not block a fresh bind and must not be treated busy.
 $procs = Get-Process strata*,llama*,hipfire*,daemon* -ErrorAction SilentlyContinue
 if ($procs) { Write-Output "REFUSE: model process already running: $($procs.Name -join ',')"; exit 1 }
-if (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) {
-    Write-Output "REFUSE: port $Port already in use"; exit 1
-}
+$realListener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.OwningProcess -gt 4 }
+if ($realListener) { Write-Output "REFUSE: port $Port already in use by pid $($realListener.OwningProcess -join ',')"; exit 1 }
 $gp = Join-Path $env:USERPROFILE 'models\gpu_guard.pid'
 if (Test-Path $gp) {
     $gpid = [int](Get-Content $gp)
@@ -110,11 +111,18 @@ $envMap = [ordered]@{
 }
 $cfg = [ordered]@{
     exe        = $Exe
-    args       = @('--model',$Model,'--ctx',"$Ctx",'--prefill','4096','--gpus','1','--threads','8','--cache-gb','60')
+    # --max-context: serve.py reads the engine's max context from this arg (server.py:768);
+    # without it the API reports 32768 even when the engine loaded a 640k KV.
+    # --conversation-cache-mib: host-RAM parking of conversation snapshots for agents.
+    args       = @('--model',$Model,'--ctx',"$Ctx",'--max-context',"$Ctx",'--prefill','4096','--gpus','1','--threads','8','--cache-gb','60','--conversation-cache-mib','8192')
     cwd        = $WorkDir
     tokenizer  = $Tokenizer
     model_name = 'inkling-2-mini'
     env        = $envMap
+    # Inkling-2 is a thinking model: without a budget it thinks until max_tokens and
+    # returns an empty answer. A modest default leaves room for the final answer;
+    # an individual request can still override it.
+    reasoning_budget_tokens = 256
 }
 if (-not $ConfigOut) { $ConfigOut = Join-Path $env:TEMP 'ik2-native-serve.json' }
 $json = $cfg | ConvertTo-Json -Depth 6

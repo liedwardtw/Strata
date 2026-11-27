@@ -116,6 +116,31 @@ READY 655360 stop
 
 **GPU safety**: the launcher refuses to start if another model process is running and warns if `gpu_guard` is down. Never run two model-loading processes concurrently on a 24 GB WDDM card.
 
+### Native Strata serve (web page + monitor + API + agent tool calling)
+
+The one-click launcher now starts the **native Strata serve** (`serve.server`) with the ik2 engine as its internal engine — not a custom HTTP bridge. You get the same experience as stock Strata: a browser chat page, a monitor page, the OpenAI/Anthropic API, and agent tool/function calling (tool calling is implemented in serve's Python layer; the engine only streams token ids).
+
+```
+start.bat   :: starts native Strata serve on port 8099 (640k context, ik2 engine)
+stop.bat    :: stops the serve + engine, leaves gpu_guard running
+```
+
+Endpoints (model id `inkling-2-mini`):
+
+| What | URL |
+|---|---|
+| Web chat page | `http://127.0.0.1:8099/` |
+| Monitor page | `http://127.0.0.1:8099/api-monitor` (or `/#monitor`) |
+| OpenAI chat API | `http://127.0.0.1:8099/v1/chat/completions` |
+| Anthropic API | `http://127.0.0.1:8099/v1/messages` |
+| Health | `http://127.0.0.1:8099/health` |
+
+Portable launcher: `scripts/native-serve/run-native-serve.ps1` (all paths from params/env, ASCII-only). It writes a serve config with `--max-context`, `--conversation-cache-mib 8192`, and `reasoning_budget_tokens: 256` (Inkling-2 is a thinking model; without a budget it thinks up to `max_tokens` and returns an empty answer). A single-stream engine reports `batch_slots=0` so serve uses its serialized FIFO — two concurrent requests queue cleanly instead of deadlocking (`IK2_REPORT_BATCH=1` restores batch reporting for real batched deployments).
+
+### Strata Desktop App (internal engine)
+
+The installed Strata Desktop App (v0.2.21) loads ik2 through its native **shape-engine component** path (`component:strata-inkling`), so the App's own Control runtime drives our engine directly — no external provider/bridge. Verified end-to-end: `strata serve --profile strata-inkling-2-mini.json --engine strata --port 8099` reports `loaded:true, max_context=655360`, and the serving executable is the local component's `strata.exe` (our ik2 build); web chat page, tool calling (`get_weather`), and 640k context all work. The engine's `--version` prints `strata-inkling 0.1.64` (required by the App's shape-engine check), and `--draft off` (auto-added by Strata Control for Inkling engines) is treated as a no-op plain-AR request. See `scripts/native-serve/README.md` for the component-registration steps. The signed stock engine bundle is left untouched; the local build is an unsigned, per-user component (Windows Smart App Control may need a local allow). An engine update can unpin the local component — re-run `strata components use --family shape:inkling2 <folder>` after updates.
+
 ## Measured results
 
 ### Single-stream AR (num. in tok/s, greedy, bit-exact)

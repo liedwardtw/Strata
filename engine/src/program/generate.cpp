@@ -3633,10 +3633,12 @@ int main(int argc, char** argv) {
         }
     }
 #endif
-    // `strata --version` / `-V` (also `strata generate --version`): the version and nothing else, before any GPU is touched
+    // `strata --version` / `-V` (also `strata generate --version`): the version and nothing else, before any GPU is touched.
+    // This ik2 build is installed as the Inkling-2-Mini shape engine (component:strata-inkling), so the first line must
+    // name that shape: Control's shape_engine._test_start() insists on a `strata-inkling` prefix (shape_engine.py:239-242).
     for (int i = 1; i < argc && i < 3; ++i) {
         if (std::strcmp(argv[i], "--version") == 0 || std::strcmp(argv[i], "-V") == 0) {
-            std::printf("strata %s\n", STRATA_VERSION);
+            std::printf("strata-inkling %s\n", STRATA_VERSION);
             return 0;
         }
         // `strata --families`: the GGUF architectures this build runs (setup asks before it installs one)

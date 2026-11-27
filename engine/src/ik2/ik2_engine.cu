@@ -5572,7 +5572,14 @@ int run(int argc, char** argv) {
         else if (a == "--cache-gb" || a == "--expert-vram") cache_gb = std::atof(next().c_str());
         else if (a == "--threads" || a == "--cpu-threads" || a == "--pool-workers") threads = std::atoi(next().c_str());
         else if (a == "--gpus") n_gpu = std::atoi(next().c_str());
-        else if (a == "--draft") draft_path = next();
+        else if (a == "--draft") {
+            // Strata's serve/inkling_kind.py auto-adds "--draft off" for Inkling
+            // engines that did not specify drafting. Treat "off"/"none"/"" as
+            // no-op (plain AR) instead of trying to open a file literally named
+            // "off" (which died with "drafter: cannot open off").
+            const std::string v = next();
+            if (v != "off" && v != "none" && v != "false" && !v.empty()) draft_path = v;
+        }
         else if (a == "--serve") serve = true;
         else if (a == "--serve-ik2") serve = true, serve_strata = false;
         else if (a == "--eos") {
@@ -7479,8 +7486,15 @@ int run(int argc, char** argv) {
             eos_ids.push_back(199999);   // (Inkling 2's <|endoftext|>)
         }
         if (serve_strata) {
-            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d batch_slots=%d slot_read=1\n",
-                        kv_is_int() ? (kv_int_bits() == 4 ? "int4" : "int8") : (g_kv_fp8 ? "fp8" : "f16"), ctx, n_gpu, g_parallel);
+            // Single-stream (g_parallel==1) must report batch_slots=0: serve.py:955 sets
+            // self.batch=int(info["batch_slots"]); any nonzero makes it take generate_batched,
+            // skipping the solo FIFO -> two concurrent GENs deadlock the one-stream engine.
+            // IK2_REPORT_BATCH=1 restores the old value for real batched deployments.
+            static const bool report_batch = getenv("IK2_REPORT_BATCH") && std::atoi(getenv("IK2_REPORT_BATCH"));
+            const int reported_slots = report_batch ? g_parallel : 0;
+            std::printf("INFO engine=ik2 engine_kind=ik2 model=Inkling-2 kv=%s ctx=%d gpus=%d batch_slots=%d%s\n",
+                        kv_is_int() ? (kv_int_bits() == 4 ? "int4" : "int8") : (g_kv_fp8 ? "fp8" : "f16"), ctx, n_gpu,
+                        reported_slots, reported_slots ? " slot_read=1" : "");
             std::printf("READY %d stop\n", ctx);
         } else {
             std::printf("@READY ctx %d\n", ctx);
