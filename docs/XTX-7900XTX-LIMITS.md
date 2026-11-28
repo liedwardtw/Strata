@@ -145,3 +145,32 @@ Two cliffs, both reproducible and both at the same place whatever the prompt:
 The 640K config cannot use a 16K chunk, so the daily default stays at 7,168. `start-daily.ps1 -Ctx 131072 -Chunk 16384` is the faster configuration for a workload that fits in 131K: measured end to end through the server at a 48,422-token prompt, 17.63 s to first token against 18.83 s on the default (+6.8%), with the conversation cache unaffected (turns 2-4 reuse 48,422 / 48,439 / 48,457 tokens at 412-439 ms).
 
 Also measured and rejected on the same prompt: `IK2_WMMA_GEMM=0` (the rocBLAS path) reads at 1,681 tok/s against 2,613, so the WMMA INT4 GEMM is already the fast path; `IK2_INT4_DENSE=0` 2,604 and `IK2_INT4_PREFILL=1` 2,593, both inside the noise.
+
+## What a cached turn still costs, and where it goes (2026-11-29)
+
+The conversation cache turns a 48,422-token turn from 19 s into a fraction of a second, but it is not free, and the engine now prints the price. Two lines per turn on stderr (the server's log), with the copy time and the bandwidth it achieved:
+
+```
+strata serve: conversation cache: restored 48439 tokens; parked=4 bytes=1637771520; 76.3 ms (5.93 GB/s)
+strata serve: conversation cache: parked 48512 tokens; parked=4 bytes=1637771520; 143.0 ms (3.17 GB/s)
+```
+
+At 48,422 tokens a snapshot holds 452 MB (the sliding windows of the 40 sliding layers plus the whole KV of the 8 full-attention layers). Restoring it moves 452 MB at **5.93 GB/s** (76 ms); parking it moves 454 MB at **3.17 GB/s** (143 ms). Both are pageable-memory speeds: a pinned buffer on PCIe 4.0 x16 should reach 20-25 GB/s, so the snapshot buffers are the next thing to pin (they are plain std::vector<uint8_t> today). Pinning would take a turn's two copies from 219 ms to roughly 50 ms.
+
+Two hypotheses were ruled out before that conclusion:
+
+- **not the decode graph capture.** The graph is captured per request, so it was the prime suspect for a fixed per-turn cost. Running the server with `IK2_GRAPH=0` changed the cached turns from 409.3 / 444.1 / 425.4 ms to 400.5 / 404.1 / 419.0 ms, i.e. nothing.
+- **not the restore.** The restore is only 76-80 ms of a 409-456 ms turn, so the rest is the prompt pass itself.
+
+The rest is the price of reading a *short* chunk. Sent straight to the engine (`ik2cache.py`, the same 48,422-token prompt, then the same prompt plus N tokens, so the second request reuses 48,422 tokens), the new tokens cost:
+
+| new tokens | chunk time | per token |
+|---|---|---|
+| 17 | 226 ms | 13.3 ms |
+| 300 | 511 ms | 1.70 ms |
+| 1,000 | 877 ms | 0.88 ms |
+| 7,168 | 2,775 ms | 0.39 ms |
+
+So a chunk carries a fixed cost of roughly 200-350 ms (48 layer visits of setup and small-kernel launches) plus 0.5-1.0 ms a token, and only a full 7,168-token chunk amortises the fixed part down to the 0.36 ms a token that the prefill table reports. A cached agent turn therefore reaches its first token in about 0.36 s when it adds 17 tokens and about 0.95 s when it adds 1,000 — against 19 s cold. The fixed part is the next lever: it is per chunk, not per token, so it would need the per-visit setup to be amortised across chunks (or a smaller, cheaper visit for short chunks).
+
+`IK2_PF_PROFILE=1` is not the instrument for this. It syncs after every phase, which on a short chunk costs more than the phases it measures: a 17-token cached chunk reported attention 0.13 s plus experts 0.57 s, more than the 0.36 s the request took in total.

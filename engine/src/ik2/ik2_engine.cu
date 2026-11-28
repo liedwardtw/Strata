@@ -8248,15 +8248,21 @@ int run(int argc, char** argv) {
             const bool live_ok = L == hist.size() && (L < ids.size() || !last.empty());
             if (best >= 0 && ((int) L < snaps[best].pos || !live_ok)) {
                 const int sp = snaps[best].pos;
+                const double tr0 = now();
                 snap_copy(snaps[best], false);
+                const double tr1 = now();
                 hist = snaps[best].toks;   // (the state and the tokens it covers, together)
                 hist_sig = snaps[best].sigs;
                 last.clear();
                 L = (size_t) sp;
                 if (serve_strata) {
                     // (stderr: the server's log is the engine's stderr, and the Monitor's cache card reads it)
-                    std::fprintf(stderr, "strata serve: conversation cache: restored %d tokens; parked=%d bytes=%zu\n",
-                                 sp, count_parked(), conv_host_bytes);
+                    const size_t moved = snap_host(snaps[best]);
+                    std::fprintf(stderr,
+                                 "strata serve: conversation cache: restored %d tokens; parked=%d bytes=%zu; "
+                                 "%.1f ms (%.2f GB/s)\n",
+                                 sp, count_parked(), conv_host_bytes, (tr1 - tr0) * 1e3,
+                                 (tr1 - tr0) > 1e-9 ? moved / (tr1 - tr0) / 1e9 : 0.0);
                     std::fflush(stderr);
                 }
             } else if (!live_ok) {
@@ -8486,10 +8492,16 @@ int run(int argc, char** argv) {
                 std::printf("@END %s %zu %d %.3f %.3f\n", reason, ids.size(), cached, t1 - t0, t_done - t1);
             std::fflush(stdout);
             if (hist.size() > ids.size()) {
+                const double tp0 = now();
                 const int parked = park_state(hist, hist_sig);
+                const double tp1 = now();
                 if (serve_strata && parked > 0) {
-                    std::fprintf(stderr, "strata serve: conversation cache: parked %d tokens; parked=%d bytes=%zu\n",
-                                 parked, count_parked(), conv_host_bytes);
+                    const size_t moved = snap_host(snaps[(snap_next + (int) snaps.size() - 1) % (int) snaps.size()]);
+                    std::fprintf(stderr,
+                                 "strata serve: conversation cache: parked %d tokens; parked=%d bytes=%zu; "
+                                 "%.1f ms (%.2f GB/s)\n",
+                                 parked, count_parked(), conv_host_bytes, (tp1 - tp0) * 1e3,
+                                 (tp1 - tp0) > 1e-9 ? moved / (tp1 - tp0) / 1e9 : 0.0);
                     std::fflush(stderr);
                 }
             }
