@@ -120,3 +120,28 @@ The environment space is exhausted. At a 44,288-token prompt, one full read each
 The phase profile (read the shares, not the absolute times: `IK2_PF_PROFILE=1` syncs after every phase and costs 19%, 2,152 vs 2,649 tok/s) splits a 4,096-token chunk into attention 1.03 s (projections 0.618, output 0.313), experts 1.21 s (gather 0.393, gemm16 0.546, scatter 0.118), loop gates 0.244 s and router 0.03 s.
 
 That is ~8.4 TFLOP of projection work and ~0.52 TFLOP of expert work per chunk. The projections run at ~13.5 TFLOPS, 21% of the card's 61 TFLOPS fp16 peak; the experts run at ~1 TFLOPS because the prefill MoE is 128 small GEMMs of ~256 rows each. Reaching 4,000 tok/s needs both of those to more than double, which is a rewrite of the INT4 GEMM and of the expert loop — not a switch, a chunk size or a thread count.
+
+**But the chunk size does buy 7.3%, if the context is not 640K.** At a 44,288-token prompt, one rep each (repeats agree within 0.3%):
+
+| ctx | chunk | tok/s |
+| --- | --- | --- |
+| 655360 | 7168 | 2,613 (the daily default) |
+| 131072 | 10240 | 2,699 |
+| 131072 | 12288 | 2,751 |
+| 131072 | 14336 | 2,754 |
+| 131072 | **16384** | **2,804** |
+| 65536 | 16384 | 2,805 |
+| 131072 | 20480 | 768 |
+| 65536 | 20480 | 952 |
+| 196608 | 16384 | 1,466 |
+| 262144 | 16384 | 1,103 |
+| 393216 | 16384 | 721 |
+
+Two cliffs, both reproducible and both at the same place whatever the prompt:
+
+- **chunk above 16,384 collapses** (768 tok/s at 20,480) at a 64K context and at a 131K context alike, so it is a hard limit of the buffers or the kernels, not of VRAM.
+- **ctx above 131,072 with a 16K chunk pages** (1,466 at 196K, 721 at 393K), the same paging that makes the 8,192 chunk collapse at 640K: the 16K chunk's scratch plus the KV no longer fit.
+
+The 640K config cannot use a 16K chunk, so the daily default stays at 7,168. `start-daily.ps1 -Ctx 131072 -Chunk 16384` is the faster configuration for a workload that fits in 131K: measured end to end through the server at a 48,422-token prompt, 17.63 s to first token against 18.83 s on the default (+6.8%), with the conversation cache unaffected (turns 2-4 reuse 48,422 / 48,439 / 48,457 tokens at 412-439 ms).
+
+Also measured and rejected on the same prompt: `IK2_WMMA_GEMM=0` (the rocBLAS path) reads at 1,681 tok/s against 2,613, so the WMMA INT4 GEMM is already the fast path; `IK2_INT4_DENSE=0` 2,604 and `IK2_INT4_PREFILL=1` 2,593, both inside the noise.
