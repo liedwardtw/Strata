@@ -521,6 +521,12 @@ int g_int4_layers = 20;      // IK2_INT4_LAYERS: number of low layers served by 
 bool g_i4_mid_fuse = false;  // IK2_I4_MID_FUSE=1: fused swiglu+prep_down+rot (SLOWER on gfx1100: 92.0 vs 93.8; kept for reference)
 int g_i4_rot_in = 0;         // IK2_I4_ROT_IN: phase D, 1 = gate_up rot-in-matvec, 2 = also down prep+rot-in (default off)
 bool g_int4_pf_off = false;   // IK2_INT4_PF=0: disable INT4 prefill experts (isolate decode vs prefill bug)
+// IK2_FULL_WINDOW=N (default 0 = off, byte-identical): the 8 full-attention layers read only the last N
+// keys when decoding (T<=8), so a 640K conversation stops paying O(ctx) KV traffic on them. The cold KV is
+// left in VRAM (it is still written during prefill, and the sliding layers keep their own 1024 window), it is
+// simply not read again. This is the "discard the cold KV" lever and it DOES change the output: measure it
+// with quality.py and a long-context needle before trusting it.
+int g_full_window = 0;
 bool g_verify_fast = false;   // IK2_VERIFY_FAST=1: device-only INT4 verify MoE (g_rec, T=2..8): the T=1 resident
                               // sequence at S=T*K slots, no route D2H / stream sync (graph-capturable). Default OFF.
 bool g_verify_graph = false;  // IK2_VERIFY_GRAPH=1: capture the T=8 verify forward once and replay it. Needs
@@ -2589,8 +2595,14 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     gx_hash_dev("sink", W.sink, T * c.H, T, l);
 
     const int extent = Ly.sliding ? c.extent_swa : c.extent;
-    const int window = Ly.sliding ? c.window : (1 << 30);
-    const int k0 = Ly.sliding ? std::max(0, pos0 - c.window + 1) : 0;
+    // The kernels recompute their own k0 from `window` (attn_split_int_kernel: k0 = qpos0 - window + 1), so the
+    // window argument is what actually bounds the walk; the host k0 below must agree with it.
+    const int window = Ly.sliding ? c.window
+                                 : ((g_full_window > 0 && T <= 8) ? g_full_window : (1 << 30));
+    int k0 = Ly.sliding ? std::max(0, pos0 - c.window + 1) : 0;
+    // IK2_FULL_WINDOW: a full-attention layer decoding (T<=8) reads only the last g_full_window keys. The
+    // prompt path (T>8) always reads everything, so prefill still builds the whole KV; only the re-read is cut.
+    if (g_full_window > 0 && !Ly.sliding && T <= 8 && pos0 + 1 > g_full_window) k0 = pos0 - g_full_window + 1;
     const int nk = pos0 + T - k0;
     const float one = 1.0f, zero = 0.0f;
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
@@ -3533,7 +3545,9 @@ void one_token_launches(Model& M, Work& W, OutMode out_mode, bool kstep = false,
         // the clips, the token's K and V into the cache at its position, the attention
         pf_fast::mark(4, g_s);
         const int extent = Ly.sliding ? c.extent_swa : c.extent;
-        const int window = Ly.sliding ? c.window : (1 << 30);
+        // IK2_FULL_WINDOW: the kernels bound their own key walk from `window` (k0 = qpos - window + 1), so this is
+        // the one argument that decides whether a full-attention layer re-reads the whole context or just its tail.
+        const int window = Ly.sliding ? c.window : (g_full_window > 0 ? g_full_window : (1 << 30));
         const int P = Ly.sliding ? P_sl : P_full;
         // the attention on the tensor cores, from an FP16 copy of q (IK2_ATTN_MMA=0: the scalar kernels - a layer
         // without a window, its keys the whole context, is bound by their arithmetic).  int8/int4 KV use the
@@ -5703,6 +5717,7 @@ int run(int argc, char** argv) {
     g_moe_group_exp = getenv("IK2_MOE_GROUP_EXPERT") && std::atoi(getenv("IK2_MOE_GROUP_EXPERT")) != 0;
     if (getenv("IK2_INT4_DENSE")) g_int4_dense = std::atoi(getenv("IK2_INT4_DENSE"));
     if (const char* pf = getenv("IK2_DECODE_PFULL")) { int v = std::atoi(pf); if (v >= 1 && v <= 512) g_decode_pfull = v; }
+    if (const char* fw = getenv("IK2_FULL_WINDOW")) { int v = std::atoi(fw); if (v >= 0) g_full_window = v; }
     g_attn_wideload = getenv("IK2_ATTN_WIDELOAD") && std::atoi(getenv("IK2_ATTN_WIDELOAD")) != 0;
     g_attn_dpp = getenv("IK2_ATTN_DPP") && std::atoi(getenv("IK2_ATTN_DPP")) != 0;
     g_attn_gqa = getenv("IK2_ATTN_GQA") && std::atoi(getenv("IK2_ATTN_GQA")) != 0;
@@ -7286,6 +7301,9 @@ int run(int argc, char** argv) {
         // conversation when that conversation is parked (park_state below), not for the whole context up front, so
         // this is on by default; IK2_CONV_CACHE_FULL=0 turns it off.
         const bool conv_cache_full = !getenv("IK2_CONV_CACHE_FULL") || std::atoi(getenv("IK2_CONV_CACHE_FULL")) != 0;
+    // IK2_CONV_CACHE_PARK_MIB: the most host bytes one park may copy (default 1024). A park is synchronous, so an
+    // unbounded one turns a 393K-token prompt into a 42 s stall; past the cap the conversation is simply not cached.
+    const size_t conv_park_cap_mib = getenv("IK2_CONV_CACHE_PARK_MIB") ? (size_t) std::atof(getenv("IK2_CONV_CACHE_PARK_MIB")) : 1024;
         size_t snap_bytes = 0;   // host bytes per snapshot (sliding KV + scales; conv histories are VRAM)
         size_t batch_snap_bytes = 0;   // a batch slot must restore full-attention KV of a different prompt
         size_t full_row_b = 0;   // host bytes a token takes in every full-attention layer (K and V)
@@ -7423,6 +7441,12 @@ int run(int argc, char** argv) {
         auto park_state = [&](const std::vector<int>& toks, const std::vector<uint64_t>& sigs) -> int {
             if (snaps.empty() || toks.empty()) return 0;
             const size_t need = conv_cache_full ? toks.size() * full_row_b : 0;
+            // A park copies the conversation's full-attention KV to host RAM, and that copy is synchronous: at
+            // 393K tokens it cost ~42 s, which is more than the whole decode it was meant to speed up. Never
+            // spend more than this on one park; past it the conversation simply is not cached (a re-read of the
+            // prompt is the cheaper mistake). IK2_CONV_CACHE_PARK_MIB overrides the cap, 0 = no cap.
+            const size_t park_cap = conv_park_cap_mib << 20;
+            if (park_cap > 0 && need > park_cap) return 0;
             while (conv_host_bytes + need > conv_full_budget) {
                 int victim = -1;
                 for (int i = 0; i < (int) snaps.size(); ++i)

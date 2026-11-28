@@ -31,3 +31,13 @@ At 256K context the accept rate collapses to 1.96/8 (~34 tok/s) and DSpark loses
 ## Running
 
 DSpark is enabled by the `--draft` CLI flag with the native `mtp.safetensors`. In serve mode, `IK2_SERVE_DSPEC=1` enables greedy DSpark in the request path (default 0 = AR). The Desktop App auto-adds `--draft off` for Inkling engines; our engine treats that as a no-op plain-AR request.
+
+## The verify's dense projections, and what else was measured (2026-11-29)
+
+`IK2_INT4_DENSE_MULTI=1` lets the T=8 verify read each dense INT4 weight row once instead of once per row. On the RX 7900 XTX with this build (32-token prompt, `IK2_VERIFY_FAST=1 IK2_VERIFY_GRAPH=1 IK2_SPEC_N=8`, 20K context) the verify went from **57.0 to 41.5 ms a step**, and the 11-case quality set went 46.6 to **54.7 tok/s with 11/11 still passing**. It is not bit-exact (a 64-token greedy run first differs at token 46), so it stays opt-in.
+
+What did not help, measured the same day: `IK2_BATCH_MOE_DEVICE=1` (57.0 ms: the batch MoE needs `W.batch`, which the verify never sets), `IK2_BATCH_MOE_COMPACT=1` (56.8), `IK2_VERIFY_MSHARED=1` and `IK2_DRAFT_ATTN_GQA=1` (no change), `IK2_MOE_GROUP_EXPERT=1` (no change at 20K, 2.9x worse at 655K).
+
+The draft side can be approximated for free: every emitted token is the target's own argmax (`generate_speculative`, `engine/src/ik2/ik2_engine.cu:5492-5508`), so a lossy drafter changes only the accept rate, never the output. Measured: `IK2_DRAFT_CAND=1` gave 0 of 64 token differences, but drafting got slower (11.5 vs 6.1 ms a step) and the accept rate fell (1.66 vs 1.97 tokens a step), so it stays off; `IK2_DRAFT_MARKOV_FUSE=1` changed nothing.
+
+At a 640K context in serve mode speculation is still 3-5x slower than AR (repetitive prompt 12.65 vs 38.54 tok/s, prose 11.43 vs 62.32): the verify reads the KV for 8 rows and the expert weights once per slot. AR stays the default.
