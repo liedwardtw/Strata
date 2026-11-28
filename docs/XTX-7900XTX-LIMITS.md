@@ -189,3 +189,28 @@ Same 48,422-token conversation, same run shape:
 The restore nearly doubled; the park barely moved, so the park's limit is the device side (or WDDM's staging), not the host pages. A cached turn at 48k tokens is now 0.36-0.37 s against 19 s cold, and the remaining time is the short chunk's own cost (see the table above), not the cache.
 
 Quality unchanged: `quality.py run pinned` 11/11 passed, and the four serve test files pass (39 passed, 3011 subtests).
+### A chunk carries ~200-300 ms of fixed cost, and it is not the MoE, the projections or the attention (2026-11-29)
+
+A short chunk is expensive out of proportion to its tokens. Sent straight to the engine (`ik2cache.py`), the same 8,000-token prompt followed by N more tokens costs:
+
+| new tokens | chunk time | per token |
+|---|---|---|
+| 17 | 199 ms | 11.7 ms |
+| 300 | 511 ms | 1.70 ms |
+| 1,000 | 877 ms | 0.88 ms |
+| 7,168 | 2,856 ms | 0.40 ms |
+
+The same 17-token chunk costs 199 ms at an 8K context and 226 ms at a 48K one, and a *cold* 17-token prompt costs the same, so the cost does not depend on the context and does not come from the conversation cache. Fitting the two points inside one 8,000-token request (chunk 1 = 7,168 tokens in 2,856 ms, chunk 2 = 832 tokens in 594 ms) gives a marginal 0.357 ms a token and a fixed **297 ms per chunk**.
+
+Six candidate causes were each measured and each ruled out:
+
+| candidate | how it was tested | result |
+|---|---|---|
+| the MoE's per-expert loop | `IK2_EXPERTS_PREFILL_WMMA=1` / `IK2_INT4_LAYERS=48` | 197 / 215 ms against 211 — no change |
+| hipBLAS call overhead in the projections | `IK2_INT4_PREFILL=1` | 197 ms against 199 — no change |
+| the attention walk | `IK2_FULL_WINDOW=1024` / `IK2_FLASH_NW=4` / `IK2_ATTN_GQA=0` | 199 / 201 / 206 ms — no change |
+| the route copy to the host | the staging buffers are already `cudaHostAlloc`-pinned | not it |
+| the decode graph capture | `IK2_GRAPH=0` | no change |
+| the cache restore | timed separately | 41 ms of a 360 ms turn |
+
+So roughly 200-300 ms sits in the per-chunk setup of the 48 layer visits, in a part none of those switches reaches. It is worth about 2.6% of a 7,168-token prefill (2,856 → ~2,670 ms would be 2,684 tok/s) and about 190 ms on every short agent turn, which makes it a better target for the agent loop than for the prefill number. Finding it needs a per-visit timer that does not itself synchronise (`IK2_PF_PROFILE` does, and on a short chunk it reports more time than the request took).
