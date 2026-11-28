@@ -121,7 +121,9 @@ $cfg = [ordered]@{
     # --max-context: serve.py reads the engine's max context from this arg (server.py:768);
     # without it the API reports 32768 even when the engine loaded a 640k KV.
     # --conversation-cache-mib: host-RAM parking of conversation snapshots for agents.
-    args       = @('--model',$Model,'--ctx',"$Ctx",'--max-context',"$Ctx",'--prefill','4096','--gpus','1','--threads','8','--cache-gb','60','--conversation-cache-mib','8192')
+    # --prefill: the read's chunk. 7168 measured 10.5% faster than 4096 at a 44,288-token prompt on a 7900 XTX
+    # (2,518 vs 2,272 tok/s); 8192 falls off a cliff to ~1,435 and 10240 to ~694. Decode is unaffected.
+    args       = @('--model',$Model,'--ctx',"$Ctx",'--max-context',"$Ctx",'--prefill','7168','--gpus','1','--threads','8','--cache-gb','60','--conversation-cache-mib','8192')
     cwd        = $WorkDir
     tokenizer  = $Tokenizer
     model_name = 'inkling-2-mini'

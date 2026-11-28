@@ -411,10 +411,11 @@ bool g_prof = false;
 // elapsed summed after the token's sync - no per-phase stream wait, so the resident path's speed is preserved.
 bool g_prof_fast = false;
 namespace pf_fast {
-// 0 emb_norm, 1 loop_bank, 2 input_norm, 3 proj, 4 prep_kv, 5 attn, 6 wo, 7 moe_norm, 8 router_route, 9 experts, 10 combine, 11 head
-constexpr int NPH = 12;
+// 0 emb_norm, 1 loop_bank, 2 input_norm, 3 proj, 4 prep_kv, 5 attn, 6 wo, 7 moe_norm, 8 router_route, 9 experts, 10 combine, 11 head, 12 tail
+// (13, not 12: one_token_launches marks 12 at its end, and acc[] is indexed by the mark.)
+constexpr int NPH = 13;
 const char* const names[NPH] = {"emb_norm", "loop_bank", "input_norm", "proj", "prep_kv", "attn",
-                                "wo", "moe_norm", "router_route", "experts", "combine", "head"};
+                                "wo", "moe_norm", "router_route", "experts", "combine", "head", "tail"};
 // One event per mark, recorded in sequence across the token's 48 visits (a fixed-handle scheme reused the
 // same 13 events every visit and kept only the LAST timestamp, so every phase but one read as ~0 or garbage).
 constexpr int kPfMaxMarks = 1100;
@@ -444,14 +445,17 @@ void finish(cudaStream_t s) {   // (after the token's stream sync: every recorde
     nmark = 0;
     ++ntok;
 }
-void report() {
+void report(FILE* o = stdout) {
     if (!g_prof_fast || !ntok) return;
     double tot = 0.0;
     for (int i = 0; i < NPH; ++i) tot += acc[i];
-    std::printf("\nRESIDENT DECODE PROFILE (%d tokens, %.3f ms/token total):\n", ntok, tot / ntok);
+    std::fprintf(o, "\nRESIDENT DECODE PROFILE (%d tokens, %.3f ms/token total):\n", ntok, tot / ntok);
     for (int i = 0; i < NPH; ++i)
-        std::printf("  %-13s %7.3f ms/token  %5.1f%%\n", names[i], acc[i] / ntok, 100.0 * acc[i] / tot);
-    std::fflush(stdout);
+        std::fprintf(o, "  %-13s %7.3f ms/token  %5.1f%%\n", names[i], acc[i] / ntok, 100.0 * acc[i] / tot);
+    std::fflush(o);
+    // (zeroed so a serve loop reports one request's split at a time; the CLI reports once and exits)
+    for (int i = 0; i < NPH; ++i) acc[i] = 0.0;
+    ntok = 0;
 }
 }  // namespace pf_fast
 bool g_mv = true;   // IK2_MV=0: a few tokens' experts through the FP16 GEMMs too
@@ -1348,7 +1352,8 @@ struct ExpertCache {
                 // leaves little VRAM. Non-INT4 (Q8 decode-critical) pools still need their full per-layer minimum.
                 bool pool_all_int4 = int4_below > 0;
                 for (int l : g.layers) if (l >= int4_below) pool_all_int4 = false;
-                const int min_e = pool_all_int4 ? 2 : std::min(E, (int) g.layers.size() * E);
+                // An INT4 pool may be sized down to 0 slots (see the clamp below): it never has to exist.
+                const int min_e = pool_all_int4 ? 0 : std::min(E, (int) g.layers.size() * E);
                 s += (size_t) min_e * g.sb;
             }
             return s;
@@ -1400,6 +1405,20 @@ struct ExpertCache {
                 size_t iused = 0;
                 for (size_t p = 0; p < pools.size(); ++p)
                     if (is_int4_pool[p]) iused += (size_t) pmin[p] * pools[p].slot_bytes;
+                if (iused > int4_budget) {
+                    // The INT4 pools serve prefill STREAMING only (a resident int4 model reads its i4_* sidecars), so
+                    // they may be as small as 0 slots. Clamp them to what the budget actually leaves instead of the
+                    // E-slot floor: with a larger --prefill the work buffers come first, and the old floor made the
+                    // engine allocate past the budget (or die in the guard above) for a cache nothing reads.
+                    size_t left = int4_budget;
+                    for (size_t p = 0; p < pools.size(); ++p) {
+                        if (!is_int4_pool[p]) { pools[p].n_slots = pmax[p]; continue; }
+                        const int ns = (int) std::min<size_t>((size_t) pmax[p], left / pools[p].slot_bytes);
+                        pools[p].n_slots = ns;
+                        left -= (size_t) ns * pools[p].slot_bytes;
+                    }
+                    goto pools_sized;
+                }
                 size_t irem = int4_budget > iused ? int4_budget - iused : 0;
                 for (size_t p = 0; p < pools.size(); ++p) {
                     if (!is_int4_pool[p]) { pools[p].n_slots = pmax[p]; continue; }
@@ -8367,6 +8386,9 @@ int run(int argc, char** argv) {
                     std::fflush(stderr);
                 }
             }
+            // IK2_PROF_FAST: the resident decode path's phase split for this request. On stderr, because stdout is
+            // the protocol pipe; report() clears the accumulators so each request shows its own split.
+            if (g_prof_fast) pf_fast::report(stderr);
             if (serve_strata) {
                 if (monitor_info) {
                     const uint64_t h = monitor_counts(true), m = monitor_counts(false);
