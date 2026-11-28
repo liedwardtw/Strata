@@ -5592,6 +5592,38 @@ static SpecStats generate_speculative(Model& M, Config& c, ik2::draft::Drafter* 
 
 namespace ik2 {
 
+// Pinned host memory for the conversation cache's snapshots.  A pageable buffer copies at 3-6 GB/s: measured
+// 5.93 GB/s restoring the 452 MB of a 48k-token conversation and 3.17 GB/s parking it, which is most of what a
+// cached turn still costs.  Pinned pages reach 20-25 GB/s on PCIe 4.0 x16.  If the lock fails the allocation
+// falls back to the heap, so a big cache can never kill the engine - it only gets slower.
+template <class T> struct PinAlloc {
+    using value_type = T;
+    PinAlloc() = default;
+    template <class U> PinAlloc(const PinAlloc<U>&) noexcept {}
+    T* allocate(std::size_t n) {
+        if (n == 0) return nullptr;
+        const std::size_t bytes = n * sizeof(T);
+        void* p = nullptr;
+        if (cudaHostAlloc(&p, bytes + 16, cudaHostAllocDefault) == cudaSuccess) {
+            *(std::uint64_t*) p = 0x50494E4E4544ULL;   // "PINNED"
+            return (T*) ((char*) p + 16);
+        }
+        char* q = (char*) std::malloc(bytes + 16);
+        if (!q) throw std::bad_alloc();
+        *(std::uint64_t*) q = 0;
+        return (T*) (q + 16);
+    }
+    void deallocate(T* p, std::size_t) noexcept {
+        if (!p) return;
+        char* q = (char*) p - 16;
+        if (*(std::uint64_t*) q == 0x50494E4E4544ULL) cudaFreeHost(q);
+        else std::free(q);
+    }
+    template <class U> bool operator==(const PinAlloc<U>&) const noexcept { return true; }
+    template <class U> bool operator!=(const PinAlloc<U>&) const noexcept { return false; }
+};
+using PinBytes = std::vector<uint8_t, PinAlloc<uint8_t>>;
+
 int run(int argc, char** argv) {
     std::string model, toks, dump, draft_path;
     int gen = 16, chunk = 2048, ctx = 262144, threads = 8, n_gpu = 1;
@@ -7299,12 +7331,13 @@ int run(int argc, char** argv) {
         // request's prompt (before its generation): an agent's next turn usually agrees with the last one up to
         // there and no further (the model's own reply comes back re-rendered, its thinking dropped), so the state
         // goes back to that point instead of the start. Full-layer KV needs nothing: positions rewrite cleanly.
+
         struct Snap {
             int pos = -1;
             bool full = false;   // batch slot snapshots must park full-attention KV too (different prompts share cells)
             std::vector<float*> h;   // [layer * 4 + conv]
-            std::vector<std::vector<uint8_t>> kv_k, kv_v;
-            std::vector<std::vector<uint8_t>> kv_ks, kv_vs;   // int8/int4: per-head fp16 scales
+            std::vector<PinBytes> kv_k, kv_v;
+            std::vector<PinBytes> kv_ks, kv_vs;   // int8/int4: per-head fp16 scales
             // The tokens this state covers, so it can be matched against a prompt on its own (see the search before
             // a prompt is read): a snapshot is a whole conversation, not a position in whichever one is live now.
             std::vector<int> toks;
@@ -7376,9 +7409,10 @@ int run(int argc, char** argv) {
                 for (int i = 0; i < 4; ++i) sn.h.push_back(dalloc<float>(3 * cc[i]));
                 const bool park_full = full && !Ly.sliding;
                 if ((Ly.sliding && Ly.kv_cap < ctx) || park_full) {
-                    // A full-attention window is the whole context (5 GiB at 640k), so it is sized when the
-                    // conversation is parked (snap_copy grows it); only a batch slot allocates it up front.
-                    const size_t cap = park_full ? (size_t) (eager ? ctx : 0) : (size_t) c.window;
+                    // Sized when the conversation is parked (snap_copy grows it): a full-attention window is as
+                    // long as the conversation, and a sliding one is c.window rows - pinning those up front for
+                    // every slot would lock gigabytes nobody uses yet.  Only a batch slot allocates eagerly.
+                    const size_t cap = eager ? (park_full ? (size_t) ctx : (size_t) c.window) : 0;
                     if (cap > 0) {
                         const size_t bytes = cap * kv_row_b;
                         sn.kv_k[l].resize(bytes);
@@ -7408,7 +7442,7 @@ int run(int argc, char** argv) {
                 const bool park_full = sn.full && !Ly.sliding;
                 if (sn.pos > 0 && ((Ly.sliding && Ly.kv_cap < ctx) || park_full)) {
                     const int w = park_full ? sn.pos : std::min(sn.pos, c.window);
-                    if (park_full && save) {   // (a full-attention window is as long as the conversation: grow to it)
+                    if (save) {   // (grown when the conversation is parked: see alloc_snap)
                         const size_t need = (size_t) w * kv_row_b;
                         if (sn.kv_k[l].size() < need) sn.kv_k[l].resize(need);
                         if (sn.kv_v[l].size() < need) sn.kv_v[l].resize(need);

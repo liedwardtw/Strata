@@ -174,3 +174,18 @@ The rest is the price of reading a *short* chunk. Sent straight to the engine (`
 So a chunk carries a fixed cost of roughly 200-350 ms (48 layer visits of setup and small-kernel launches) plus 0.5-1.0 ms a token, and only a full 7,168-token chunk amortises the fixed part down to the 0.36 ms a token that the prefill table reports. A cached agent turn therefore reaches its first token in about 0.36 s when it adds 17 tokens and about 0.95 s when it adds 1,000 — against 19 s cold. The fixed part is the next lever: it is per chunk, not per token, so it would need the per-visit setup to be amortised across chunks (or a smaller, cheaper visit for short chunks).
 
 `IK2_PF_PROFILE=1` is not the instrument for this. It syncs after every phase, which on a short chunk costs more than the phases it measures: a 17-token cached chunk reported attention 0.13 s plus experts 0.57 s, more than the 0.36 s the request took in total.
+### The snapshot buffers are pinned now (same day)
+
+The four host buffers of a snapshot (kv_k, kv_v and the two scale planes) are std::vector<uint8_t, PinAlloc>: PinAlloc locks the pages with `cudaHostAlloc` and falls back to the heap when the lock fails, so a large cache can never kill the engine, only slow it. The buffers are also sized when a conversation is parked rather than up front, so the 64 slots no longer reserve 2.6 GB of locked pages nobody uses.
+
+Same 48,422-token conversation, same run shape:
+
+| | pageable | pinned |
+|---|---|---|
+| restore 452 MB | 76.3 ms (5.93 GB/s) | **41.2 ms (10.98 GB/s)** |
+| park 454 MB | 143.0 ms (3.17 GB/s) | **120.7 ms (3.75 GB/s)** |
+| cached turn, prompt_ms (turns 2-4) | 409 / 444 / 425 ms | **372 / 360 / 360 ms** |
+
+The restore nearly doubled; the park barely moved, so the park's limit is the device side (or WDDM's staging), not the host pages. A cached turn at 48k tokens is now 0.36-0.37 s against 19 s cold, and the remaining time is the short chunk's own cost (see the table above), not the cache.
+
+Quality unchanged: `quality.py run pinned` 11/11 passed, and the four serve test files pass (39 passed, 3011 subtests).
