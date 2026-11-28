@@ -2617,11 +2617,12 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     // The kernels recompute their own k0 from `window` (attn_split_int_kernel: k0 = qpos0 - window + 1), so the
     // window argument is what actually bounds the walk; the host k0 below must agree with it.
     const int window = Ly.sliding ? c.window
-                                 : ((g_full_window > 0 && T <= 8) ? g_full_window : (1 << 30));
+                                 : ((g_full_window > 0) ? g_full_window : (1 << 30));
     int k0 = Ly.sliding ? std::max(0, pos0 - c.window + 1) : 0;
-    // IK2_FULL_WINDOW: a full-attention layer decoding (T<=8) reads only the last g_full_window keys. The
-    // prompt path (T>8) always reads everything, so prefill still builds the whole KV; only the re-read is cut.
-    if (g_full_window > 0 && !Ly.sliding && T <= 8 && pos0 + 1 > g_full_window) k0 = pos0 - g_full_window + 1;
+    // IK2_FULL_WINDOW: a full-attention layer reads only the last g_full_window keys. Decode (T<=8) and the
+    // prompt pass (T>8) both honour it, so a long prompt no longer walks the whole KV once per chunk - at a
+    // 600K context that walk was 4.9 GB a chunk and the prompt did not finish in ten minutes.
+    if (g_full_window > 0 && !Ly.sliding && pos0 + 1 > g_full_window) k0 = pos0 - g_full_window + 1;
     const int nk = pos0 + T - k0;
     const float one = 1.0f, zero = 0.0f;
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
@@ -2719,7 +2720,8 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                 CB(cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, extent, Tq * c.H, c.d_rel, &one_f, Ly.rel_proj,
                                 CUDA_R_32F, c.d_rel, r_p + (size_t) ts * HR, CUDA_R_32F, c.d_rel, &zero_f, W.relb,
                                 CUDA_R_32F, extent, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
-                const int k_lo = Ly.sliding ? std::max(0, pos0 + ts - c.window + 1) : 0;
+                const int k_lo = Ly.sliding ? std::max(0, pos0 + ts - c.window + 1)
+                                            : (g_full_window > 0 ? std::max(0, pos0 + ts - g_full_window + 1) : 0);
                 const int ns = k::attn_flash_splits(Tq, c.H, pos0 + ts + Tq - k_lo, g_n_sm);
                 if (kv_is_int())
 #if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
