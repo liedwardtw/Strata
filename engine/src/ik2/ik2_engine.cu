@@ -5661,6 +5661,12 @@ int run(int argc, char** argv) {
         return s;
     };
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
+    // IK2_PF_PROFILE: print the prefill breakdown at the end of each served request. The profile block used to
+    // print only on the CLI tail, which cannot read a chunk longer than 4,096 tokens (the prompt is an argument
+    // and Windows caps that at 32,767 characters), so the 8,192-token chunk cliff had no measurement. The phase
+    // timers are gated on g_prof, so this turns it on as well; it costs the fast decode path, not the prefill.
+    const bool g_pf_profile = getenv("IK2_PF_PROFILE") != nullptr;
+    if (g_pf_profile) g_prof = true;
     g_prof_fast = getenv("IK2_PROF_FAST") && std::atoi(getenv("IK2_PROF_FAST"));
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
     g_flash_wmma = !(getenv("IK2_FLASH_WMMA") && !std::atoi(getenv("IK2_FLASH_WMMA")));
@@ -8451,6 +8457,24 @@ int run(int argc, char** argv) {
             // IK2_PROF_FAST: the resident decode path's phase split for this request. On stderr, because stdout is
             // the protocol pipe; report() clears the accumulators so each request shows its own split.
             if (g_prof_fast) pf_fast::report(stderr);
+            // IK2_PF_PROFILE: the prefill breakdown for this request, so a chunk longer than 4,096 tokens can be
+            // measured at all (the CLI prompt is an argument and Windows caps it there). Same lines as the CLI
+            // tail, on stderr because stdout is the protocol pipe, then cleared so each request stands alone.
+            if (g_pf_profile) {
+                const Prof& p = g_pf;
+                std::fprintf(stderr, "strata serve: PREFILL profile: attention %.2f s, router %.2f s, uploads %.2f s,"
+                                     " experts %.2f s, rest %.2f s\n", p.attn, p.route, p.upload, p.experts, p.rest);
+                std::fprintf(stderr, "strata serve: PREFILL moe: host %.2f s, gpu %.2f s (sync %.2f s), calls %d;"
+                                     " branches rg %ld mv %ld pf %ld\n", p.pf_host, p.pf_gpu, p.pf_sync, p.pf_calls,
+                             p.br_rg, p.br_mv, p.br_pf);
+                std::fprintf(stderr, "strata serve: PREFILL run_exp: gather %.3f s, decode_f16 %.3f s, gemm16 %.3f s,"
+                                     " scatter %.3f s\n", p.pf_gather, p.pf_dec, p.pf_gemm, p.pf_scatter);
+                std::fprintf(stderr, "strata serve: PREFILL attn: proj %.3f s, conv %.3f s, QK %.3f s, probs %.3f s,"
+                                     " PV %.3f s, out %.3f s\n", p.a_proj, p.a_conv, p.a_qk, p.a_probs, p.a_pv, p.a_out);
+                std::fprintf(stderr, "strata serve: PREFILL loop_gates %.3f s\n", p.pf_loopgate);
+                std::fflush(stderr);
+                g_pf = Prof();
+            }
             if (serve_strata) {
                 if (monitor_info) {
                     const uint64_t h = monitor_counts(true), m = monitor_counts(false);
