@@ -110,3 +110,13 @@ One caveat on measurement: process to process at 48K the decode rate moves by ±
 | park after `DONE` | 88.74 / 86.70 | 89.21 / 87.41 |
 
 The park now runs after `DONE` is printed and the timer is taken before it, so the reported speed is the decode's own and the client gets the reply ~80 ms earlier. The copy still happens; the next request pays for it before its first token, which is where it belongs, because a cold read of the same conversation costs 18.5 s.
+
+## The prefill ceiling, and why 4,000 tok/s is not reachable on this kernel shape (2026-11-29)
+
+Measured with chunk 7,168, INT4 KV, every expert resident, two reps each: **2,954 tok/s at 16,384 tokens** (2,843 / 3,066), **2,613-2,649 at 44,288**, **2,483 at 600,000** (with `IK2_FULL_WINDOW=32768`).
+
+The environment space is exhausted. At a 44,288-token prompt, one full read each, against a 2,613 baseline: `IK2_FLASH_NW=16` 2,490, `=4` 2,512, `IK2_FLASH_BN=64` 2,530, `IK2_ATTN_GQA=0` 2,609, `IK2_EXPERTS_PREFILL_WMMA=1` 2,605, `IK2_INT4_PREFILL=1` 2,582, `IK2_GATE_FUSE=0` 2,596, `IK2_RMS_FUSE=0` 2,602 — all inside the ±12% run-to-run noise. `--threads 8 / 16 / 32` gives 2,605.0 / 2,605.5 / 2,609.9, so the host is not the limit either.
+
+The phase profile (read the shares, not the absolute times: `IK2_PF_PROFILE=1` syncs after every phase and costs 19%, 2,152 vs 2,649 tok/s) splits a 4,096-token chunk into attention 1.03 s (projections 0.618, output 0.313), experts 1.21 s (gather 0.393, gemm16 0.546, scatter 0.118), loop gates 0.244 s and router 0.03 s.
+
+That is ~8.4 TFLOP of projection work and ~0.52 TFLOP of expert work per chunk. The projections run at ~13.5 TFLOPS, 21% of the card's 61 TFLOPS fp16 peak; the experts run at ~1 TFLOPS because the prefill MoE is 128 small GEMMs of ~256 rows each. Reaching 4,000 tok/s needs both of those to more than double, which is a rewrite of the INT4 GEMM and of the expert loop — not a switch, a chunk size or a thread count.
