@@ -101,3 +101,12 @@ The numbers to trust are end to end with the graph on: **112 tok/s at a 64-token
 That table also settles what the window is for. At 48K, cutting the keys 6x (`IK2_FULL_WINDOW=8192`) moves attention from 5.668 to 4.108 ms and the token from 15.098 to 14.226 (−5.8%): at this depth the attention is not key-bound, so the window only pays where it removes most of the keys. At 393K it does (13.5 -> 95.7 tok/s); at 48K it does not, and the conversation cache is the lever there instead.
 
 One caveat on measurement: process to process at 48K the decode rate moves by ±20% (62.4 in one run, 49-51 in another with the same config). Single samples at that depth mean nothing; only interleaved paired runs do.
+
+**The park was inside the decode timer.** At a 48K conversation the conversation cache copies 405 MB of full-attention KV to host RAM after every reply. That copy sat between the last token and the `DONE` line, and the decode timer read `now()` after it, so a request that decoded at 89 tok/s reported 64. Two reps each, single stream, greedy, 32 tokens:
+
+| 48K, 32 tokens | cache on | cache off |
+| --- | --- | --- |
+| park before `DONE` | 64.08 / 56.98 | 89.36 / 87.29 |
+| park after `DONE` | 88.74 / 86.70 | 89.21 / 87.41 |
+
+The park now runs after `DONE` is printed and the timer is taken before it, so the reported speed is the decode's own and the client gets the reply ~80 ms earlier. The copy still happens; the next request pays for it before its first token, which is where it belongs, because a cold read of the same conversation costs 18.5 s.

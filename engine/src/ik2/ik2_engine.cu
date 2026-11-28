@@ -8444,16 +8444,11 @@ int run(int argc, char** argv) {
                 }
                 hist.push_back(tok);
             }
-            // The state at the end of the reply as well: a client that sends the assistant's message back verbatim,
-            // or a tool call echoed into the next turn, then finds the reply's own tokens already read.
-            if (hist.size() > ids.size()) {
-                const int parked = park_state(hist, hist_sig);
-                if (serve_strata && parked > 0) {
-                    std::fprintf(stderr, "strata serve: conversation cache: parked %d tokens; parked=%d bytes=%zu\n",
-                                 parked, count_parked(), conv_host_bytes);
-                    std::fflush(stderr);
-                }
-            }
+            // The state at the end of the reply is parked as well: a client that sends the assistant's message back
+            // verbatim, or a tool call echoed into the next turn, then finds the reply's own tokens already read.
+            // It happens AFTER the DONE line below, not before it: at a 48K conversation the copy is ~405 MB and it
+            // used to sit inside the decode timer, which read 64 tok/s where the decode itself ran at 89.
+            const double t_done = now();
             // IK2_PROF_FAST: the resident decode path's phase split for this request. On stderr, because stdout is
             // the protocol pipe; report() clears the accumulators so each request shows its own split.
             if (g_prof_fast) pf_fast::report(stderr);
@@ -8481,15 +8476,23 @@ int run(int argc, char** argv) {
                     const uint64_t dh = h > monitor_h0 ? h - monitor_h0 : 0;
                     const uint64_t dm = m > monitor_m0 ? m - monitor_m0 : 0;
                     std::printf("DONE %d %zu %.1f %.1f %s 0 0 %d %llu %llu\n", n_out, ids.size(), (t1 - t0) * 1e3,
-                                (now() - t1) * 1e3, std::strcmp(reason, "cancelled") == 0 ? "cancel" : reason, cached,
+                                (t_done - t1) * 1e3, std::strcmp(reason, "cancelled") == 0 ? "cancel" : reason, cached,
                                 (unsigned long long) dh, (unsigned long long) (dh + dm));
                 } else {
                     std::printf("DONE %d %zu %.1f %.1f %s 0 0 %d\n", n_out, ids.size(), (t1 - t0) * 1e3,
-                                (now() - t1) * 1e3, std::strcmp(reason, "cancelled") == 0 ? "cancel" : reason, cached);
+                                (t_done - t1) * 1e3, std::strcmp(reason, "cancelled") == 0 ? "cancel" : reason, cached);
                 }
             } else
-                std::printf("@END %s %zu %d %.3f %.3f\n", reason, ids.size(), cached, t1 - t0, now() - t1);
+                std::printf("@END %s %zu %d %.3f %.3f\n", reason, ids.size(), cached, t1 - t0, t_done - t1);
             std::fflush(stdout);
+            if (hist.size() > ids.size()) {
+                const int parked = park_state(hist, hist_sig);
+                if (serve_strata && parked > 0) {
+                    std::fprintf(stderr, "strata serve: conversation cache: parked %d tokens; parked=%d bytes=%zu\n",
+                                 parked, count_parked(), conv_host_bytes);
+                    std::fflush(stderr);
+                }
+            }
             busy = false;
         }
         return 0;
