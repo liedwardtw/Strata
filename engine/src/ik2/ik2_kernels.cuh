@@ -614,13 +614,20 @@ void attn_decode_int_wideload(int bits, const float* q, const float* r, const fl
 void attn_decode_int_at(int bits, const float* q, const float* r, const float* sink, const uint8_t* kci,
                         const uint8_t* vci, const uint16_t* ks, const uint16_t* vs, int kv_cap, int H, int Hkv,
                         const int* pos, int P, float qk_scale, const float* proj, int d_rel, int extent, int window,
-                        float* scratch, float* out, cudaStream_t s, const float* gate = nullptr);
+                        float* scratch, float* out, cudaStream_t s, const float* gate = nullptr, int fa_split = 0,
+                        int rdna3_mask = -1);
+/// IK2_FA_SPLIT opt-in: fa_split > 0 forces the coalesced 8-byte int4 row load (same exact values, fewer
+/// load instructions); < 0 forces the legacy 2-byte-per-lane path; 0 follows the IK2_FA_SPLIT env var
+/// (default 0 = byte-identical legacy).  int8 always uses the legacy path.
+/// IK2_FA_RDNA3 opt-in bitmask (rdna3_mask; -1 follows the env, default 0 = byte-identical):
+///   bit0 (1) wave-balanced P, bit1 (2) PRE_LOAD_V, bit2 (4) wideload, bit3 (8) exp2/merge relax.
 /// IK2_ATTN_DPP: same split grid / 2-byte per lane loads as attn_decode_int_at; only int4, with the 5-step
 /// shfl_xor warp sum replaced by bit-identical RDNA3 DPP row_xmask + permlanex16 xor exchanges.
 void attn_decode_int_at_dpp(int bits, const float* q, const float* r, const float* sink, const uint8_t* kci,
                             const uint8_t* vci, const uint16_t* ks, const uint16_t* vs, int kv_cap, int H, int Hkv,
                             const int* pos, int P, float qk_scale, const float* proj, int d_rel, int extent, int window,
-                            float* scratch, float* out, cudaStream_t s, const float* gate = nullptr);
+                            float* scratch, float* out, cudaStream_t s, const float* gate = nullptr,
+                            int rdna3_mask = -1);
 /// IK2_ATTN_GQA: GQA-shared int decode split kernel - grid (Hkv, P, 1) so the R = H/Hkv = 3 query heads of a KV
 /// head share each K/V row.  Writes the same [H,P,130] partials and reuses the same combine kernel; bit-exact
 /// to attn_decode_int_at.  Falls back to the original path unless H % Hkv == 0 and H / Hkv == 3.  dpp selects
@@ -628,12 +635,14 @@ void attn_decode_int_at_dpp(int bits, const float* q, const float* r, const floa
 void attn_decode_int_at_gqa(int bits, const float* q, const float* r, const float* sink, const uint8_t* kci,
                             const uint8_t* vci, const uint16_t* ks, const uint16_t* vs, int kv_cap, int H, int Hkv,
                             const int* pos, int P, float qk_scale, const float* proj, int d_rel, int extent, int window,
-                            float* scratch, float* out, cudaStream_t s, const float* gate = nullptr, int dpp = 0);
+                            float* scratch, float* out, cudaStream_t s, const float* gate = nullptr, int dpp = 0,
+                            int fa_split = 0, int rdna3_mask = -1);
 /// Non-graph (host k0 / nk / qpos) counterpart of attn_decode_int_at_gqa.
 void attn_decode_int_gqa(int bits, const float* q, const float* r, const float* sink, const uint8_t* kci,
                          const uint8_t* vci, const uint16_t* ks, const uint16_t* vs, int kv_cap, int H, int Hkv, int D,
                          int k0, int nk, int qpos, float qk_scale, const float* proj, int d_rel, int extent, int window,
-                         float* scratch, float* out, cudaStream_t s, int dpp = 0);
+                         float* scratch, float* out, cudaStream_t s, int dpp = 0, int fa_split = 0,
+                         int rdna3_mask = -1);
 
 /// True batched decode attention: n_rows queries on different slots in one launch.  kci_tab/vci_tab/ks_tab/vs_tab
 /// are DEVICE arrays of n_rows K/V pointers; pos is a DEVICE int[n_rows].  Partials [n_rows,H,P,130] reuse the

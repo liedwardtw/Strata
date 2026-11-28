@@ -3260,6 +3260,118 @@ void test_batch_conv_rows() {
     }
 }
 
+// IK2_FA_SPLIT (opt-in): the coalesced 8-byte int4 row load must deliver the same values as the legacy
+// 2-byte-per-lane load in both the plain and the GQA-shared split kernels.  fa_split=-1 forces legacy,
+// +1 forces the FA path, independently of the IK2_FA_SPLIT environment variable.
+void test_fa_split() {
+    const int H = 24, KV = 8, D = 128, d_rel = 16, cb = D / 2, ctx = 256, P = 32;
+    const float scale = 1.0f / std::sqrt((float) D);
+    auto q = fvec((size_t) H * D, 1.5f), r = fvec((size_t) H * d_rel, 1.0f),
+         sink = fvec(H, 2.0f), proj = fvec((size_t) 1024 * d_rel);
+    std::vector<int> pos_h(1, ctx - 1);
+    int* dpos = dev(pos_h);
+    float *dq = dev(q), *dr = dev(r), *ds = dev(sink), *dp = dev(proj);
+    std::vector<uint8_t> hkc((size_t) ctx * KV * cb), hvc((size_t) ctx * KV * cb);
+    std::vector<uint16_t> hks((size_t) ctx * KV), hvs((size_t) ctx * KV);
+    for (size_t i = 0; i < hkc.size(); ++i) hkc[i] = (uint8_t) (rng() & 0xFFu);
+    for (size_t i = 0; i < hvc.size(); ++i) hvc[i] = (uint8_t) (rng() & 0xFFu);
+    for (size_t i = 0; i < hks.size(); ++i) {
+        hks[i] = f2h_host(frand(0.5f));
+        hvs[i] = f2h_host(frand(0.5f));
+    }
+    uint8_t *dkc = dev(hkc), *dvc = dev(hvc);
+    uint16_t *dks = dev(hks), *dvs = dev(hvs);
+    const size_t n = (size_t) H * D;
+    float *scratch = dev_n<float>((size_t) H * P * 130);
+    float *out0 = dev_n<float>(n), *out1 = dev_n<float>(n);
+    double worst = 0.0;
+    size_t nonfinite = 0;
+    auto run = [&](bool gqa, int fa, float* out) {
+        if (gqa)
+            k::attn_decode_int_at_gqa(4, dq, dr, ds, dkc, dvc, dks, dvs, ctx, H, KV, dpos, P, scale, dp, d_rel,
+                                      1024, 1 << 30, scratch, out, 0, nullptr, 0, fa);
+        else
+            k::attn_decode_int_at(4, dq, dr, ds, dkc, dvc, dks, dvs, ctx, H, KV, dpos, P, scale, dp, d_rel, 1024,
+                                  1 << 30, scratch, out, 0, nullptr, fa);
+    };
+    for (int gqa = 0; gqa < 2; ++gqa) {
+        run(gqa != 0, -1, out0);
+        const auto a = host(out0, n);
+        run(gqa != 0, 1, out1);
+        const auto b = host(out1, n);
+        for (size_t i = 0; i < n; ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) ++nonfinite;
+            worst = std::max(worst, (double) std::fabs(a[i] - b[i]));
+        }
+    }
+    std::printf("IK2_FA_SPLIT worst-abs-diff %.9g over %zu values (plain + GQA), non-finite %zu\n", worst, n * 2,
+                nonfinite);
+    expect_true("IK2_FA_SPLIT no NaN / non-finite", nonfinite == 0);
+    expect_true("IK2_FA_SPLIT values preserved", worst <= 1e-5);
+    for (float* p : {dq, dr, ds, dp, scratch, out0, out1}) cudaFree(p);
+    cudaFree(dpos);
+    cudaFree(dkc); cudaFree(dvc); cudaFree(dks); cudaFree(dvs);
+}
+
+// IK2_FA_RDNA3 opt-in bitmask: each bit is compared against mask 0 (the exact original numerics) on
+// synthetic int4 KV, in both the plain and the GQA-shared split decode kernels.  rdna3_mask is passed
+// explicitly instead of toggling the environment, so the test is independent of the caller's shell.
+void test_fa_rdna3() {
+    const int H = 24, KV = 8, D = 128, d_rel = 16, cb = D / 2, ctx = 256, P = 4;
+    const float scale = 1.0f / std::sqrt((float) D);
+    auto q = fvec((size_t) H * D, 1.5f), r = fvec((size_t) H * d_rel, 1.0f),
+         sink = fvec(H, 2.0f), proj = fvec((size_t) 1024 * d_rel);
+    std::vector<int> pos_h(1, ctx - 1);
+    int* dpos = dev(pos_h);
+    float *dq = dev(q), *dr = dev(r), *ds = dev(sink), *dp = dev(proj);
+    std::vector<uint8_t> hkc((size_t) ctx * KV * cb), hvc((size_t) ctx * KV * cb);
+    std::vector<uint16_t> hks((size_t) ctx * KV), hvs((size_t) ctx * KV);
+    for (size_t i = 0; i < hkc.size(); ++i) hkc[i] = (uint8_t) (rng() & 0xFFu);
+    for (size_t i = 0; i < hvc.size(); ++i) hvc[i] = (uint8_t) (rng() & 0xFFu);
+    for (size_t i = 0; i < hks.size(); ++i) {
+        hks[i] = f2h_host(frand(0.5f));
+        hvs[i] = f2h_host(frand(0.5f));
+    }
+    uint8_t *dkc = dev(hkc), *dvc = dev(hvc);
+    uint16_t *dks = dev(hks), *dvs = dev(hvs);
+    const size_t n = (size_t) H * D;
+    // bit0 may enlarge P (GQA: 4 -> 6 on 48 WGP); 128 is the kernel's cap.
+    float *scratch = dev_n<float>((size_t) H * 128 * 130);
+    float *out0 = dev_n<float>(n), *out1 = dev_n<float>(n);
+    auto run = [&](bool gqa, int mask, float* out) {
+        if (gqa)
+            k::attn_decode_int_at_gqa(4, dq, dr, ds, dkc, dvc, dks, dvs, ctx, H, KV, dpos, P, scale, dp, d_rel,
+                                      1024, 1 << 30, scratch, out, 0, nullptr, 0, -1, mask);
+        else
+            k::attn_decode_int_at(4, dq, dr, ds, dkc, dvc, dks, dvs, ctx, H, KV, dpos, P, scale, dp, d_rel, 1024,
+                                  1 << 30, scratch, out, 0, nullptr, -1, mask);
+    };
+    const char* names[4] = {"WAVE_P", "PRE_LOAD_V", "WIDELOAD", "EXP2"};
+    double worst[4] = {0.0, 0.0, 0.0, 0.0};
+    size_t nonfinite = 0;
+    for (int bit = 0; bit < 4; ++bit) {
+        for (int gqa = 0; gqa < 2; ++gqa) {
+            run(gqa != 0, 0, out0);
+            const auto a = host(out0, n);
+            run(gqa != 0, 1 << bit, out1);
+            const auto b = host(out1, n);
+            for (size_t i = 0; i < n; ++i) {
+                if (!std::isfinite(a[i]) || !std::isfinite(b[i])) ++nonfinite;
+                worst[bit] = std::max(worst[bit], (double) std::fabs(a[i] - b[i]));
+            }
+        }
+        std::printf("IK2_FA_RDNA3 bit%d %-11s worst-abs-diff %.9g\n", bit, names[bit], worst[bit]);
+    }
+    expect_true("IK2_FA_RDNA3 no NaN / non-finite", nonfinite == 0);
+    expect_true("IK2_FA_RDNA3 bit1 PRE_LOAD_V bit-exact", worst[1] == 0.0);
+    expect_true("IK2_FA_RDNA3 bit0 wave-balanced P sane", worst[0] <= 1e-3);
+    expect_true("IK2_FA_RDNA3 bit2 wideload sane", worst[2] <= 1e-3);
+    expect_true("IK2_FA_RDNA3 bit3 exp2/merge sane", worst[3] <= 1e-1);
+    for (float* p : {dq, dr, ds, dp, scratch, out0, out1}) cudaFree(p);
+    cudaFree(dpos);
+    cudaFree(dkc); cudaFree(dvc); cudaFree(dks); cudaFree(dvs);
+}
+
 int main() {
     int dev_count = 0;
     CU(cudaGetDeviceCount(&dev_count));
@@ -3297,6 +3409,8 @@ int main() {
     test_int4_dense_rot_rows();
     test_batch_rows();
     test_batch_rows_gqa();
+    test_fa_split();
+    test_fa_rdna3();
     test_batch_prep_rows();
     test_batch_conv_rows();
 #if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
