@@ -69,3 +69,35 @@ Two changes got there. The conversation park copied the full-attention KV to hos
 At the 48K the agent traffic actually runs at, the conversation cache is the lever that matters: a second turn reuses 48,422 tokens and reads the prompt in 446 ms instead of 18,830 ms (42x), and an unrelated request in between does not evict it.
 **A 600K prompt now reads at all.** Without the window the eight full-attention visits walk the whole KV once per chunk, so prefill is O(ctx^2): a 600,000-token prompt was still running after ten minutes and was killed twice. `IK2_FULL_WINDOW=32768` now applies to the prompt pass as well as decode, and the same prompt reads in 241.6 s (2,483 tok/s, 84 chunk passes, 4 generated tokens). The KV is still built in full; only the re-read is bounded, so nothing older than the window is available to the model, which is the same loss decode already took. Measured on this build with `ik2bench.py --tokens 600000`; the 11-case quality set still passes 11/11 with the window on, and at 48K the window is worth only 2,613 -> 2,757 tok/s because the full visits are a small share of the work there.
 **The 8,192-token chunk cliff is VRAM paging, not an algorithm.** Chunk 7,168 reads a 44K prompt at 2,613 tok/s and chunk 8,192 at 1,435. `IK2_PF_PROFILE=1` (new: the prefill breakdown at the end of each served request, because the CLI cannot take a prompt longer than 4,096 tokens) shows where it goes at a 640K context: `loop_gates` 0.545 -> 5.755 s and `attn proj` 1.253 -> 5.202 s, while the tiled MoE phases get *faster* (gather 1.184 -> 0.868 s, gemm16 flat). The two phases that collapse are the ones streaming the largest scratch buffers. At a 32K context the same chunk 8,192 is faster than 7,168 (2,463 vs 2,276 tok/s), so the cliff is the 640K config sitting ~0.6 GiB from the VRAM budget. Consequence: a context the workload does not need costs speed. Paired, interleaved, 2 rounds at a 44,288-token prompt: ctx 655360 + chunk 7168 -> 2,610 / 2,621 tok/s; ctx 131072 + chunk 10240 -> 2,706 / 2,705 (+3.4%). `start-daily.ps1` now takes `-Ctx` and `-Chunk`, defaulting to the 640K pair.
+
+## What the decode profile can and cannot tell you (2026-11-29)
+
+A 48K prompt, one stream, greedy, 24 tokens, `ik2dec.py --tokens 48000 --gen 24 --env IK2_PROF_FAST=1 --env IK2_GRAPH=0`:
+
+| phase | ms a token | share |
+| --- | --- | --- |
+| attn | 5.444 | 37.3% |
+| experts | 3.189 | 21.8% |
+| proj | 1.385 | 9.5% |
+| input_norm | 1.008 | 6.9% |
+| router_route | 0.851 | 5.8% |
+| moe_norm | 0.779 | 5.3% |
+| wo | 0.587 | 4.0% |
+| loop_bank | 0.544 | 3.7% |
+| head | 0.304 | 2.1% |
+| prep_kv | 0.247 | 1.7% |
+| combine | 0.163 | 1.1% |
+| emb_norm | 0.104 | 0.7% |
+| **total** | **14.604** | |
+
+The same profile at a 2,048-token prompt reads 12.487 ms a token with `attn` at 3.336. So attention carries **3.34 ms that does not depend on the context at all** and only 2.1 ms that does (48K minus 2K).
+
+That 3.34 ms is not GPU work. It is the launch cost of 48 layer visits x ~16 kernels x ~4 us, and the CUDA graph removes it: the same engine at a 64-token prompt decodes **112 tok/s with the graph and 82 tok/s without** (8.9 vs 12.1 ms a token), and the 3.2 ms difference is exactly the fixed part of the profile.
+
+So the graph-off profile is only readable for the phases that scale with real work (attention over the context, the MoE, the head). Every small per-visit phase — the two norms, `prep_kv`, `combine`, `wo`, `loop_bank` — reads 10-20x its true cost, because with the graph off each of those launches is a real host launch. And the graph-on profile cannot be taken at all: `IK2_PROF_FAST` events never fire inside a captured graph, so every phase reads 0.000 with `IK2_GRAPH=1`.
+
+The numbers to trust are end to end with the graph on: **112 tok/s at a 64-token prompt, 89 at 8K, 62 at 48K, 96 at 393K with `IK2_FULL_WINDOW=32768`**.
+
+That table also settles what the window is for. At 48K, cutting the keys 6x (`IK2_FULL_WINDOW=8192`) moves attention from 5.668 to 4.108 ms and the token from 15.098 to 14.226 (−5.8%): at this depth the attention is not key-bound, so the window only pays where it removes most of the keys. At 393K it does (13.5 -> 95.7 tok/s); at 48K it does not, and the conversation cache is the lever there instead.
+
+One caveat on measurement: process to process at 48K the decode rate moves by ±20% (62.4 in one run, 49-51 in another with the same config). Single samples at that depth mean nothing; only interleaved paired runs do.
