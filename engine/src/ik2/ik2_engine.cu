@@ -7244,6 +7244,10 @@ int run(int argc, char** argv) {
             std::vector<float*> h;   // [layer * 4 + conv]
             std::vector<std::vector<uint8_t>> kv_k, kv_v;
             std::vector<std::vector<uint8_t>> kv_ks, kv_vs;   // int8/int4: per-head fp16 scales
+            // The tokens this state covers, so it can be matched against a prompt on its own (see the search before
+            // a prompt is read): a snapshot is a whole conversation, not a position in whichever one is live now.
+            std::vector<int> toks;
+            std::vector<uint64_t> sigs;
         };
         const size_t kv_elem_b = g_kv_fp8 ? 1 : 2;
         // Per-token KV row bytes.  For INT4 the old `KD * bits / 8` was computed as `KD * (bits/8)` = 0,
@@ -7256,16 +7260,26 @@ int run(int argc, char** argv) {
         // KV) so an agent's next turn reuses the shared prefix instead of re-running it. The number of snapshots is
         // sized to fit the budget; more snapshots = more concurrent conversations parked.
         const size_t conv_cache_mib = getenv("IK2_CONV_CACHE_MIB") ? (size_t) std::atof(getenv("IK2_CONV_CACHE_MIB")) : 8192;
-        const bool conv_cache_full = getenv("IK2_CONV_CACHE_FULL") && std::atoi(getenv("IK2_CONV_CACHE_FULL"));
+        // The full-attention KV (8 layers of 8 KV heads x 128 x 2 bytes = 8 KiB a token on this model) is what makes
+        // a parked conversation worth going back to: without it the state only answers for the tokens the device
+        // happens to hold, so any request that shares just the opening tokens - an agent's title or summary call
+        // between two turns - left every snapshot unusable and the whole prompt was read again.  It is sized per
+        // conversation when that conversation is parked (park_state below), not for the whole context up front, so
+        // this is on by default; IK2_CONV_CACHE_FULL=0 turns it off.
+        const bool conv_cache_full = !getenv("IK2_CONV_CACHE_FULL") || std::atoi(getenv("IK2_CONV_CACHE_FULL")) != 0;
         size_t snap_bytes = 0;   // host bytes per snapshot (sliding KV + scales; conv histories are VRAM)
         size_t batch_snap_bytes = 0;   // a batch slot must restore full-attention KV of a different prompt
+        size_t full_row_b = 0;   // host bytes a token takes in every full-attention layer (K and V)
         for (size_t l = 0; l < M.V.size(); ++l) {
             const Layer& Ly = bind_visit(M, (int) l);
-            const bool park_full = conv_cache_full && !Ly.sliding;
-            if ((Ly.sliding && Ly.kv_cap < ctx) || park_full) {
-                const size_t cap = park_full ? (size_t) ctx : (size_t) c.window;
+            if (Ly.sliding && Ly.kv_cap < ctx) {
+                const size_t cap = (size_t) c.window;
                 snap_bytes += 2 * cap * kv_row_b;
                 if (kv_is_int()) snap_bytes += 2 * cap * c.KV * 2;
+            }
+            if (!Ly.sliding) {
+                full_row_b += 2 * kv_row_b;
+                if (kv_is_int()) full_row_b += 2 * (size_t) c.KV * 2;
             }
             const bool batch_full = !Ly.sliding;
             if ((Ly.sliding && Ly.kv_cap < ctx) || batch_full) {
@@ -7275,11 +7289,17 @@ int run(int argc, char** argv) {
             }
         }
         int n_snaps = 8;
+        // The slot count follows the sliding part alone (small and fixed); the full-attention KV of a parked
+        // conversation grows with that conversation and is charged to the same budget as it is written.
         if (snap_bytes > 0) n_snaps = (int) std::max<size_t>(1, std::min<size_t>(64, (conv_cache_mib << 20) / snap_bytes));
-        std::printf("conversation cache: %zu MiB budget, %d snapshots of %.1f MiB host RAM (%s)\n",
-                    conv_cache_mib, n_snaps, snap_bytes / 1048576.0, conv_cache_full ? "full KV" : "sliding KV");
+        size_t conv_full_budget = conv_cache_mib << 20;
+        const size_t conv_fixed_bytes = snap_bytes * (size_t) n_snaps;
+        conv_full_budget = conv_fixed_bytes < conv_full_budget ? conv_full_budget - conv_fixed_bytes : 0;
+        std::printf("conversation cache: %zu MiB budget, %d snapshots of %.1f MiB host RAM (%s, %.1f KiB a token)\n",
+                    conv_cache_mib, n_snaps, snap_bytes / 1048576.0,
+                    conv_cache_full ? "sliding + full-attention KV" : "sliding KV", full_row_b / 1024.0);
         std::fflush(stdout);
-        auto alloc_snap = [&](Snap& sn, bool full) {
+        auto alloc_snap = [&](Snap& sn, bool full, bool eager) {
             sn.full = full;
             sn.kv_k.resize(M.V.size());
             sn.kv_v.resize(M.V.size());
@@ -7292,19 +7312,23 @@ int run(int argc, char** argv) {
                 for (int i = 0; i < 4; ++i) sn.h.push_back(dalloc<float>(3 * cc[i]));
                 const bool park_full = full && !Ly.sliding;
                 if ((Ly.sliding && Ly.kv_cap < ctx) || park_full) {
-                    const size_t cap = park_full ? (size_t) ctx : (size_t) c.window;
-                    const size_t bytes = cap * kv_row_b;
-                    sn.kv_k[l].resize(bytes);
-                    sn.kv_v[l].resize(bytes);
-                    if (kv_is_int()) {
-                        sn.kv_ks[l].resize(cap * c.KV * 2);
-                        sn.kv_vs[l].resize(cap * c.KV * 2);
+                    // A full-attention window is the whole context (5 GiB at 640k), so it is sized when the
+                    // conversation is parked (snap_copy grows it); only a batch slot allocates it up front.
+                    const size_t cap = park_full ? (size_t) (eager ? ctx : 0) : (size_t) c.window;
+                    if (cap > 0) {
+                        const size_t bytes = cap * kv_row_b;
+                        sn.kv_k[l].resize(bytes);
+                        sn.kv_v[l].resize(bytes);
+                        if (kv_is_int()) {
+                            sn.kv_ks[l].resize(cap * c.KV * 2);
+                            sn.kv_vs[l].resize(cap * c.KV * 2);
+                        }
                     }
                 }
             }
         };
         std::vector<Snap> snaps(n_snaps);
-        for (auto& sn : snaps) alloc_snap(sn, conv_cache_full);
+        for (auto& sn : snaps) alloc_snap(sn, conv_cache_full, false);
         int snap_next = 0;
         auto snap_copy = [&](Snap& sn, bool save) {
             const size_t cc[4] = {KD, KD, C, C};
@@ -7320,6 +7344,16 @@ int run(int argc, char** argv) {
                 const bool park_full = sn.full && !Ly.sliding;
                 if (sn.pos > 0 && ((Ly.sliding && Ly.kv_cap < ctx) || park_full)) {
                     const int w = park_full ? sn.pos : std::min(sn.pos, c.window);
+                    if (park_full && save) {   // (a full-attention window is as long as the conversation: grow to it)
+                        const size_t need = (size_t) w * kv_row_b;
+                        if (sn.kv_k[l].size() < need) sn.kv_k[l].resize(need);
+                        if (sn.kv_v[l].size() < need) sn.kv_v[l].resize(need);
+                        if (kv_is_int()) {
+                            const size_t sneed = (size_t) w * c.KV * 2;
+                            if (sn.kv_ks[l].size() < sneed) sn.kv_ks[l].resize(sneed);
+                            if (sn.kv_vs[l].size() < sneed) sn.kv_vs[l].resize(sneed);
+                        }
+                    }
                     const int k_start = sn.pos - w;
                     const int s0 = k_start % Ly.kv_cap;
                     const int n1 = std::min(w, Ly.kv_cap - s0);
@@ -7347,8 +7381,60 @@ int run(int argc, char** argv) {
             }
             for (auto& D : g_dev) CU(cudaStreamSynchronize(D.s));
         };
+        // What the parked conversations hold in host RAM right now (a conversation's full-attention KV grows with it).
+        size_t conv_host_bytes = 0;
+        auto snap_host = [&](const Snap& sn) {
+            size_t b = 0;
+            for (const auto& v : sn.kv_k) b += v.size();
+            for (const auto& v : sn.kv_v) b += v.size();
+            for (const auto& v : sn.kv_ks) b += v.size();
+            for (const auto& v : sn.kv_vs) b += v.size();
+            return b;
+        };
+        auto count_parked = [&]() {
+            int n = 0;
+            for (const auto& sn : snaps) if (sn.pos > 0) ++n;
+            return n;
+        };
+        // Park the live state - the tokens it covers, its conv histories, its sliding windows and, with the
+        // conversation cache on, its full-attention KV - so a later prompt that begins with those tokens goes back to
+        // it instead of reading them again.  The device holds one state at a time, so this copy is the only one; when
+        // the budget is full the least useful parked conversation (the one with the fewest tokens) makes room.
+        // Returns the tokens parked, 0 when this one did not fit.
+        auto park_state = [&](const std::vector<int>& toks, const std::vector<uint64_t>& sigs) -> int {
+            if (snaps.empty() || toks.empty()) return 0;
+            const size_t need = conv_cache_full ? toks.size() * full_row_b : 0;
+            while (conv_host_bytes + need > conv_full_budget) {
+                int victim = -1;
+                for (int i = 0; i < (int) snaps.size(); ++i)
+                    if (snaps[i].pos > 0 && (victim < 0 || snaps[i].pos < snaps[victim].pos)) victim = i;
+                if (victim < 0 || snaps[victim].pos > (int) toks.size()) break;   // (nothing worth giving up)
+                conv_host_bytes -= snap_host(snaps[victim]);
+                for (size_t l = 0; l < snaps[victim].kv_k.size(); ++l) {
+                    if (bind_visit(M, (int) l).sliding) continue;   // (the sliding windows are preallocated: keep them)
+                    snaps[victim].kv_k[l] = {};
+                    snaps[victim].kv_v[l] = {};
+                    snaps[victim].kv_ks[l] = {};
+                    snaps[victim].kv_vs[l] = {};
+                }
+                snaps[victim].toks.clear();
+                snaps[victim].sigs.clear();
+                snaps[victim].pos = -1;
+            }
+            if (conv_host_bytes + need > conv_full_budget) return 0;
+            Snap& sn = snaps[snap_next];
+            snap_next = (snap_next + 1) % (int) snaps.size();
+            conv_host_bytes -= snap_host(sn);
+            sn.toks = toks;
+            sn.sigs = sigs;
+            sn.pos = (int) toks.size();
+            snap_copy(sn, true);
+            conv_host_bytes += snap_host(sn);
+            return sn.pos;
+        };
         auto reset = [&]() {
-            for (auto& sn : snaps) sn.pos = -1;
+            // (the parked conversations stay: a snapshot carries its own tokens and KV, so it no longer depends on
+            // what the device holds - which is why one prompt that matches nothing must not throw the cache away)
             for (int vis = 0; vis < (int) M.V.size(); ++vis) {
                 Layer& Ly = bind_visit(M, vis);
                 use_dev(Ly.dev);
@@ -7434,7 +7520,7 @@ int run(int argc, char** argv) {
             reqs.resize(g_parallel);
             for (int b = 0; b < g_parallel; ++b) {
                 reqs[b].slot = b;
-                alloc_snap(reqs[b].state, true);
+                alloc_snap(reqs[b].state, true, true);
             }
         }
         // Sampling, shared by the solo path and the batch scheduler. Parameterized so the solo path keeps its
@@ -8072,40 +8158,47 @@ int run(int argc, char** argv) {
             size_t L = 0;   // (a picture's position is the same only with the same rows: its hash beside its token)
             auto hsig = [&](size_t i) { return i < hist_sig.size() ? hist_sig[i] : (uint64_t) 0; };
             while (L < hist.size() && L < ids.size() && hist[L] == ids[L] && hsig(L) == sig[L]) ++L;
-            if (L < hist.size() || L == ids.size()) {
-                // back to the latest snapshot at or before L that leaves a token to run (one past it is dropped:
-                // its position's state follows from a prefix the request does not share)
-                int best = -1;
-                for (int i = 0; i < (int) snaps.size(); ++i)
-                    if (snaps[i].pos >= 0 && snaps[i].pos <= (int) L && snaps[i].pos < (int) ids.size() &&
-                        (best < 0 || snaps[i].pos > snaps[best].pos))
-                        best = i;
-                if (L == hist.size() && L == ids.size() && !last.empty()) {
-                    // (the same tokens again: the last logits answer)
-                } else if (best >= 0) {
-                    const int sp = snaps[best].pos;
-                    snap_copy(snaps[best], false);
-                    for (auto& sn : snaps)
-                        if (sn.pos > sp) sn.pos = -1;
-                    hist.resize(sp);
-                    if (hist_sig.size() > (size_t) sp) hist_sig.resize(sp);
-                    last.clear();
-                    L = sp;
-                    if (monitor_info) {
-                        int parked = 0;
-                        for (const auto& sn2 : snaps) if (sn2.pos >= 0) ++parked;
-                        std::fprintf(stderr, "conversation cache: restored %d tokens; parked=%d bytes=%zu\n",
-                                     sp, parked, (size_t) parked * snap_bytes);
-                    }
-                } else {
-                    reset(), L = 0;
+            // Which parked conversation to go back to: the one covering the longest prefix of THIS prompt.  A snapshot
+            // carries the tokens it was taken at, so it is matched against the prompt itself; matching on position
+            // alone (L, i.e. what the device happens to hold) meant that one request sharing only the opening tokens -
+            // an agent's title or summary call between two turns - left every snapshot unusable, the whole prompt was
+            // read again, and reset() threw the cache away.
+            int best = -1;
+            for (int i = 0; i < (int) snaps.size(); ++i) {
+                const Snap& sn = snaps[i];
+                if (sn.pos <= 0 || sn.toks.size() >= ids.size()) continue;   // (one token stays to run: its logits)
+                if (best >= 0 && sn.pos <= snaps[best].pos) continue;
+                if (!std::equal(sn.toks.begin(), sn.toks.end(), ids.begin())) continue;
+                bool same = true;
+                for (size_t k = 0; k < sn.sigs.size() && same; ++k) same = sn.sigs[k] == (k < sig.size() ? sig[k] : 0);
+                if (same) best = i;
+            }
+            // The live state answers this prompt only when it ends where the prompt ends (L is where they part) and
+            // its logits are still there; a parked conversation reaching further in wins when one does.
+            const bool live_ok = L == hist.size() && (L < ids.size() || !last.empty());
+            if (best >= 0 && ((int) L < snaps[best].pos || !live_ok)) {
+                const int sp = snaps[best].pos;
+                snap_copy(snaps[best], false);
+                hist = snaps[best].toks;   // (the state and the tokens it covers, together)
+                hist_sig = snaps[best].sigs;
+                last.clear();
+                L = (size_t) sp;
+                if (serve_strata) {
+                    // (stderr: the server's log is the engine's stderr, and the Monitor's cache card reads it)
+                    std::fprintf(stderr, "strata serve: conversation cache: restored %d tokens; parked=%d bytes=%zu\n",
+                                 sp, count_parked(), conv_host_bytes);
+                    std::fflush(stderr);
                 }
+            } else if (!live_ok) {
+                reset(), L = 0;
             }
             const int cached = (int) L;
             uint64_t monitor_h0 = 0, monitor_m0 = 0;
             if (monitor_info) {
                 monitor_h0 = monitor_counts(true);
                 monitor_m0 = monitor_counts(false);
+            }
+            if (serve_strata) {   // (the server reports how much of the prompt was already there: cached tokens)
                 std::printf("RESUME %d\n", cached);
                 std::fflush(stdout);
             }
@@ -8151,6 +8244,12 @@ int run(int argc, char** argv) {
                         forward(M, ids.data() + p0, n, (int) p0, false, last_c ? OutMode::kLogits : OutMode::kNone,
                                 std::string(), lo, nullptr, t_exp);
                         if (last_c) last = std::move(lo);
+                        if (serve_strata) {   // (read, total, ms, tok/s, reused) - a short read still shows progress
+                            const double ms = (now() - t0) * 1e3;
+                            std::printf("PP %zu %zu %.0f %.1f %d\n", p0 + n, ids.size(), ms,
+                                        (p0 + n - L) / std::max(1e-3, ms / 1e3), (int) L);
+                            std::fflush(stdout);
+                        }
                     }
                 }
             }
@@ -8174,15 +8273,13 @@ int run(int argc, char** argv) {
             if (L < ids.size()) {
                 hist = ids;
                 hist_sig = sig;
-                Snap& sn = snaps[snap_next];
-                snap_next = (snap_next + 1) % (int) snaps.size();
-                sn.pos = (int) hist.size();
-                snap_copy(sn, true);
-                if (monitor_info) {
-                    int parked = 0;
-                    for (const auto& sn2 : snaps) if (sn2.pos >= 0) ++parked;
-                    std::fprintf(stderr, "conversation cache: parked %d tokens; parked=%d bytes=%zu\n",
-                                 sn.pos, parked, (size_t) parked * snap_bytes);
+                // The state at the end of the prompt: an agent's next turn begins with exactly these tokens, so it
+                // reads only what follows them.
+                const int parked = park_state(hist, hist_sig);
+                if (serve_strata && parked > 0) {
+                    std::fprintf(stderr, "strata serve: conversation cache: parked %d tokens; parked=%d bytes=%zu\n",
+                                 parked, count_parked(), conv_host_bytes);
+                    std::fflush(stderr);
                 }
             }
             const double t1 = now();
@@ -8259,6 +8356,16 @@ int run(int argc, char** argv) {
                     last = std::move(lo);
                 }
                 hist.push_back(tok);
+            }
+            // The state at the end of the reply as well: a client that sends the assistant's message back verbatim,
+            // or a tool call echoed into the next turn, then finds the reply's own tokens already read.
+            if (hist.size() > ids.size()) {
+                const int parked = park_state(hist, hist_sig);
+                if (serve_strata && parked > 0) {
+                    std::fprintf(stderr, "strata serve: conversation cache: parked %d tokens; parked=%d bytes=%zu\n",
+                                 parked, count_parked(), conv_host_bytes);
+                    std::fflush(stderr);
+                }
             }
             if (serve_strata) {
                 if (monitor_info) {

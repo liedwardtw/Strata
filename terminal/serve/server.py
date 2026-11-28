@@ -1478,6 +1478,10 @@ class StrataEngine:
                     self.progress = (int(f[1]), int(f[2]))
                     self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
                     self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
+                    # an engine that says what it reused on the PP line itself (Strata IK2: `PP read total ms tok/s
+                    # reused`) needs no RESUME line for the Context gauge, the Monitor's live row or cached_tokens
+                    if len(f) >= 6 and f[5].isdigit():
+                        self.reused = int(f[5])
                 if not stopped and cancel.is_set():
                     # #879: a Stop during the prompt read went out only after the first token (or after 10 s of
                     # silence, which a stream of PP lines never allows): the engine read the whole prompt first
@@ -2551,6 +2555,8 @@ class StrataEngine:
                         self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
                         self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
                         self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
+                        if len(f) >= 6 and f[5].isdigit():                 # the reused prefix, when the engine says it here
+                            self.reused = read_to = int(f[5])
                         rate, chunk = self.prefill_tok_s_mean or 0.0, int(f[1]) - read_to
                         read_to = int(f[1])
                         if silence > 0 and rate > 0 and chunk > 0:   # #481: the next chunk, as long as this one
@@ -5311,8 +5317,20 @@ class Service:
         el = now - s.get("started", now)
         if s.get("first_token") is None:
             pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
-            done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
-            print(f"[strata] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
+            reused = int(getattr(self.engine, "reused", 0) or 0)
+            spd = getattr(self.engine, "prefill_tok_s_mean", None)
+            if spd is None and pr and el > 0.2:           # an engine that names no speed: what the position says
+                spd = max(0.0, pr[0] - reused) / el
+            if pr and pr[1]:
+                # #29/#4636: the read's own progress and speed, not only how long it has been going.  An agent's
+                # prompt is tens of thousands of tokens and the read is most of the request, so "how far" and
+                # "how fast" are the two numbers that say whether it is healthy.
+                done = (f"{pr[0]:,} of {pr[1]:,} tokens ({100.0 * min(1.0, pr[0] / pr[1]):.0f}%)"
+                        + (f", {spd:,.0f} tok/s" if spd else "") + (f", {reused:,} reused" if reused else ""))
+            else:
+                done = f"{s.get('prompt_tokens', 0):,} tokens"   # as read (#29)
+            print(f"[strata] reading the prompt: {done}, {el:.0f} s so far", flush=True)
+            self._live_read(pr, reused, spd)              # the same numbers on the API monitor's row
         else:
             rate = s["generated"] / max(RATE_MIN_SPAN_S, now - s["first_token"])
             # #984: while a thinking budget applies, the thinking line shows it, not the request's max_tokens
@@ -5321,6 +5339,19 @@ class Service:
             print(f"[strata] {s['phase']}: {s['generated']} of {limit} tokens, {rate:.1f} tok/s, "
                   f"{el:.0f} s", flush=True)
         return now
+
+    def _live_read(self, pr, reused: int, spd: float | None) -> None:
+        """The prompt read's figures on this request's API-monitor row (/api/requests), for the monitor's progress line.
+
+        Only the numbers: a row that is not in the monitor keeps nothing (request_trace.record is None)."""
+        trace = getattr(self.request_trace, "record", None)
+        if trace is None:
+            return
+        with self.status_lock:
+            trace["prompt_read"] = int(pr[0]) if pr else None
+            trace["prompt_total"] = int(pr[1]) if pr and pr[1] else trace.get("prompt_total")
+            trace["prefill_tok_s"] = round(float(spd), 1) if spd else None
+            trace["reused"] = reused
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
             declared_only=False, deferred=False) -> Iterator[tuple[str, object]]:
@@ -5493,7 +5524,8 @@ class Service:
                     with self.status_lock:
                         if trace is not None:
                             trace["queue_s"] += round(time.perf_counter() - waiting, 3)
-                            trace["state"] = "generating"
+                            trace["state"] = "reading"      # the prompt is read first: the monitor shows how far
+                            trace["prompt_total"] = trace.get("prompt_total") or len(ids)
                         if not par:
                             self.status["queued"] -= 1
                             queued_counted = False
@@ -5577,6 +5609,8 @@ class Service:
                                 if trace is not None and trace["first_token_s"] is None:
                                     with self.status_lock:
                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
+                                        trace["state"] = "generating"   # the prompt is read: the answer starts
+                                        trace["prompt_read"] = trace.get("prompt_total")
                                 if t in self.stop_ids:
                                     if force and parser.state == "reasoning" and parser.buf == THINK_END:
                                         opens = True    # #537: the held </think> was the end: the call opens there
@@ -5812,6 +5846,14 @@ class Service:
                             finish = "stop"
                             break
                         prompt = prompt + seg + extra
+                    # The engine's end-token set is not always this server's (a pack that names its eos only under
+                    # GGUF's key, an engine started with its own --eos).  When the engine says it stopped at its own
+                    # end token and nothing else ended this pass, the reply ended there: "stop", not the token cap
+                    # that was still ahead.  Without this, a reply that ended normally went out as max_tokens and the
+                    # thinking warning below printed for it.
+                    if (finish == "length" and not cancel.is_set() and len(segments) > segments_before
+                            and segments[-1].get("finish") == "stop"):
+                        finish = "stop"
                     if cancel.is_set():
                         finish = "cancel"
                     elif looped:

@@ -29,6 +29,10 @@ param(
     [string]$WorkDir      = '',
     [int]$Ctx             = 32768,
     [int]$Port            = 8099,
+    # The address the API listens on: 127.0.0.1 = this PC only (the default);
+    # 0.0.0.0 = also the other devices on this network (no API key is set here,
+    # so use it only on a network you trust).
+    [string]$HostAddr     = '127.0.0.1',
     [string]$ConfigOut    = ''
 )
 
@@ -121,6 +125,10 @@ $cfg = [ordered]@{
     cwd        = $WorkDir
     tokenizer  = $Tokenizer
     model_name = 'inkling-2-mini'
+    # The engine writes its own log here (stderr). serve reads this file for the
+    # Monitor's conversation-cache card and for a start-failure hint; with no log
+    # path the engine's stderr goes to the null device and both stay empty.
+    log        = (Join-Path $WorkDir 'engine.log')
     env        = $envMap
     # Inkling-2 is a thinking model. Two ways to keep agent/browser answers fast:
     #  - reasoning_effort "none" -> template enable_thinking:false (no thinking pass at all):
@@ -139,8 +147,8 @@ $err = Join-Path $WorkDir 'native-serve.err'
 $old = $env:PYTHONPATH
 $env:PYTHONPATH = $TerminalDir
 Push-Location $TerminalDir
-Write-Output "Starting native serve: http://127.0.0.1:$Port/v1 (config $ConfigOut)"
-& $Python -m serve.server --engine strata --config $ConfigOut --port $Port --api-monitor 1>$log 2>$err
+Write-Output "Starting native serve: http://${HostAddr}:$Port/v1 (config $ConfigOut)"
+& $Python -m serve.server --engine strata --config $ConfigOut --host $HostAddr --port $Port --api-monitor 1>$log 2>$err
 $code = $LASTEXITCODE
 Pop-Location
 $env:PYTHONPATH = $old
