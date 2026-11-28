@@ -240,3 +240,20 @@ Fitting the three: **4.36 ms a visit + 0.0065 ms a token** (832 -> 9.8 predicted
 That fixed part is the launch count. `run_prefill_moe` loops over the experts on the host and issues six kernels per expert (gather, rot_pack8, gemm8 gate/up, swiglu+pad, rot_pack8, gemm8 down, scatter), so a visit is ~540 launches at a 17-token chunk (S = 17x8 = 136 rows spread over 128 experts, so nearly every expert has a row) at ~8 us each. At 7,168 tokens the same 48 visits cost 48 x 4.36 = 209 ms of a 2,458 ms chunk, i.e. **8.5% of the read**, which is also why a bigger chunk pays: fewer chunks means fewer of these.
 
 The fix that follows from this is the masked expert GEMM the batch path already uses (`IK2_BATCH_MOE_DEVICE`, engine/src/ik2/ik2_engine.cu:4423-4457): permutation, gather, rot_pack8, gemm8_masked, swiglu, pad, rot_pack8, gemm8_masked, scatter — nine launches a visit instead of ~540, with the row->expert map that `run_prefill_moe` already builds. Expected: ~+9% on a long read and 2-3x on a short continuation; not done yet because it needs a device row->expert array and its own quality check.
+## The masked expert GEMM removes the launches and costs the read (2026-11-29)
+
+The idea above was implemented and measured: `IK2_PF_MOE_BATCH` routed the whole prefill MoE through the batch path's masked expert GEMM (`k::int4_gemm8_moe_masked`, engine/src/ik2/ik2_engine.cu:4440) with a device row->expert array built in `run_prefill_moe`'s host grouping loop, tiled to the f32 scratch's row capacity. Nine launches a visit instead of ~540. Measured with `ik2cache.py --tokens 8000 --extra 17` and `IK2_VPROF4=1`, against the same run without the flag:
+
+| chunk | per-expert loop | masked GEMM | read of the 8,000-token prompt |
+| 17 tokens | 4.36 ms a visit | **3.27 ms** (-25%) | 209 -> 157 ms |
+| 832 tokens | 10.27 ms | 11.00 ms (+7%) | 493 -> 528 ms |
+| 7,168 tokens | 51.20 ms | 133.30 ms (+160%) | 2,458 -> 6,399 ms |
+
+So it wins only on a nearly empty chunk and costs a real read 2.6x. The reason is the tile shape: the masked kernel launches a block per expert (`grid.z = c.E` = 128) and the prefill tiles rows by the scratch capacity, so a big chunk becomes hundreds of tiles that each pay 128 mostly-idle expert blocks, while the per-expert loop gives one expert all its rows in a properly tiled GEMM. The row->expert map and the branch were reverted rather than kept behind a flag.
+
+The ~4.4 ms a visit is therefore the price of the launch count *and* the shape the experts are routed in, and it is not recoverable without a genuinely grouped GEMM: every expert's rows in one kernel, expert-major weights, no per-expert grid dimension. That is a new kernel, not a switch.
+
+## Two more levers measured and closed (2026-11-29)
+
+- **FP16 KV at a 131,072 context does not buy the tensor-core attention.** With `IK2_KV=f16` the KV is 6.66 GiB (against 1.35 GiB of INT4) and the read fell to **261 tok/s** against 2,804, because the extra 5 GiB pushes the resident expert sidecars out of the budget. The MMA attention path needs f16 KV, but on this card the memory it costs is worth more than the attention it saves.
+- **`IK2_AR_KSTEP=1 IK2_AR_K=2` does nothing on the single-stream decode**: 106.48 tok/s against 106.90 at an 8,000-token prompt. The +3.2% recorded for it earlier was on the batched path, which the daily configuration does not use.
