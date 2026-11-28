@@ -28,6 +28,11 @@ param(
     [string]$TerminalDir  = '',
     [string]$WorkDir      = '',
     [int]$Ctx             = 32768,
+    # Tokens read per prefill pass. Measured on an RX 7900 XTX at a 44,288-token prompt: 4096 -> 2,272 tok/s,
+    # 7168 -> 2,518 (+10.5%). Do not raise it without checking the context: at a 640K context chunk 8192
+    # collapses to ~1,435 tok/s because the bigger work buffers push the total past the VRAM budget and
+    # Windows starts paging; at a 32K context the same chunk 8192 is faster than 7168 (2,463 vs 2,276).
+    [int]$Chunk           = 7168,
     [int]$Port            = 8099,
     # The address the API listens on: 127.0.0.1 = this PC only (the default);
     # 0.0.0.0 = also the other devices on this network (no API key is set here,
@@ -121,9 +126,9 @@ $cfg = [ordered]@{
     # --max-context: serve.py reads the engine's max context from this arg (server.py:768);
     # without it the API reports 32768 even when the engine loaded a 640k KV.
     # --conversation-cache-mib: host-RAM parking of conversation snapshots for agents.
-    # --prefill: the read's chunk. 7168 measured 10.5% faster than 4096 at a 44,288-token prompt on a 7900 XTX
+    # --prefill: the read's chunk, -Chunk (7168 measured 10.5% faster than 4096 at a 44,288-token prompt on a 7900 XTX)
     # (2,518 vs 2,272 tok/s); 8192 falls off a cliff to ~1,435 and 10240 to ~694. Decode is unaffected.
-    args       = @('--model',$Model,'--ctx',"$Ctx",'--max-context',"$Ctx",'--prefill','7168','--gpus','1','--threads','8','--cache-gb','60','--conversation-cache-mib','8192')
+    args       = @('--model',$Model,'--ctx',"$Ctx",'--max-context',"$Ctx",'--prefill',"$Chunk",'--gpus','1','--threads','8','--cache-gb','60','--conversation-cache-mib','8192')
     cwd        = $WorkDir
     tokenizer  = $Tokenizer
     model_name = 'inkling-2-mini'
