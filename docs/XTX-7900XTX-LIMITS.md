@@ -46,3 +46,24 @@ See [QUALITY](XTX-7900XTX-QUALITY.md). EXP2 (+4.9% speed) caused 84% prompt-leve
 - `IK2_ATTN_MMA` / `IK2_EXPERT_MMA` are NVIDIA-PTX paths — trap-stub or hang on HIP; keep 0.
 - Wrong `IK2_INT4_DIR` / `IK2_INT4_DENSE_DIR` silently falls back to Q8 experts → ~3.9 tok/s.
 - The stock signed Strata engine is untouched; our local engine is an unsigned per-user shape component (Windows Smart App Control may need a local allow).
+
+## Measured ceiling and the long-context levers (2026-11-29)
+
+All numbers on the RX 7900 XTX, this build, the daily 640K config (chunk 7168, INT4 KV, INT4 experts 24 layers), single stream, greedy, no other GPU work. Run-to-run noise on the same config is +-12%, so only a change above ~15% is resolvable.
+
+**Prefill is at its ceiling for this design.** Eight environment knobs were swept at a 44,288-token prompt and every one landed inside the noise (2,490-2,613 tok/s): `IK2_FLASH_NW=16`/`=4`, `IK2_FLASH_BN=64`, `IK2_ATTN_GQA=0`, `IK2_EXPERTS_PREFILL_WMMA=1`, `IK2_INT4_PREFILL=1`, `IK2_GATE_FUSE=0`, `IK2_RMS_FUSE=0`. The ceiling by prompt length is 2,954 tok/s at 16K, 2,564 at 21.6K, 2,613 at 44.3K. The 3,053 recorded in [BENCHMARKS](XTX-7900XTX-BENCHMARKS.md) was a 16K prompt with FP16 KV and chunk 9216; with INT4 KV the flash path has no tensor-core MMA (`mma` is false when `kv_is_int()`), which is why a 7168-token chunk beats the old 9216.
+
+What the profile still shows (per 4,096-token chunk): attention 1.03 s of which the input projection is 0.618 s and the output projection 0.313 s, experts 1.21 s (gather 0.393, gemm16 0.546, scatter 0.118), loop gates 0.244 s. The projection GEMM runs at ~11% of the card's FP16 peak, so the remaining headroom is kernel efficiency (fused loop gates, an expert-major GEMM that does not gather first), not memory.
+
+**Decode by prompt length, single stream, 24-32 tokens after the prompt** (tok/s):
+
+| prompt | before | park capped | capped + `IK2_FULL_WINDOW=32768` |
+|---|---|---|---|
+| 48K | 62.4 | 62.4 | 64.9 |
+| 128K | 36.0 | 64.1 | 96.5 |
+| 256K | 21.8 | 45.2 | 93.2 |
+| 393K | 13.5 | 35.4 | 95.7 |
+
+Two changes got there. The conversation park copied the full-attention KV to host RAM with no bound and that copy is synchronous: at 393K it stalled ~42 s a request, so it is now capped at `IK2_CONV_CACHE_PARK_MIB` (default 1024 MiB) and a longer conversation is simply not cached. `IK2_FULL_WINDOW=N` then makes the 8 full-attention visits read only the last N keys while decoding. It is lossy and off by default: with a 22,251-token prompt and the answer at the very start, N=32768 answers correctly, N=16384 and N=4096 do not.
+
+At the 48K the agent traffic actually runs at, the conversation cache is the lever that matters: a second turn reuses 48,422 tokens and reads the prompt in 446 ms instead of 18,830 ms (42x), and an unrelated request in between does not evict it.
