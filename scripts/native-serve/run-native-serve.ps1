@@ -38,6 +38,15 @@ param(
     # 0.0.0.0 = also the other devices on this network (no API key is set here,
     # so use it only on a network you trust).
     [string]$HostAddr     = '127.0.0.1',
+    # Opt-in DSpark: a drafter proposes and the target verifies up to 8 tokens a step.
+    # Measured on an RX 7900 XTX at a 32,768 context against the quality set (11 fixed
+    # prompts, every answer checked): plain AR 46.6 tok/s wall, DSpark 54.7 (+17%),
+    # both 11/11 correct. It pays on predictable output (7-8 of 8 drafts accepted) and
+    # loses on prose (2-3 of 8), and at a 640K context the drafter stops being resident
+    # and the whole path falls to ~6 tok/s - so pair it with -Ctx 131072.
+    [switch]$Draft,
+    # The drafter's weights (the model's own mtp.safetensors). Required with -Draft.
+    [string]$Drafter      = '',
     [string]$ConfigOut    = ''
 )
 
@@ -121,6 +130,19 @@ $envMap = [ordered]@{
     IK2_INT4_PREFILL    = '1'
     IK2_LG_CTX          = '1024'
 }
+# -Draft: the DSpark path. Every flag here was measured; see the parameter's comment.
+if ($Draft) {
+    if (-not $Drafter) { Write-Error "-Draft needs -Drafter <path to the model's mtp.safetensors>"; exit 2 }
+    $envMap['IK2_SERVE_DSPEC']      = '1'
+    $envMap['IK2_VERIFY_FAST']      = '1'
+    $envMap['IK2_VERIFY_GRAPH']     = '1'
+    $envMap['IK2_DRAFT_CTX_CAP']    = '1'   # the drafter's local layers keep a 2048-row ring
+    $envMap['IK2_DRAFT_KV_FP8']     = '1'   # half the bytes; its ring path is what used to crash
+    $envMap['IK2_SPEC_N']           = '8'   # the trained block size
+    $envMap['IK2_INT4_DENSE_MULTI'] = '1'   # the verify's dense projections, 8 rows at once
+}
+$engArgs = @('--model',$Model,'--ctx',"$Ctx",'--max-context',"$Ctx",'--prefill',"$Chunk",'--gpus','1','--threads','8','--cache-gb','60','--conversation-cache-mib','8192')
+if ($Draft) { $engArgs += @('--draft',$Drafter) }
 $cfg = [ordered]@{
     exe        = $Exe
     # --max-context: serve.py reads the engine's max context from this arg (server.py:768);
@@ -128,7 +150,7 @@ $cfg = [ordered]@{
     # --conversation-cache-mib: host-RAM parking of conversation snapshots for agents.
     # --prefill: the read's chunk, -Chunk (7168 measured 10.5% faster than 4096 at a 44,288-token prompt on a 7900 XTX)
     # (2,518 vs 2,272 tok/s); 8192 falls off a cliff to ~1,435 and 10240 to ~694. Decode is unaffected.
-    args       = @('--model',$Model,'--ctx',"$Ctx",'--max-context',"$Ctx",'--prefill',"$Chunk",'--gpus','1','--threads','8','--cache-gb','60','--conversation-cache-mib','8192')
+    args       = $engArgs
     cwd        = $WorkDir
     tokenizer  = $Tokenizer
     model_name = 'inkling-2-mini'
