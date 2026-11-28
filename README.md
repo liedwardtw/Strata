@@ -4,6 +4,8 @@ An optimized fork of [Strata](https://github.com/Niko1221/Strata) (original ik2 
 
 This build is the **final, converged deliverable: one single autoregressive stream, 655360-token (640k) context held entirely in VRAM with INT4 KV, and an 8 GiB conversation cache in host RAM.** Every optimization is environment-gated; the validated configuration is baked into the one-click launcher.
 
+> **Full technical record (RX 7900 XTX deep-dive):** [benchmarks](docs/XTX-7900XTX-BENCHMARKS.md) · [optimizations](docs/XTX-7900XTX-OPTIMIZATIONS.md) · [setup/build](docs/XTX-7900XTX-SETUP.md) · [DSpark](docs/XTX-7900XTX-DSPARK.md) · [VRAM & long context](docs/XTX-7900XTX-VRAM.md) · [correctness & quality](docs/XTX-7900XTX-QUALITY.md) · [limits & falsified approaches](docs/XTX-7900XTX-LIMITS.md).
+
 ## Headline result (greedy, bit-exact)
 
 | Item | Value | Condition |
@@ -24,6 +26,7 @@ All numbers: Windows 11, RX 7900 XTX (960 GB/s), 32 GB RAM, greedy decoding, 128
 
 ## Contents
 
+- **RX 7900 XTX deep-dive:** [benchmarks](docs/XTX-7900XTX-BENCHMARKS.md) · [optimizations](docs/XTX-7900XTX-OPTIMIZATIONS.md) · [setup/build](docs/XTX-7900XTX-SETUP.md) · [DSpark](docs/XTX-7900XTX-DSPARK.md) · [VRAM & long context](docs/XTX-7900XTX-VRAM.md) · [correctness & quality](docs/XTX-7900XTX-QUALITY.md) · [limits](docs/XTX-7900XTX-LIMITS.md)
 - [What is in this build](#what-is-in-this-build)
 - [Requirements](#requirements)
 - [Build (Windows / HIP / gfx1100)](#build-windows--hip--gfx1100)
