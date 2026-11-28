@@ -214,3 +214,14 @@ Six candidate causes were each measured and each ruled out:
 | the cache restore | timed separately | 41 ms of a 360 ms turn |
 
 So roughly 200-300 ms sits in the per-chunk setup of the 48 layer visits, in a part none of those switches reaches. It is worth about 2.6% of a 7,168-token prefill (2,856 → ~2,670 ms would be 2,684 tok/s) and about 190 ms on every short agent turn, which makes it a better target for the agent loop than for the prefill number. Finding it needs a per-visit timer that does not itself synchronise (`IK2_PF_PROFILE` does, and on a short chunk it reports more time than the request took).
+### What the per-chunk floor is not: the GEMM stack, the launch count, or a per-visit sync (2026-11-29)
+
+Three more candidates were measured after the eight above.
+
+The projections already run on the tuned kernel, not hipBLAS. At a 44,288-token prompt, `IK2_WMMA_GEMM=1` reads 2,612 tok/s and `IK2_WMMA_GEMM=0` (hipBLAS fp16) reads 1,700, and the daily launcher already sets `=1`. So the ~13.5 TFLOPS the projections reach is the custom kernel's own throughput (22% of the card's fp16 peak), not call overhead, and `IK2_INT4_PREFILL=1` cannot help because it only swaps one fast path for another.
+
+Removing launches does not help either, because a short chunk is not launch-bound: a 17-token continuation at an 8K context costs 201 ms at the baseline, 201 with `IK2_I4_ROT_IN=2` (three fewer launches a visit), 197 with `IK2_LOOPBANK_FUSE=1` and 221 with both.
+
+The phase profiler cannot localise the floor. With `IK2_PROF=1` a chunk's attention reads 0.45 s at 17 tokens, 0.62 s at 1,024 and 1.01 s at 4,096, i.e. flat up to a thousand tokens — but the profiler itself synchronises twice a visit (96 syncs a chunk), which is the same order as the floor it is trying to measure. Its own numbers are 3-4x the unprofiled chunk.
+
+The floor does explain the 16K-chunk result, which is the best check available: a 44,288-token prompt is 7 chunks at 7,168 and 3 at 16,384, and four fewer chunks at ~300 ms is 1.2 s of a 17 s read = 7%, against the measured +7.3% (2,804 against 2,613 tok/s). So the 16K chunk's gain is the floor avoided, not a better kernel.
