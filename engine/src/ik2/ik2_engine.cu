@@ -8354,6 +8354,30 @@ int run(int argc, char** argv) {
                         forward(M, ids.data() + p0, n, (int) p0, false, last_c ? OutMode::kLogits : OutMode::kNone,
                                 std::string(), lo, nullptr, t_exp);
                         if (last_c) last = std::move(lo);
+                        // IK2_VPROF4: the per-visit split of this chunk, from the events forward() already records
+                        // (vpA at each visit's start, vpB right after its attention). One sync for the whole chunk,
+                        // so unlike IK2_PROF this does not change the thing it measures.
+                        if (serve_strata && vp_n > 0) {
+                            cudaEventRecord(vpB[63], g_s);
+                            cudaStreamSynchronize(g_s);
+                            float tot = 0.f;
+                            std::vector<std::pair<float, int>> per;
+                            for (int v = 0; v < vp_n; ++v) {
+                                float d = 0.f;
+                                cudaEventElapsedTime(&d, vpA[v], (v + 1 < vp_n) ? vpA[v + 1] : vpB[63]);
+                                per.push_back({d, v});
+                                tot += d;
+                            }
+                            std::sort(per.begin(), per.end(),
+                                      [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
+                                          return a.first > b.first;
+                                      });
+                            std::fprintf(stderr, "VPROF4 chunk T=%d visits=%d total=%.1f ms (%.2f a visit)\n", n, vp_n,
+                                         tot, tot / std::max(1, vp_n));
+                            for (size_t k = 0; k < per.size() && k < 6; ++k)
+                                std::fprintf(stderr, "VPROF4   visit %d: %.2f ms\n", per[k].second, per[k].first);
+                            std::fflush(stderr);
+                        }
                         if (serve_strata) {   // (read, total, ms, tok/s, reused) - a short read still shows progress
                             const double ms = (now() - t0) * 1e3;
                             std::printf("PP %zu %zu %.0f %.1f %d\n", p0 + n, ids.size(), ms,

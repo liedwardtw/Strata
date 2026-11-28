@@ -225,3 +225,18 @@ Removing launches does not help either, because a short chunk is not launch-boun
 The phase profiler cannot localise the floor. With `IK2_PROF=1` a chunk's attention reads 0.45 s at 17 tokens, 0.62 s at 1,024 and 1.01 s at 4,096, i.e. flat up to a thousand tokens — but the profiler itself synchronises twice a visit (96 syncs a chunk), which is the same order as the floor it is trying to measure. Its own numbers are 3-4x the unprofiled chunk.
 
 The floor does explain the 16K-chunk result, which is the best check available: a 44,288-token prompt is 7 chunks at 7,168 and 3 at 16,384, and four fewer chunks at ~300 ms is 1.2 s of a 17 s read = 7%, against the measured +7.3% (2,804 against 2,613 tok/s). So the 16K chunk's gain is the floor avoided, not a better kernel.
+### The floor is per visit, and it is the per-expert MoE's launch count (2026-11-29)
+
+`IK2_VPROF4=1` prints a chunk's per-visit split from the CUDA events forward() already records (one sync for the whole chunk, so unlike `IK2_PROF` it does not change what it measures). Three chunks of the same conversation:
+
+| chunk | total | per visit | slowest visit |
+|---|---|---|---|
+| 7,168 tokens | 2,457.8 ms | 51.20 ms | 415.2 ms (visit 0, cold) |
+| 832 tokens | 492.7 ms | 10.27 ms | 16.0 ms |
+| 17 tokens | 209.4 ms | 4.36 ms | 18.5 ms (visit 34) |
+
+Fitting the three: **4.36 ms a visit + 0.0065 ms a token** (832 -> 9.8 predicted against 10.3 measured; 7,168 -> 51.0 against 51.2). So every visit carries ~4.4 ms that does not depend on how many tokens it is given.
+
+That fixed part is the launch count. `run_prefill_moe` loops over the experts on the host and issues six kernels per expert (gather, rot_pack8, gemm8 gate/up, swiglu+pad, rot_pack8, gemm8 down, scatter), so a visit is ~540 launches at a 17-token chunk (S = 17x8 = 136 rows spread over 128 experts, so nearly every expert has a row) at ~8 us each. At 7,168 tokens the same 48 visits cost 48 x 4.36 = 209 ms of a 2,458 ms chunk, i.e. **8.5% of the read**, which is also why a bigger chunk pays: fewer chunks means fewer of these.
+
+The fix that follows from this is the masked expert GEMM the batch path already uses (`IK2_BATCH_MOE_DEVICE`, engine/src/ik2/ik2_engine.cu:4423-4457): permutation, gather, rot_pack8, gemm8_masked, swiglu, pad, rot_pack8, gemm8_masked, scatter — nine launches a visit instead of ~540, with the row->expert map that `run_prefill_moe` already builds. Expected: ~+9% on a long read and 2-3x on a short continuation; not done yet because it needs a device row->expert array and its own quality check.
