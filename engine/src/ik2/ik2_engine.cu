@@ -8269,6 +8269,13 @@ int run(int argc, char** argv) {
                                         (p0 + n - L) / std::max(1e-3, ms / 1e3), (int) L);
                             std::fflush(stdout);
                         }
+                        if (spec_active && drafter && g_taps) {
+                            // Seed the drafter from the chunk this forward() just ran: g_taps holds exactly those rows.
+                            // Doing it per chunk is what the CLI path does; the old code seeded once with the whole
+                            // prompt length, which read past the taps buffer for any prompt longer than one chunk.
+                            ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, n, (int) p0);
+                            if (last_c) ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, n - 1);
+                        }
                     }
                 }
             }
@@ -8330,11 +8337,10 @@ int run(int argc, char** argv) {
             // tokens actually emitted (the last emitted token stays pending as the next anchor), so
             // prefix-cache reuse and the snapshot history never run ahead of the visible stream.
             if (spec_active && greedy_tok >= 0) {
-                if (g_taps) {   // seed the drafter's KV/RNN from the prefill taps (best effort; the target verifies)
-                    const int ntap = (int) hist.size();
-                    ik2::draft::write_context(drafter, g_taps, g_taps_ld, 0, ntap, 0);
-                    ik2::draft::set_f_rnn(drafter, g_taps, g_taps_ld, ntap - 1);
-                }
+                // The drafter was seeded per chunk by the prefill loop above (that is the only place g_taps holds
+                // rows that belong to this request). A prompt that was entirely reused runs no chunk, so the
+                // drafter keeps the cache it built for the same conversation on the previous request - the target
+                // verifies every draft, so a stale drafter can only cost accept rate, never correctness.
                 auto emit = [&](int t) -> bool {
                     std::printf("T %d\n", t);
                     std::fflush(stdout);
@@ -8344,8 +8350,19 @@ int run(int argc, char** argv) {
                     return n_out >= max_new;   // reason stays "length"
                 };
                 auto commit = [&](int t) { hist.push_back(t); };
-                generate_speculative(M, c, drafter, greedy_tok, (int) hist.size(), ctx, spec_B,
-                                     emit, commit, /*cli_diag=*/false, /*verify_check=*/0, /*margin_check=*/false, t_exp);
+                const SpecStats st = generate_speculative(M, c, drafter, greedy_tok, (int) hist.size(), ctx, spec_B,
+                                                          emit, commit, /*cli_diag=*/false, /*verify_check=*/0,
+                                                          /*margin_check=*/false, t_exp);
+                if (serve_strata && st.steps > 0) {
+                    // Served requests used to throw this away, so nobody could tell whether speculation paid. The
+                    // accept rate is the number that decides it, and it is a property of the text, not the engine.
+                    std::fprintf(stderr,
+                                 "strata serve: speculative: %d steps, %.2f tokens a step; drafting %.1f ms a step, "
+                                 "verifying %.1f ms\n",
+                                 st.steps, (double) n_out / st.steps, st.t_draft * 1e3 / st.steps,
+                                 st.t_verify * 1e3 / st.steps);
+                    std::fflush(stderr);
+                }
             } else for (int i = 0; i < max_new; ++i) {
                 if (g_cancel) {
                     reason = "cancelled";
