@@ -257,3 +257,17 @@ The ~4.4 ms a visit is therefore the price of the launch count *and* the shape t
 
 - **FP16 KV at a 131,072 context does not buy the tensor-core attention.** With `IK2_KV=f16` the KV is 6.66 GiB (against 1.35 GiB of INT4) and the read fell to **261 tok/s** against 2,804, because the extra 5 GiB pushes the resident expert sidecars out of the budget. The MMA attention path needs f16 KV, but on this card the memory it costs is worth more than the attention it saves.
 - **`IK2_AR_KSTEP=1 IK2_AR_K=2` does nothing on the single-stream decode**: 106.48 tok/s against 106.90 at an 8,000-token prompt. The +3.2% recorded for it earlier was on the batched path, which the daily configuration does not use.
+
+## The knob space is exhausted at both chunk sizes (2026-11-29)
+
+Repeated at the fast configuration (`-Ctx 131072 -Chunk 16384`, 44,288-token prompt, one read a run, two rounds), because a 16K chunk changes the balance between the projections and the expert GEMMs:
+
+| config | round 1 | round 2 | verdict |
+| baseline | (run failed) | 2,810.0 | - |
+| `IK2_INT4_PREFILL=1` | 2,754.5 | 2,783.2 | worse |
+| `IK2_FLASH_NW=16` | 2,700.1 | 2,699.3 | worse |
+| `IK2_EXPERTS_PREFILL_WMMA=1` | 2,804.9 | 2,818.9 | equal |
+
+Combined with the eight-knob sweep at chunk 7,168 and the three exclusions recorded above, every environment switch that reaches the prefill is now measured at both chunk sizes, and none beats the defaults. The remaining cost is the kernels themselves: the prompt projections run at ~13.5 TFLOPS (22% of the card's 61 TFLOPS fp16 peak) through the tuned `strata_pf_gemm_f16` WMMA kernel, which is already faster than hipBLAS (2,613 against 1,700 tok/s), and the experts at ~1.2 s a chunk through the per-expert loop whose launch count is structural (see above).
+
+**So the measured prefill ceiling of this kernel stack is 2,954 tok/s at a 16,384-token prompt (2,804-2,818 at 44,288 with a 131,072 context and a 16K chunk, 2,613 with the daily 640K context and a 7,168 chunk). Reaching 4,000 needs a new GEMM stack (a grouped expert GEMM and a projection GEMM above 25 TFLOPS) plus an INT4-KV attention path on the matrix cores; no switch reaches it.**
