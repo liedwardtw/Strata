@@ -2143,13 +2143,32 @@ __global__ void gather_f16_16_kernel(const uint16_t* __restrict__ x16, const int
 
 #if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
 // FP16 rows gathered to F32 (the INT4 prefill's activation input): y [n][C] = x[idx[i]][C].
+// The row copy is the largest single memory move of a prefill chunk's expert loop, and reading it a half at
+// a time reached only 89 GB/s: with C a multiple of 8 the halves come in 16-byte loads and go out as float4.
 __global__ void gather_f32_16_kernel(const uint16_t* __restrict__ x16, const int* __restrict__ idx, int n, int C,
                                      float* __restrict__ y) {
     const int row = blockIdx.x;
     if (row >= n) return;
-    const uint16_t* src = x16 + (size_t) idx[row] * C;
+    const uint16_t* src16 = x16 + (size_t) idx[row] * C;
     float* dst = y + (size_t) row * C;
-    for (int i = threadIdx.x; i < C; i += blockDim.x) dst[i] = __half2float(__ushort_as_half(src[i]));
+    if ((C & 7) == 0) {
+        const uint4* src = (const uint4*) src16;
+        float4* d4 = (float4*) dst;
+        const int n8 = C >> 3;   // uint4 = 8 halves
+        for (int i = threadIdx.x; i < n8; i += blockDim.x) {
+            const uint4 v = src[i];
+            const uint16_t* h = (const uint16_t*) &v;
+            float4 a, b;
+            a.x = __half2float(__ushort_as_half(h[0])); a.y = __half2float(__ushort_as_half(h[1]));
+            a.z = __half2float(__ushort_as_half(h[2])); a.w = __half2float(__ushort_as_half(h[3]));
+            b.x = __half2float(__ushort_as_half(h[4])); b.y = __half2float(__ushort_as_half(h[5]));
+            b.z = __half2float(__ushort_as_half(h[6])); b.w = __half2float(__ushort_as_half(h[7]));
+            d4[2 * i] = a;
+            d4[2 * i + 1] = b;
+        }
+        return;
+    }
+    for (int i = threadIdx.x; i < C; i += blockDim.x) dst[i] = __half2float(__ushort_as_half(src16[i]));
 }
 
 // h [n][F] FP16 -> x [n][Kpad] F32, zero-padded (INT4 down-projection input). One block per row.
