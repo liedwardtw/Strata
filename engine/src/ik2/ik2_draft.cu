@@ -428,8 +428,10 @@ void layer_attn(Drafter* d, DLayer& l, int P, float* out) {
     const int k_lo = l.local ? std::max(0, P - 1023) : 0;
     if (d->kv_fp8) {
         // FP8 context caches take precedence over IK2_DRAFT_ATTN_GQA (the GQA kernel is F32-only).
+        // ring_mask goes through: with IK2_DRAFT_CTX_CAP the local layers keep a 2048-row ring, and
+        // reading it linearly made every prompt past 2048 positions fail at the first decode token.
         k::draft_attn_fp8(d->q, l.kc8, l.vc8, k_lo, P, d->kk, d->vv, T, d->H, d->KV, 1.0f / std::sqrt(128.0f),
-                          d->scratch, d->o, d->s);
+                          d->scratch, d->o, l.ring_mask, d->s);
     } else if (draft_attn_gqa_enabled() && d->KV > 0 && d->H % d->KV == 0) {
         k::draft_attn_gqa(d->q, l.kc, l.vc, k_lo, P, d->kk, d->vv, T, d->H, d->KV, 1.0f / std::sqrt(128.0f),
                           d->scratch, d->o, d->s);
@@ -462,7 +464,10 @@ Drafter* load(const std::string& path, int C, int ctx, cublasHandle_t blas, cuda
     const StFile f = st_open(path);
     auto* d = new Drafter;
     d->C = C, d->ctx = ctx, d->blas = blas, d->s = s;
-    d->kv_fp8 = draft_kv_fp8_enabled();
+    d->kv_fp8 = draft_kv_fp8_enabled() || draft_ctx_cap_enabled();
+    // The ring cache (IK2_DRAFT_CTX_CAP) only has a ring-aware write and read on the FP8 path, so the cap
+    // turns FP8 on. The F32 cache is the 4x bigger one the cap exists to avoid anyway, and its write is
+    // still linear: with a ring it would run off the end of the 2048-row buffer.
 
     auto find_tensor = [&](const std::string& n1, const std::string& n2 = "") -> std::string {
         if (f.t.find(n1) != f.t.end()) return n1;
@@ -685,8 +690,16 @@ void write_context(Drafter* d, const float* taps, int ld, int r0, int m, int pos
                 gemm_bf(d, l.wvc, KD, C, d->hb, n, d->ctx_v, KD);
                 k::rms(kd, l.k_norm_ctx, n * d->KV, 128, d->eps, kd, d->s);
                 k::rope_neox(kd, n, d->KV, d->ctx_pos, d->theta, d->s);
-                k::pack_e4m3(kd, (size_t) n * KD, l.kc8 + (size_t) (pos0 + a) * KD, d->s);
-                k::pack_e4m3(d->ctx_v, (size_t) n * KD, l.vc8 + (size_t) (pos0 + a) * KD, d->s);
+                // A local layer's cache is a ring of cap rows when IK2_DRAFT_CTX_CAP is on, so the rows
+                // go in at (pos & (cap-1)) instead of at pos: a contiguous write ran off the end of the
+                // ring once the prompt passed 2048 positions.
+                if (l.ring_mask) {
+                    k::pack_e4m3_ring(kd, n, KD, l.kc8, l.ring_mask, pos0 + a, d->s);
+                    k::pack_e4m3_ring(d->ctx_v, n, KD, l.vc8, l.ring_mask, pos0 + a, d->s);
+                } else {
+                    k::pack_e4m3(kd, (size_t) n * KD, l.kc8 + (size_t) (pos0 + a) * KD, d->s);
+                    k::pack_e4m3(d->ctx_v, (size_t) n * KD, l.vc8 + (size_t) (pos0 + a) * KD, d->s);
+                }
             } else {
                 const int wpos = l.ring_mask ? ((pos0 + a) & l.ring_mask) : (pos0 + a);
                 float* kd = l.kc + (size_t) wpos * KD;

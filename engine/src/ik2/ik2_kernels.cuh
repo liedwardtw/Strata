@@ -711,9 +711,11 @@ void draft_attn_gqa(const float* q, const float* kc, const float* vc, int k_lo, 
 /// bit-exact (the cache was quantized when written).
 void draft_attn_fp8(const float* q, const uint8_t* kc, const uint8_t* vc, int k_lo, int k_hi, const float* kb,
                     const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out,
-                    cudaStream_t s);
+                    int ring_mask, cudaStream_t s);
 /// FP8 E4M3 copies of n values (saturating at +-448): y[i] = e4m3(x[i]).
 void pack_e4m3(const float* x, size_t n, uint8_t* y, cudaStream_t s);
+    /// pack_e4m3 into a ring cache: row r goes to slot ((pos0 + r) & ring_mask). ring_mask must be cap-1.
+    void pack_e4m3_ring(const float* x, int rows, int cols, uint8_t* y, int ring_mask, int pos0, cudaStream_t s);
 /// out [T][F] BF16 = silu(gu[t][f]) * gu[t][F + f] (gu [T][2 F] F32: gate's then up's).
 void silu_mul_bf16(const float* gu, int T, int F, uint16_t* out, cudaStream_t s);
 /// The Markov head's input [state (R); emb[prev] (R, BF16 table); hidden (C); f (C)] as BF16 into out [2 R + 2 C].

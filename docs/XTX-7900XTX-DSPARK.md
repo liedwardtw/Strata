@@ -41,3 +41,41 @@ What did not help, measured the same day: `IK2_BATCH_MOE_DEVICE=1` (57.0 ms: the
 The draft side can be approximated for free: every emitted token is the target's own argmax (`generate_speculative`, `engine/src/ik2/ik2_engine.cu:5492-5508`), so a lossy drafter changes only the accept rate, never the output. Measured: `IK2_DRAFT_CAND=1` gave 0 of 64 token differences, but drafting got slower (11.5 vs 6.1 ms a step) and the accept rate fell (1.66 vs 1.97 tokens a step), so it stays off; `IK2_DRAFT_MARKOV_FUSE=1` changed nothing.
 
 At a 640K context in serve mode speculation is still 3-5x slower than AR (repetitive prompt 12.65 vs 38.54 tok/s, prose 11.43 vs 62.32): the verify reads the KV for 8 rows and the expert weights once per slot. AR stays the default.
+
+## The ring cache used to crash, and DSpark at 48K (2026-11-29)
+
+IK2_DRAFT_CTX_CAP gives the local draft layers a 2048-row ring instead of a ctx-sized cache, and
+IK2_DRAFT_KV_FP8 stores that cache in E4M3. Together they crashed: any prompt past 2048 positions
+ended the engine at the first decode token with ik2::k::int4_matvec: launch failed: unspecified launch
+failure (or cudaStreamSynchronize(g_s) at engine/src/ik2/ik2_engine.cu:4485), twice out of two.
+
+Cause: only the F32 cache had a ring. The FP8 write packed its rows at (pos0 + a) * KD and
+draft_attn_fp8_kernel read them at (k_lo + j) * KD, both linear, so from position 2048 on they
+walked off the end of a 2048-row buffer. Fix: pack_e4m3_ring writes row r to ((pos0 + r) & ring_mask)
+(one block per row, so a block never straddles the wrap), draft_attn_fp8 takes the ing_mask and
+masks both the K and the V read, and IK2_DRAFT_CTX_CAP now implies IK2_DRAFT_KV_FP8 because the F32
+path still writes linearly and has no ring of its own.
+
+With that, DSpark runs at a long prompt. Measured in serve mode, a 51,745-token prompt, 64K context,
+greedy, 96 tokens:
+
+| | prefill | decode | draft | verify | accept |
+| --- | --- | --- | --- | --- | --- |
+| AR | 2,587 tok/s (20.0 s) | **85.6 tok/s** | — | — | — |
+| DSpark | same | 29.3 tok/s (3.33 a step) | 37.7 ms | 75.9 ms | 3.33 / 8 |
+| DSpark, next turn | — | 54.0 tok/s (6.20 a step) | 38.5 ms | 76.4 ms | 6.20 / 8 |
+
+So DSpark still loses at 48K, for two reasons that are worth keeping apart:
+
+- **The draft step is O(P) in the worst possible shape.** The one global draft layer attends every
+  position, and draft_attn_fp8_kernel walks them one key per warp iteration, so 51,745 keys cost
+  37.7 ms. The bytes are 106 MB, which is 0.11 ms at this card's bandwidth: the kernel is 340x off its
+  own memory floor. A key-tiled draft attention (or a window on the global layer) would bring it to
+  ~3 ms.
+- **Even with a free draft step the verify is not cheap enough.** At 48K a T=8 verify costs 9.5 ms a
+  token against AR's 11.7 ms: the expert sidecars are read per routed row, so 8 rows buy only a 1.2x
+  discount. Break-even needs an accept rate of about 7 of 8, which is a short-context, highly
+  repetitive workload — not a 48K conversation.
+
+At 20K the same drafter measures 6.1 ms drafting and 41.7 ms verifying, i.e. the verify grows 1.8x and
+the draft 6.2x between 20K and 48K. DSpark stays a short-context lever; AR stays the default.

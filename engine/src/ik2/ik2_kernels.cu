@@ -4596,8 +4596,8 @@ __global__ void draft_attn_kernel(const float* q, const float* kc, const float* 
 // unpacked e4m3 -> F32 (e4m3fn_to_f32) before the dot / PV, so context K/V bytes drop 4x at the cost
 // of a little ALU. NOT bit-exact vs the F32 cache: quantization happened at write_context's pack.
 __global__ void draft_attn_fp8_kernel(const float* q, const uint8_t* kc, const uint8_t* vc, int k_lo, int k_hi,
-                                      const float* kb, const float* vb, int nq, int H, int Hkv, float scale,
-                                      float* scratch, float* out) {
+                                      const float* kb, const float* vb, int nq, int H, int Hkv, int ring_mask,
+                                      float scale, float* scratch, float* out) {
     __shared__ float sh[128];
     __shared__ float qs[128];
     const int h = blockIdx.x, qi = blockIdx.y, g = h / (H / Hkv), tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -4609,7 +4609,9 @@ __global__ void draft_attn_fp8_kernel(const float* q, const uint8_t* kc, const u
     for (int j = warp; j < nk; j += 4) {
         float k0, k1, k2, k3;
         if (j < nc) {   // context row: E4M3 bytes, unpack to F32
-            const uint8_t* kr = kc + (size_t) (k_lo + j) * KD + (size_t) g * 128;
+            // ring_mask > 0: the local layers keep a ring cache, so position p lives at (p & ring_mask)
+            const int kp = ring_mask > 0 ? ((k_lo + j) & ring_mask) : (k_lo + j);
+            const uint8_t* kr = kc + (size_t) kp * KD + (size_t) g * 128;
             k0 = e4m3fn_to_f32(kr[lane]);
             k1 = e4m3fn_to_f32(kr[lane + 32]);
             k2 = e4m3fn_to_f32(kr[lane + 64]);
@@ -4640,7 +4642,8 @@ __global__ void draft_attn_fp8_kernel(const float* q, const uint8_t* kc, const u
     __syncthreads();
     float o = 0.0f;
     for (int j = 0; j < nk; ++j) {
-        const float v = j < nc ? e4m3fn_to_f32(vc[(size_t) (k_lo + j) * KD + (size_t) g * 128 + tid])
+        const int kp = ring_mask > 0 ? ((k_lo + j) & ring_mask) : (k_lo + j);
+        const float v = j < nc ? e4m3fn_to_f32(vc[(size_t) kp * KD + (size_t) g * 128 + tid])
                                : vb[(size_t) (j - nc) * KD + (size_t) g * 128 + tid];
         o += lg[j] * v;
     }
@@ -5731,6 +5734,20 @@ void pack_e4m3(const float* x, size_t n, uint8_t* y, cudaStream_t s) {
     pack_e4m3_kernel<<<grid(n), kBlk, 0, s>>>(x, n, y);
     check("pack_e4m3");
 }
+// pack_e4m3 into a ring cache: row r lands in slot ((pos0 + r) & ring_mask). One block per row, so a block
+// never straddles the wrap point. The plain pack_e4m3 writes its rows contiguously, which is what made
+// IK2_DRAFT_CTX_CAP + IK2_DRAFT_KV_FP8 write past the 2048-row local ring once a prompt passed 2048
+// positions (the launch then failed with "unspecified launch failure" at the first decode token).
+__global__ void pack_e4m3_ring_kernel(const float* x, int cols, uint8_t* y, int ring_mask, int pos0) {
+    const int r = blockIdx.y, wp = (pos0 + r) & ring_mask;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < cols; i += blockDim.x * gridDim.x)
+        y[(size_t) wp * cols + i] = f32_to_e4m3fn(x[(size_t) r * cols + i]);
+}
+void pack_e4m3_ring(const float* x, int rows, int cols, uint8_t* y, int ring_mask, int pos0, cudaStream_t s) {
+    if (rows <= 0 || cols <= 0) return;
+    pack_e4m3_ring_kernel<<<dim3((cols + kBlk - 1) / kBlk, rows), kBlk, 0, s>>>(x, cols, y, ring_mask, pos0);
+    check("pack_e4m3_ring");
+}
 void mix_rms(const float* x, int n_tap, size_t tap_stride, int rows, int C, const float* alpha, const float* w,
              float eps, float* out, cudaStream_t s) {
     if (rows <= 0) return;
@@ -5752,8 +5769,9 @@ void draft_attn(const float* q, const float* kc, const float* vc, int k_lo, int 
 // read as e4m3 bytes (4x fewer bytes); the block's kb/vb stay F32. Not bit-exact (cache quantization).
 void draft_attn_fp8(const float* q, const uint8_t* kc, const uint8_t* vc, int k_lo, int k_hi, const float* kb,
                     const float* vb, int nq, int H, int Hkv, float scale, float* scratch, float* out,
-                    cudaStream_t s) {
-    draft_attn_fp8_kernel<<<dim3(H, nq), 128, 0, s>>>(q, kc, vc, k_lo, k_hi, kb, vb, nq, H, Hkv, scale, scratch, out);
+                    int ring_mask, cudaStream_t s) {
+    draft_attn_fp8_kernel<<<dim3(H, nq), 128, 0, s>>>(q, kc, vc, k_lo, k_hi, kb, vb, nq, H, Hkv, ring_mask, scale,
+                                                      scratch, out);
     check("draft_attn_fp8");
 }
 // GQA-shared draft attention: grid (Hkv, nq), one block reads each K/V row of its KV head once for
